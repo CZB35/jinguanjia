@@ -40,6 +40,8 @@ pub struct DashboardTaskItem {
     pub service_items_text: String,
     pub task_status: String,
     pub task_status_text: String,
+    pub display_status: String,
+    pub display_status_text: String,
     pub technician_name: Option<String>,
     pub appointment_time: Option<String>,
     pub progress_percent: i32,
@@ -366,6 +368,8 @@ async fn enrich_recent_tasks(state: &AppState, tasks: &[TaskEntity]) -> Result<V
             address: address.address.unwrap_or_default(),
             service_type,
             service_items_text: service_items_text(&service_items),
+            display_status: display_status(&task_status).to_string(),
+            display_status_text: display_status_text(&task_status).to_string(),
             task_status_text: task_status_text(&task_status).to_string(),
             technician_name,
             task_status,
@@ -432,6 +436,26 @@ fn task_status_text(status: &str) -> &'static str {
         "completed" => "已完成",
         "closed" => "已关闭",
         _ => "未知状态",
+    }
+}
+
+fn display_status(status: &str) -> &'static str {
+    match status {
+        "pending_assign" | "pending_execute" => "pending_execute",
+        "executing" => "executing",
+        "pending_dealer_review" | "pending_hq_score" => "pending_review",
+        "completed" | "closed" => "completed",
+        _ => "pending_execute",
+    }
+}
+
+fn display_status_text(status: &str) -> &'static str {
+    match display_status(status) {
+        "pending_execute" => "待执行",
+        "executing" => "进行中",
+        "pending_review" => "待评价",
+        "completed" => "已完成",
+        _ => "待执行",
     }
 }
 

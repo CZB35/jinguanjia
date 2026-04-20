@@ -111,6 +111,8 @@ pub struct TaskSummary {
     pub service_items_text: String,
     pub task_status: String,
     pub task_status_text: String,
+    pub display_status: String,
+    pub display_status_text: String,
     pub review_status: String,
     pub review_status_text: String,
     pub score_status: String,
@@ -158,6 +160,8 @@ pub struct TaskDetailResponse {
     pub task_tags: Vec<String>,
     pub task_status: String,
     pub task_status_text: String,
+    pub display_status: String,
+    pub display_status_text: String,
     pub review_status: String,
     pub review_status_text: String,
     pub score_status: String,
@@ -478,6 +482,8 @@ pub async fn get_task_detail(
     let service_items_payload = map_task_service_item_payloads(service_items);
     let task_tags = build_task_tags(&task, &service_items_payload);
     let task_status_text = task_status_text(&task_status).to_string();
+    let display_status = display_status(&task_status).to_string();
+    let display_status_text = display_status_text(&task_status).to_string();
     let review_status_text = review_status_text(&review_status).to_string();
     let score_status_text = score_status_text(&score_status).to_string();
     let priority_text_value = priority_text(&priority).to_string();
@@ -509,6 +515,8 @@ pub async fn get_task_detail(
         service_items: service_items_payload,
         task_status,
         task_status_text,
+        display_status,
+        display_status_text,
         review_status,
         review_status_text,
         score_status,
@@ -1138,6 +1146,8 @@ async fn build_task_summary(state: &AppState, task: TaskEntity) -> Result<TaskSu
     let review_status = task.review_status.clone().unwrap_or_default();
     let score_status = task.score_status.clone().unwrap_or_default();
     let task_status_text_value = task_status_text(&task_status).to_string();
+    let display_status_value = display_status(&task_status).to_string();
+    let display_status_text_value = display_status_text(&task_status).to_string();
     let review_status_text_value = review_status_text(&review_status).to_string();
     let score_status_text_value = score_status_text(&score_status).to_string();
     let progress_percent = task_progress_percent(&service_items, task.task_status.as_deref());
@@ -1169,6 +1179,8 @@ async fn build_task_summary(state: &AppState, task: TaskEntity) -> Result<TaskSu
         service_items: service_items_payload,
         task_status,
         task_status_text: task_status_text_value,
+        display_status: display_status_value,
+        display_status_text: display_status_text_value,
         review_status,
         review_status_text: review_status_text_value,
         score_status,
@@ -1822,6 +1834,26 @@ fn task_status_text(status: &str) -> &'static str {
         "completed" => "已完成",
         "closed" => "已关闭",
         _ => "未知状态",
+    }
+}
+
+fn display_status(status: &str) -> &'static str {
+    match status {
+        "pending_assign" | "pending_execute" => "pending_execute",
+        "executing" => "executing",
+        "pending_dealer_review" | "pending_hq_score" => "pending_review",
+        "completed" | "closed" => "completed",
+        _ => "pending_execute",
+    }
+}
+
+fn display_status_text(status: &str) -> &'static str {
+    match display_status(status) {
+        "pending_execute" => "待执行",
+        "executing" => "进行中",
+        "pending_review" => "待评价",
+        "completed" => "已完成",
+        _ => "待执行",
     }
 }
 
