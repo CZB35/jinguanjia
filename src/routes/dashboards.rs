@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::{Datelike, Utc};
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{Json, extract::{Query, State}, http::HeaderMap};
 use rbs::value;
 use serde::Serialize;
 
@@ -70,9 +70,16 @@ pub struct ServiceGroupCount {
     pub count: usize,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct DashboardQuery {
+    pub year: Option<i32>,
+    pub month: Option<u32>,
+}
+
 pub async fn dealer_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<DashboardQuery>,
 ) -> Result<Json<ApiResponse<DashboardResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "super_admin"])?;
@@ -91,15 +98,17 @@ pub async fn dealer_dashboard(
             .map_err(AppError::Internal)?
     };
 
-    let mut dashboard = build_dashboard(tasks.clone(), Vec::new(), Vec::new());
-    dashboard.recent_tasks = enrich_recent_tasks(&state, &tasks).await?;
-    dashboard.service_group_counts = build_service_group_counts(&tasks);
+    let filtered_tasks = filter_tasks_by_year_month(tasks, query.year, query.month);
+    let mut dashboard = build_dashboard(filtered_tasks.clone(), Vec::new(), Vec::new(), query.year, query.month);
+    dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
+    dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
 pub async fn technician_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<DashboardQuery>,
 ) -> Result<Json<ApiResponse<DashboardResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["technician"])?;
@@ -109,15 +118,17 @@ pub async fn technician_dashboard(
         .context("failed to query technician dashboard tasks")
         .map_err(AppError::Internal)?;
 
-    let mut dashboard = build_dashboard(tasks.clone(), Vec::new(), Vec::new());
-    dashboard.recent_tasks = enrich_recent_tasks(&state, &tasks).await?;
-    dashboard.service_group_counts = build_service_group_counts(&tasks);
+    let filtered_tasks = filter_tasks_by_year_month(tasks, query.year, query.month);
+    let mut dashboard = build_dashboard(filtered_tasks.clone(), Vec::new(), Vec::new(), query.year, query.month);
+    dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
+    dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
 pub async fn hq_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<DashboardQuery>,
 ) -> Result<Json<ApiResponse<DashboardResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["hq_reviewer", "super_admin"])?;
@@ -139,16 +150,20 @@ pub async fn hq_dashboard(
         .context("failed to query hq dashboard service items")
         .map_err(AppError::Internal)?;
 
-    let mut dashboard = build_dashboard(tasks.clone(), scores, service_items.clone());
-    dashboard.recent_tasks = enrich_recent_tasks(&state, &tasks).await?;
-    dashboard.service_stats = build_service_stats(service_items.clone(), score_items);
-    dashboard.service_trends = build_service_trends(service_items);
-    dashboard.service_group_counts = build_service_group_counts(&tasks);
+    let filtered_tasks = filter_tasks_by_year_month(tasks, query.year, query.month);
+    let filtered_service_items = filter_service_items_by_year_month(service_items, query.year, query.month);
+    let mut dashboard = build_dashboard(filtered_tasks.clone(), scores, filtered_service_items.clone(), query.year, query.month);
+    dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
+    dashboard.service_stats = build_service_stats(filtered_service_items.clone(), score_items);
+    dashboard.service_trends = build_service_trends(filtered_service_items);
+    dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
-fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_items: Vec<TaskServiceItemEntity>) -> DashboardResponse {
+fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_items: Vec<TaskServiceItemEntity>, year: Option<i32>, month: Option<u32>) -> DashboardResponse {
     let now = Utc::now();
+    let target_year = year.unwrap_or(now.year());
+    let target_month = month.unwrap_or(now.month());
     let total_tasks = tasks.len();
     let pending_tasks = tasks
         .iter()
@@ -179,7 +194,7 @@ fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_
         .iter()
         .filter(|item| {
             item.task_status.as_deref() == Some("completed")
-                && item.updated_at.map(|dt| dt.month() == now.month() && dt.year() == now.year()).unwrap_or(false)
+                && item.updated_at.map(|dt| dt.month() == target_month && dt.year() == target_year).unwrap_or(false)
         })
         .count();
     let average_score = if scores.is_empty() {
@@ -202,6 +217,30 @@ fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_
         service_trends: Vec::new(),
         service_group_counts: Vec::new(),
     }
+}
+
+fn filter_tasks_by_year_month(tasks: Vec<TaskEntity>, year: Option<i32>, month: Option<u32>) -> Vec<TaskEntity> {
+    if year.is_none() && month.is_none() {
+        return tasks;
+    }
+    let now = Utc::now();
+    let target_year = year.unwrap_or(now.year());
+    let target_month = month.unwrap_or(now.month());
+    tasks.into_iter()
+        .filter(|item| item.appointment_time.map(|dt| dt.year() == target_year && dt.month() == target_month).unwrap_or(false))
+        .collect()
+}
+
+fn filter_service_items_by_year_month(items: Vec<TaskServiceItemEntity>, year: Option<i32>, month: Option<u32>) -> Vec<TaskServiceItemEntity> {
+    if year.is_none() && month.is_none() {
+        return items;
+    }
+    let now = Utc::now();
+    let target_year = year.unwrap_or(now.year());
+    let target_month = month.unwrap_or(now.month());
+    items.into_iter()
+        .filter(|item| item.scheduled_time.map(|dt| dt.year() == target_year && dt.month() == target_month).unwrap_or(false))
+        .collect()
 }
 
 fn build_service_stats(
