@@ -38,7 +38,6 @@ pub struct AuthConfig {
 #[derive(Clone, Debug)]
 pub struct StorageConfig {
     pub upload_dir: String,
-    pub public_base_url: String,
 }
 
 impl AppConfig {
@@ -73,7 +72,6 @@ impl AppConfig {
             },
             storage: StorageConfig {
                 upload_dir: env_var_or("UPLOAD_DIR", "uploads"),
-                public_base_url: env_var_or("PUBLIC_BASE_URL", "http://192.168.8.105:3000"),
             },
         })
     }
