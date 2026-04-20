@@ -1,0 +1,67 @@
+-- 完美版页面字段补充
+
+SET NAMES utf8mb4;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'task' AND COLUMN_NAME = 'service_time_slot'),
+  'SELECT 1',
+  'ALTER TABLE `task` ADD COLUMN `service_time_slot` VARCHAR(50) NULL COMMENT ''服务时段'' AFTER `appointment_time`'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'task' AND COLUMN_NAME = 'task_remark'),
+  'SELECT 1',
+  'ALTER TABLE `task` ADD COLUMN `task_remark` VARCHAR(500) NULL COMMENT ''备注信息'' AFTER `task_desc`'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user' AND COLUMN_NAME = 'nickname'),
+  'SELECT 1',
+  'ALTER TABLE `user` ADD COLUMN `nickname` VARCHAR(50) NULL COMMENT ''昵称'' AFTER `name`'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user' AND COLUMN_NAME = 'job_no'),
+  'SELECT 1',
+  'ALTER TABLE `user` ADD COLUMN `job_no` VARCHAR(50) NULL COMMENT ''工号'' AFTER `avatar_url`'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user' AND COLUMN_NAME = 'id_card'),
+  'SELECT 1',
+  'ALTER TABLE `user` ADD COLUMN `id_card` VARCHAR(30) NULL COMMENT ''身份证号'' AFTER `job_no`'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user' AND COLUMN_NAME = 'emergency_contact_name'),
+  'SELECT 1',
+  'ALTER TABLE `user` ADD COLUMN `emergency_contact_name` VARCHAR(50) NULL COMMENT ''紧急联系人'' AFTER `id_card`'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user' AND COLUMN_NAME = 'emergency_contact_mobile'),
+  'SELECT 1',
+  'ALTER TABLE `user` ADD COLUMN `emergency_contact_mobile` VARCHAR(20) NULL COMMENT ''紧急联系电话'' AFTER `emergency_contact_name`'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'store' AND COLUMN_NAME = 'business_hours'),
+  'SELECT 1',
+  'ALTER TABLE `store` ADD COLUMN `business_hours` VARCHAR(50) NULL COMMENT ''营业时间'' AFTER `address`'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+UPDATE `user`
+SET `job_no` = CONCAT('DL', LPAD(`id`, 6, '0'))
+WHERE (`job_no` IS NULL OR `job_no` = '');
+
+UPDATE `store`
+SET `business_hours` = '08:00-18:00'
+WHERE (`business_hours` IS NULL OR `business_hours` = '');
