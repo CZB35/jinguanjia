@@ -53,6 +53,8 @@ src/storage.rs 文件存储与路径处理
 cargo run --release
 ```
 
+默认服务端口：`3001`
+
 健康检查：
 
 ```bash

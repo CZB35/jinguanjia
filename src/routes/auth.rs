@@ -63,6 +63,7 @@ pub struct CurrentUserPayload {
     pub mobile: String,
     pub roles: Vec<String>,
     pub current_role: String,
+    pub switchable: bool,
     pub status: String,
 }
 
@@ -87,7 +88,7 @@ pub async fn login_by_password(
         return Err(AppError::Unauthorized("账号或密码错误".to_string()));
     }
 
-    let roles = find_role_codes(&state, user.id).await?;
+    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
     if roles.is_empty() {
         return Err(AppError::Forbidden("账号未分配角色，请联系管理员".to_string()));
     }
@@ -123,7 +124,7 @@ pub async fn refresh_token(
     let user = find_user_by_id(&state, claims.sub).await?;
     ensure_user_loginable(&user)?;
 
-    let roles = find_role_codes(&state, user.id).await?;
+    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
     let current_role = roles
         .first()
         .cloned()
@@ -151,6 +152,9 @@ pub async fn send_login_code(
     if payload.mobile.trim().is_empty() {
         return Err(AppError::BadRequest("请输入手机号".to_string()));
     }
+
+    let user = find_user_by_mobile(&state, &payload.mobile).await.map_err(|_| AppError::BadRequest("账号不存在，请联系管理员创建账号".to_string()))?;
+    ensure_user_loginable(&user)?;
 
     let now = Utc::now().timestamp();
     let mut store = state.verification_codes.write().await;
@@ -204,7 +208,7 @@ pub async fn login_by_code(
     let user = find_user_by_mobile(&state, &payload.mobile).await?;
     ensure_user_loginable(&user)?;
 
-    let roles = find_role_codes(&state, user.id).await?;
+    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
     if roles.is_empty() {
         return Err(AppError::Forbidden("账号未分配角色，请联系管理员".to_string()));
     }
@@ -239,7 +243,7 @@ pub async fn current_user(
     let user = find_user_by_id(&state, auth_user.user_id).await?;
     ensure_user_loginable(&user)?;
 
-    let roles = find_role_codes(&state, user.id).await?;
+    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
     let current_role = roles
         .first()
         .cloned()
@@ -249,6 +253,7 @@ pub async fn current_user(
         id: user.id.unwrap_or_default(),
         name: user.name.unwrap_or_default(),
         mobile: user.mobile.unwrap_or_default(),
+        switchable: roles.len() > 1,
         roles,
         current_role,
         status: user.status.unwrap_or_else(|| "enabled".to_string()),
@@ -264,7 +269,7 @@ pub async fn switch_role(
     let user = find_user_by_id(&state, auth_user.user_id).await?;
     ensure_user_loginable(&user)?;
 
-    let roles = find_role_codes(&state, user.id).await?;
+    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
     let current_role = resolve_current_role(&roles, Some(payload.role_code.as_str()))?;
     let token_pair = auth::issue_token_pair(
         &state.config.auth,
@@ -341,6 +346,7 @@ fn build_login_response(
                 .mobile
                 .clone()
                 .ok_or_else(|| AppError::Internal(anyhow!("user.mobile is missing")))?,
+            switchable: roles.len() > 1,
             roles,
             current_role,
             status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
@@ -390,4 +396,20 @@ async fn find_role_codes(state: &AppState, user_id: Option<i64>) -> Result<Vec<S
         .map_err(AppError::Internal)?;
 
     Ok(roles.into_iter().filter_map(|item| item.role_code).collect())
+}
+
+fn sort_roles_by_priority(mut roles: Vec<String>) -> Vec<String> {
+    roles.sort_by_key(|role| role_priority(role));
+    roles.dedup();
+    roles
+}
+
+fn role_priority(role: &str) -> i32 {
+    match role {
+        "dealer" => 1,
+        "technician" => 2,
+        "hq_reviewer" => 3,
+        "super_admin" => 4,
+        _ => 99,
+    }
 }

@@ -51,7 +51,7 @@ impl AppConfig {
             },
             server: ServerConfig {
                 host: env_var_or("SERVER_HOST", "0.0.0.0"),
-                port: env_var_or("SERVER_PORT", "3000")
+                port: env_var_or("SERVER_PORT", "3001")
                     .parse()
                     .context("SERVER_PORT must be a valid u16")?,
             },
