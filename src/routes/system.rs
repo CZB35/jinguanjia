@@ -65,6 +65,17 @@ pub struct AuditLogListResponse {
     pub total: usize,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SaveAgreementRequest {
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgreementResponse {
+    pub agreement_type: String,
+    pub content: String,
+}
+
 pub async fn get_configs(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -238,6 +249,34 @@ pub async fn get_operation_log_detail(
     })))
 }
 
+pub async fn get_user_agreement(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<AgreementResponse>>, AppError> {
+    get_agreement(&state, "user_agreement", "user").await
+}
+
+pub async fn save_user_agreement(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SaveAgreementRequest>,
+) -> Result<Json<ApiResponse<AgreementResponse>>, AppError> {
+    save_agreement(&state, &headers, "user_agreement", "user", payload.content).await
+}
+
+pub async fn get_privacy_policy(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<AgreementResponse>>, AppError> {
+    get_agreement(&state, "privacy_policy", "privacy").await
+}
+
+pub async fn save_privacy_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SaveAgreementRequest>,
+) -> Result<Json<ApiResponse<AgreementResponse>>, AppError> {
+    save_agreement(&state, &headers, "privacy_policy", "privacy", payload.content).await
+}
+
 fn ensure_admin_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let auth_user = auth::authenticate(state, headers)?;
     auth_user.require_any_role(&["super_admin", "hq_reviewer"])
@@ -248,4 +287,89 @@ fn normalize_json_config_value(input: &str) -> anyhow::Result<String> {
         return Ok(input.to_string());
     }
     Ok(serde_json::to_string(input)?)
+}
+
+async fn get_agreement(
+    state: &AppState,
+    config_key: &str,
+    agreement_type: &str,
+) -> Result<Json<ApiResponse<AgreementResponse>>, AppError> {
+    let item = db::select_one_by_map_compat::<SystemConfigEntity>(
+        state.rb.as_ref(),
+        "system_config",
+        value! { "config_key": config_key },
+    )
+    .await
+    .context("failed to query agreement config")
+    .map_err(AppError::Internal)?;
+
+    let content = item
+        .and_then(|cfg| cfg.config_value)
+        .map(|raw| parse_json_string_value(&raw))
+        .unwrap_or_default();
+
+    Ok(Json(ApiResponse::success(AgreementResponse {
+        agreement_type: agreement_type.to_string(),
+        content,
+    })))
+}
+
+async fn save_agreement(
+    state: &AppState,
+    headers: &HeaderMap,
+    config_key: &str,
+    agreement_type: &str,
+    content: String,
+) -> Result<Json<ApiResponse<AgreementResponse>>, AppError> {
+    ensure_admin_access(state, headers)?;
+    let normalized_value = normalize_json_config_value(&content).map_err(AppError::Internal)?;
+
+    let existing = db::select_one_by_map_compat::<SystemConfigEntity>(
+        state.rb.as_ref(),
+        "system_config",
+        value! { "config_key": config_key },
+    )
+    .await
+    .context("failed to query agreement before save")
+    .map_err(AppError::Internal)?;
+
+    if let Some(existing_item) = existing {
+        let updated = SystemConfigEntity {
+            config_value: Some(normalized_value),
+            remark: Some("协议文本".to_string()),
+            ..existing_item.clone()
+        };
+        SystemConfigEntity::update_by_map(
+            state.rb.as_ref(),
+            &updated,
+            value! { "id": existing_item.id.unwrap_or_default(), "column": ["config_value", "remark"] },
+        )
+        .await
+        .context("failed to update agreement config")
+        .map_err(AppError::Internal)?;
+    } else {
+        SystemConfigEntity::insert(
+            state.rb.as_ref(),
+            &SystemConfigEntity {
+                id: None,
+                config_key: Some(config_key.to_string()),
+                config_value: Some(normalized_value),
+                remark: Some("协议文本".to_string()),
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .await
+        .context("failed to insert agreement config")
+        .map_err(AppError::Internal)?;
+    }
+
+    Ok(Json(ApiResponse::success(AgreementResponse {
+        agreement_type: agreement_type.to_string(),
+        content,
+    })))
+}
+
+fn parse_json_string_value(raw: &str) -> String {
+    serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.to_string())
 }
