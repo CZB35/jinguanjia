@@ -51,7 +51,7 @@ pub fn router() -> Router<AppState> {
         .route("/customer-reviews/images/{id}", delete(customer_reviews::delete_customer_review_image))
         .route("/customer-reviews/submit", post(customer_reviews::submit_customer_review))
         .route("/stores", get(stores::list_stores))
-        .route("/stores/{id}", get(stores::get_store_detail))
+        .route("/stores/{id}", get(stores::get_store_detail).patch(stores::update_store_detail))
         .route("/users/import", post(imports::import_users))
         .route("/users/export", get(imports::export_users))
         .route("/users/batch-delete", post(imports::batch_delete_users))

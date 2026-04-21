@@ -118,6 +118,23 @@ pub async fn list_customers(
         .context("failed to query customers")
         .map_err(AppError::Internal)?;
 
+    if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+        let store_ids = load_user_store_ids(&state, auth_user.user_id).await?;
+        let scoped_tasks = if store_ids.is_empty() {
+            Vec::new()
+        } else {
+            db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids })
+                .await
+                .context("failed to query dealer scoped customer tasks")
+                .map_err(AppError::Internal)?
+        };
+        let visible_customer_ids = scoped_tasks
+            .into_iter()
+            .filter_map(|item| item.customer_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        customers.retain(|customer| customer.id.map(|id| visible_customer_ids.contains(&id)).unwrap_or(false));
+    }
+
     customers.retain(|customer| {
         if let Some(mobile) = &query.mobile
             && !customer.mobile.as_deref().unwrap_or_default().contains(mobile)
@@ -454,4 +471,16 @@ async fn load_user_name(state: &AppState, user_id: i64) -> Result<String, AppErr
         .context("failed to query user name for customer history")
         .map_err(AppError::Internal)?;
     Ok(user.and_then(|item| item.name).unwrap_or_default())
+}
+
+async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>, AppError> {
+    let stores: Vec<crate::models::user_store::UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query user stores for customer scope")
+    .map_err(AppError::Internal)?;
+    Ok(stores.into_iter().filter_map(|item| item.store_id).collect())
 }

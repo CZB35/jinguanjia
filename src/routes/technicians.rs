@@ -64,6 +64,7 @@ pub struct UpdateTechnicianRequest {
     pub emergency_contact_name: Option<String>,
     pub emergency_contact_mobile: Option<String>,
     pub job_no: Option<String>,
+    pub store_id: Option<i64>,
     pub service_types: Option<Vec<String>>,
 }
 
@@ -421,6 +422,34 @@ pub async fn update_technician(
             .context("failed to recreate technician skill")
             .map_err(AppError::Internal)?;
         }
+    }
+
+    if let Some(store_id) = payload.store_id {
+        let existing_stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": technician_id })
+            .await
+            .context("failed to query existing technician stores")
+            .map_err(AppError::Internal)?;
+        for relation in existing_stores {
+            if let Some(id) = relation.id {
+                UserStoreEntity::delete_by_map(state.rb.as_ref(), value! { "id": id })
+                    .await
+                    .context("failed to delete existing technician store relation")
+                    .map_err(AppError::Internal)?;
+            }
+        }
+
+        UserStoreEntity::insert(
+            state.rb.as_ref(),
+            &UserStoreEntity {
+                id: None,
+                user_id: Some(technician_id),
+                store_id: Some(store_id),
+                created_at: None,
+            },
+        )
+        .await
+        .context("failed to bind technician store")
+        .map_err(AppError::Internal)?;
     }
 
     get_technician_detail_inner(&state, technician_id).await

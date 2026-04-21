@@ -5,6 +5,7 @@ use axum::{
     http::HeaderMap,
 };
 use bcrypt::hash;
+use chrono::Datelike;
 use rbs::value;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,7 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub struct UpdateProfileRequest {
     pub name: Option<String>,
+    pub nickname: Option<String>,
     pub email: Option<String>,
     pub avatar_url: Option<String>,
 }
@@ -36,6 +38,7 @@ pub struct UpdatePasswordRequest {
 pub struct ProfileResponse {
     pub id: i64,
     pub name: String,
+    pub nickname: Option<String>,
     pub mobile: String,
     pub email: Option<String>,
     pub avatar_url: Option<String>,
@@ -94,6 +97,7 @@ pub async fn update_profile(
         state.rb.as_ref(),
         &UserEntity {
             name: payload.name,
+            nickname: payload.nickname,
             email: payload.email,
             avatar_url: payload.avatar_url,
             ..Default::default()
@@ -296,13 +300,24 @@ async fn build_profile_response(state: &AppState, user: UserEntity) -> Result<Pr
     let role_names = if role_ids.is_empty() {
         Vec::new()
     } else {
-        db::select_by_map_compat::<RoleEntity>(state.rb.as_ref(), "role", value! { "id": role_ids })
+        db::select_by_map_compat::<RoleEntity>(state.rb.as_ref(), "role", value! { "id": role_ids.clone() })
             .await
             .context("failed to query roles for profile")
             .map_err(AppError::Internal)?
             .into_iter()
             .filter_map(|item| item.role_name)
             .collect()
+    };
+    let role_codes = if role_ids.is_empty() {
+        Vec::new()
+    } else {
+        db::select_by_map_compat::<RoleEntity>(state.rb.as_ref(), "role", value! { "id": role_ids.clone() })
+            .await
+            .context("failed to query role codes for profile")
+            .map_err(AppError::Internal)?
+            .into_iter()
+            .filter_map(|item| item.role_code)
+            .collect::<Vec<_>>()
     };
     let user_stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
         .await
@@ -321,51 +336,48 @@ async fn build_profile_response(state: &AppState, user: UserEntity) -> Result<Pr
             .collect()
     };
     let primary_store_name = store_names.first().cloned();
-    let task_count = if store_ids.is_empty() {
-        0
+    let is_technician_only = role_codes.contains(&"technician".to_string()) && !role_codes.contains(&"dealer".to_string()) && !role_codes.contains(&"hq_reviewer".to_string()) && !role_codes.contains(&"super_admin".to_string());
+    let now = chrono::Utc::now();
+    let (task_count, completed_count, technician_count, customer_count, month_completed_count) = if is_technician_only {
+        let tasks = db::select_by_map_compat::<crate::models::task::TaskEntity>(state.rb.as_ref(), "task", value! { "current_technician_id": user_id })
+            .await
+            .context("failed to query technician tasks for profile")
+            .map_err(AppError::Internal)?;
+        let completed = tasks.iter().filter(|item| item.task_status.as_deref() == Some("completed")).count();
+        let month_completed = tasks
+            .iter()
+            .filter(|item| item.task_status.as_deref() == Some("completed"))
+            .filter(|item| item.updated_at.map(|dt| dt.year() == now.year() && dt.month() == now.month()).unwrap_or(false))
+            .count();
+        let customers = tasks.iter().filter_map(|item| item.customer_id).collect::<std::collections::BTreeSet<_>>().len();
+        (tasks.len(), completed, 1, customers, month_completed)
+    } else if store_ids.is_empty() {
+        (0, 0, 0, 0, 0)
     } else {
-        db::select_by_map_compat::<crate::models::task::TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids.clone() })
+        let tasks = db::select_by_map_compat::<crate::models::task::TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids.clone() })
             .await
             .context("failed to query tasks for profile aggregate")
-            .map_err(AppError::Internal)?
-            .len()
-    };
-    let completed_count = if store_ids.is_empty() {
-        0
-    } else {
-        db::select_by_map_compat::<crate::models::task::TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids.clone(), "task_status": "completed" })
-            .await
-            .context("failed to query completed tasks for profile aggregate")
-            .map_err(AppError::Internal)?
-            .len()
-    };
-    let technician_count = if store_ids.is_empty() {
-        0
-    } else {
-        db::select_by_map_compat::<UserStoreEntity>(state.rb.as_ref(), "user_store", value! { "store_id": store_ids.clone() })
+            .map_err(AppError::Internal)?;
+        let completed = tasks.iter().filter(|item| item.task_status.as_deref() == Some("completed")).count();
+        let month_completed = tasks
+            .iter()
+            .filter(|item| item.task_status.as_deref() == Some("completed"))
+            .filter(|item| item.updated_at.map(|dt| dt.year() == now.year() && dt.month() == now.month()).unwrap_or(false))
+            .count();
+        let technicians = db::select_by_map_compat::<UserStoreEntity>(state.rb.as_ref(), "user_store", value! { "store_id": store_ids.clone() })
             .await
             .context("failed to query technicians for profile aggregate")
             .map_err(AppError::Internal)?
-            .len()
+            .len();
+        let customers = tasks.iter().filter_map(|item| item.customer_id).collect::<std::collections::BTreeSet<_>>().len();
+        (tasks.len(), completed, technicians, customers, month_completed)
     };
-    let customer_count = if store_ids.is_empty() {
-        0
-    } else {
-        db::select_by_map_compat::<crate::models::task::TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids.clone() })
-            .await
-            .context("failed to query customer count for profile aggregate")
-            .map_err(AppError::Internal)?
-            .into_iter()
-            .filter_map(|item| item.customer_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-    };
-    let month_completed_count = completed_count;
     let completion_rate = if task_count == 0 { 0.0 } else { (completed_count as f64 / task_count as f64) * 100.0 };
 
     Ok(ProfileResponse {
         id: user_id,
         name: user.name.unwrap_or_default(),
+        nickname: user.nickname,
         mobile: user.mobile.unwrap_or_default(),
         email: user.email,
         avatar_url: user.avatar_url,

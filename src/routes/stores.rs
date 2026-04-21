@@ -5,7 +5,7 @@ use axum::{
     http::HeaderMap,
 };
 use rbs::value;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     auth,
@@ -35,6 +35,15 @@ pub struct StoreItem {
 pub struct StoreListResponse {
     pub items: Vec<StoreItem>,
     pub total: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateStoreRequest {
+    pub store_name: Option<String>,
+    pub address: Option<String>,
+    pub business_hours: Option<String>,
+    pub contact_name: Option<String>,
+    pub contact_mobile: Option<String>,
 }
 
 pub async fn list_stores(
@@ -123,4 +132,40 @@ pub async fn get_store_detail(
             if total == 0 { 0.0 } else { (completed as f64 / total as f64) * 100.0 }
         },
     })))
+}
+
+pub async fn update_store_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(store_id): Path<i64>,
+    Json(payload): Json<UpdateStoreRequest>,
+) -> Result<Json<ApiResponse<StoreItem>>, AppError> {
+    let auth_user = auth::authenticate(&state, &headers)?;
+    auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+
+    let existing: StoreEntity = db::select_one_by_map_compat(state.rb.as_ref(), "store", value! { "id": store_id })
+        .await
+        .context("failed to query store before update")
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound("门店不存在".to_string()))?;
+
+    let updated = StoreEntity {
+        store_name: payload.store_name.or(existing.store_name.clone()),
+        address: payload.address.or(existing.address.clone()),
+        business_hours: payload.business_hours.or(existing.business_hours.clone()),
+        contact_name: payload.contact_name.or(existing.contact_name.clone()),
+        contact_mobile: payload.contact_mobile.or(existing.contact_mobile.clone()),
+        ..existing.clone()
+    };
+
+    StoreEntity::update_by_map(
+        state.rb.as_ref(),
+        &updated,
+        value! { "id": store_id, "column": ["store_name", "address", "business_hours", "contact_name", "contact_mobile"] },
+    )
+    .await
+    .context("failed to update store detail")
+    .map_err(AppError::Internal)?;
+
+    get_store_detail(State(state), headers, Path(store_id)).await
 }
