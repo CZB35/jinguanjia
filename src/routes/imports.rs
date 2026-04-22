@@ -12,7 +12,7 @@ use bcrypt::hash;
 use calamine::{Reader, open_workbook_auto};
 use chrono::Utc;
 use rbs::value;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -34,6 +34,7 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct BatchDeleteUsersRequest {
+    #[serde(default, alias = "ids", deserialize_with = "deserialize_vec_i64_from_mixed")]
     pub user_ids: Vec<i64>,
 }
 
@@ -50,6 +51,9 @@ pub async fn batch_delete_users(
     Json(payload): Json<BatchDeleteUsersRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     ensure_admin_access(&state, &headers)?;
+    if payload.user_ids.is_empty() {
+        return Err(AppError::BadRequest("user_ids不能为空".to_string()));
+    }
     for user_id in payload.user_ids {
         UserEntity::update_by_map(
             state.rb.as_ref(),
@@ -281,6 +285,13 @@ pub async fn import_scores(
             errors.push(format!("第{}行任务不存在: {}", index + 2, row.task_id));
             continue;
         };
+
+        let service_types = load_task_service_types(&state, &task).await?;
+        if !service_types.iter().any(|item| item == &row.service_type) {
+            failed_count += 1;
+            errors.push(format!("第{}行服务环节与任务不匹配: {} / {}", index + 2, row.task_id, row.service_type));
+            continue;
+        }
         if task.task_status.as_deref() != Some("pending_hq_score") {
             failed_count += 1;
             errors.push(format!("第{}行任务状态不允许评分: {}", index + 2, row.task_id));
@@ -477,4 +488,42 @@ fn calc_service_level(score: i32) -> &'static str {
 fn ensure_admin_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let auth_user = auth::authenticate(state, headers)?;
     auth_user.require_any_role(&["super_admin", "hq_reviewer"])
+}
+
+async fn load_task_service_types(state: &AppState, task: &TaskEntity) -> Result<Vec<String>, AppError> {
+    let task_id = task.id.unwrap_or_default();
+    let items = db::select_by_map_compat::<crate::models::task_service_item::TaskServiceItemEntity>(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query task service items during score import")
+    .map_err(AppError::Internal)?;
+
+    if items.is_empty() {
+        return Ok(task.service_type.iter().cloned().collect());
+    }
+
+    Ok(items.into_iter().filter_map(|item| item.service_type).collect())
+}
+
+fn deserialize_vec_i64_from_mixed<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::Number(number) => number
+                .as_i64()
+                .ok_or_else(|| serde::de::Error::custom("invalid integer value")),
+            serde_json::Value::String(text) => text
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| serde::de::Error::custom("invalid integer string")),
+            _ => Err(serde::de::Error::custom("expected string or number")),
+        })
+        .collect()
 }

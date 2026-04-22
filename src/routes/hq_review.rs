@@ -1,8 +1,10 @@
 use anyhow::Context;
 use axum::{
+    body::Body,
     Json,
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::Response,
 };
 use chrono::Utc;
 use rbs::value;
@@ -102,7 +104,59 @@ pub async fn list_review_tasks(
     Query(query): Query<ReviewTaskQuery>,
 ) -> Result<Json<ApiResponse<ReviewTaskListResponse>>, AppError> {
     ensure_hq_access(&state, &headers)?;
+    let items = load_review_tasks(&state, &query).await?;
+    let total = items.len();
 
+    Ok(Json(ApiResponse::success(ReviewTaskListResponse { items, total })))
+}
+
+pub async fn export_review_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ReviewTaskQuery>,
+) -> Result<Response, AppError> {
+    ensure_hq_access(&state, &headers)?;
+    let items = load_review_tasks(&state, &query).await?;
+
+    let mut csv = String::from(
+        "record_id,task_id,task_no,service_type,task_status,service_status,review_status,score_status,store_name,dealer_name,technician_name,technician_mobile,customer_name,customer_mobile,appointment_time,technician_score\n",
+    );
+    for item in items {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            item.id,
+            item.task_id,
+            csv_cell(&item.task_no),
+            csv_cell(&item.service_type),
+            csv_cell(&item.task_status),
+            csv_cell(&item.service_status),
+            csv_cell(&item.review_status),
+            csv_cell(&item.score_status),
+            csv_cell(&item.store_name),
+            csv_cell(&item.dealer_name),
+            csv_cell(&item.technician_name),
+            csv_cell(&item.technician_mobile),
+            csv_cell(&item.customer_name),
+            csv_cell(&item.customer_mobile),
+            csv_cell(&item.appointment_time.unwrap_or_default()),
+            item.technician_score.map(|score| score.to_string()).unwrap_or_default(),
+        ));
+    }
+
+    let mut response = Response::new(Body::from(csv));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"hq-review-records.csv\""),
+    );
+    Ok(response)
+}
+
+async fn load_review_tasks(state: &AppState, query: &ReviewTaskQuery) -> Result<Vec<ReviewTaskItem>, AppError> {
     let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! {})
         .await
         .context("failed to query review tasks")
@@ -125,12 +179,10 @@ pub async fn list_review_tasks(
             {
                 continue;
             }
-            items.push(build_review_task_item(&state, &task, &service_item).await?);
+            items.push(build_review_task_item(state, &task, &service_item).await?);
         }
     }
-    let total = items.len();
-
-    Ok(Json(ApiResponse::success(ReviewTaskListResponse { items, total })))
+    Ok(items)
 }
 
 pub async fn get_review_task_detail(
@@ -367,4 +419,8 @@ async fn load_customer_address_text(state: &AppState, address_id: i64) -> Result
 
 fn format_datetime(input: chrono::NaiveDateTime) -> String {
     input.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }

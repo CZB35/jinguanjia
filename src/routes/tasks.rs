@@ -1,8 +1,10 @@
 use anyhow::{Context, anyhow};
 use axum::{
+    body::Body,
     Json,
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::Response,
 };
 use chrono::{NaiveDateTime, Utc};
 use rbs::value;
@@ -319,7 +321,7 @@ pub async fn create_task(
     let store_id = resolve_store_id(&state, &auth_user, payload.store_id).await?;
     ensure_store_exists(&state, store_id).await?;
 
-    let customer = find_or_create_customer(&state, &payload, dealer_user_id).await?;
+    let customer = find_or_create_customer(&state, &payload, dealer_user_id, store_id).await?;
     let customer_id = customer.id.ok_or_else(|| AppError::Internal(anyhow!("customer.id missing")))?;
     let customer_address_id =
         resolve_customer_address_id(&state, customer_id, payload.address_id, payload.address.as_ref()).await?;
@@ -397,6 +399,64 @@ pub async fn list_tasks(
     Query(query): Query<TaskListQuery>,
 ) -> Result<Json<ApiResponse<TaskListResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
+    let items = load_task_summaries(&state, &auth_user, &query).await?;
+
+    let total = items.len();
+    Ok(Json(ApiResponse::success(TaskListResponse { items, total })))
+}
+
+pub async fn export_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<TaskListQuery>,
+) -> Result<Response, AppError> {
+    let auth_user = auth::authenticate(&state, &headers)?;
+    let items = load_task_summaries(&state, &auth_user, &query).await?;
+
+    let mut csv = String::from(
+        "task_id,task_no,service_type,service_items,task_status,display_status,review_status,score_status,appointment_time,customer_name,customer_mobile,store_name,dealer_name,technician_name,technician_mobile,is_overdue,task_tags\n",
+    );
+    for item in items {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            item.id,
+            csv_cell(&item.task_no),
+            csv_cell(&item.service_type),
+            csv_cell(&item.service_items_text),
+            csv_cell(&item.task_status_text),
+            csv_cell(&item.display_status_text),
+            csv_cell(&item.review_status_text),
+            csv_cell(&item.score_status_text),
+            csv_cell(&item.appointment_time.unwrap_or_default()),
+            csv_cell(&item.customer_name),
+            csv_cell(&item.customer_mobile),
+            csv_cell(&item.store_name),
+            csv_cell(&item.dealer_name),
+            csv_cell(&item.technician_name.unwrap_or_default()),
+            csv_cell(&item.technician_mobile.unwrap_or_default()),
+            if item.is_overdue { "是" } else { "否" },
+            csv_cell(&item.task_tags.join("|")),
+        ));
+    }
+
+    let mut response = Response::new(Body::from(csv));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"tasks-export.csv\""),
+    );
+    Ok(response)
+}
+
+async fn load_task_summaries(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    query: &TaskListQuery,
+) -> Result<Vec<TaskSummary>, AppError> {
 
     let mut tasks = if auth_user.has_role("technician") {
         db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "current_technician_id": auth_user.user_id })
@@ -416,17 +476,15 @@ pub async fn list_tasks(
             .map_err(AppError::Internal)?
     };
 
-    tasks.retain(|task| filter_task_item(task, &query));
+    tasks.retain(|task| filter_task_item(task, query));
 
     let mut items = Vec::with_capacity(tasks.len());
     for task in tasks {
-        items.push(build_task_summary(&state, task).await?);
+        items.push(build_task_summary(state, task).await?);
     }
 
-    items.retain(|item| filter_task_summary(item, &query));
-
-    let total = items.len();
-    Ok(Json(ApiResponse::success(TaskListResponse { items, total })))
+    items.retain(|item| filter_task_summary(item, query));
+    Ok(items)
 }
 
 pub async fn get_task_detail(
@@ -1224,6 +1282,7 @@ async fn find_or_create_customer(
     state: &AppState,
     payload: &CreateTaskRequest,
     created_by: i64,
+    store_id: i64,
 ) -> Result<CustomerEntity, AppError> {
     let mut customers: Vec<CustomerEntity> = db::select_by_map_compat(
         state.rb.as_ref(),
@@ -1235,6 +1294,30 @@ async fn find_or_create_customer(
     .map_err(AppError::Internal)?;
 
     if let Some(customer) = customers.pop() {
+        if customer.primary_store_id.is_none() {
+            CustomerEntity::update_by_map(
+                state.rb.as_ref(),
+                &CustomerEntity {
+                    primary_store_id: Some(store_id),
+                    ..Default::default()
+                },
+                value! { "id": customer.id.unwrap_or_default(), "column": ["primary_store_id"] },
+            )
+            .await
+            .context("failed to backfill customer primary store")
+            .map_err(AppError::Internal)?;
+
+            let refreshed = db::select_one_by_map_compat::<CustomerEntity>(
+                state.rb.as_ref(),
+                "customer",
+                value! { "id": customer.id.unwrap_or_default() },
+            )
+            .await
+            .context("failed to reload customer after primary store backfill")
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::Internal(anyhow!("customer reload failed after primary store backfill")))?;
+            return Ok(refreshed);
+        }
         return Ok(customer);
     }
 
@@ -1244,6 +1327,7 @@ async fn find_or_create_customer(
         mobile: Some(payload.customer_mobile.clone()),
         source: payload.customer_source.clone().or_else(|| Some("mini_program".to_string())),
         remark: None,
+        primary_store_id: Some(store_id),
         created_by: Some(created_by),
         created_at: None,
         updated_at: None,
@@ -1902,6 +1986,10 @@ fn service_item_is_overdue(item: &TaskServiceItemEntity) -> bool {
 
 fn overdue_text(is_overdue: bool) -> &'static str {
     if is_overdue { "已逾期" } else { "正常" }
+}
+
+fn csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn build_task_tags(task: &TaskEntity, service_items: &[TaskServiceItemPayload]) -> Vec<String> {

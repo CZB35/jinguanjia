@@ -44,14 +44,20 @@ pub struct CreateTechnicianRequest {
     pub name: String,
     pub nickname: Option<String>,
     pub mobile: String,
-    pub password: String,
+    #[serde(default)]
+    pub password: Option<String>,
     pub avatar_url: Option<String>,
     pub id_card: Option<String>,
     pub emergency_contact_name: Option<String>,
     pub emergency_contact_mobile: Option<String>,
     pub job_no: Option<String>,
-    pub store_id: i64,
-    pub service_types: Vec<String>,
+    pub store_id: Option<i64>,
+    #[serde(default)]
+    pub store_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub service_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub role_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,16 +268,27 @@ pub async fn create_technician(
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
+    let password = payload
+        .password
+        .clone()
+        .filter(|item| !item.trim().is_empty())
+        .unwrap_or_else(|| "123456".to_string());
+    let store_id = payload
+        .store_id
+        .or_else(|| payload.store_ids.as_ref().and_then(|item| item.first().copied()))
+        .ok_or_else(|| AppError::BadRequest("请选择所属门店".to_string()))?;
+    let service_types = normalize_service_types(payload.service_types.clone(), payload.role_names.clone())?;
+
     if payload.name.trim().is_empty() {
         return Err(AppError::BadRequest("请输入技师姓名".to_string()));
     }
     if payload.mobile.trim().is_empty() {
         return Err(AppError::BadRequest("请输入手机号".to_string()));
     }
-    if payload.password.trim().len() < 6 {
+    if password.trim().len() < 6 {
         return Err(AppError::BadRequest("密码长度不能少于6位".to_string()));
     }
-    if payload.service_types.is_empty() {
+    if service_types.is_empty() {
         return Err(AppError::BadRequest("请至少选择一个服务能力".to_string()));
     }
 
@@ -283,7 +300,7 @@ pub async fn create_technician(
         return Err(AppError::Conflict("该手机号账号已存在".to_string()));
     }
 
-    let password_hash = hash(&payload.password, 10)
+    let password_hash = hash(&password, 10)
         .context("failed to hash technician password")
         .map_err(AppError::Internal)?;
 
@@ -339,7 +356,7 @@ pub async fn create_technician(
         &UserStoreEntity {
             id: None,
             user_id: Some(user_id),
-            store_id: Some(payload.store_id),
+            store_id: Some(store_id),
             created_at: None,
         },
     )
@@ -347,7 +364,7 @@ pub async fn create_technician(
     .context("failed to bind technician store")
     .map_err(AppError::Internal)?;
 
-    for service_type in payload.service_types {
+    for service_type in service_types {
         TechnicianSkillEntity::insert(
             state.rb.as_ref(),
             &TechnicianSkillEntity {
@@ -692,6 +709,27 @@ async fn calculate_technician_average_score(state: &AppState, technician_id: i64
     }
 
     Ok(scores.iter().map(|item| item.total_score.unwrap_or_default() as f64).sum::<f64>() / scores.len() as f64)
+}
+
+fn normalize_service_types(service_types: Option<Vec<String>>, role_names: Option<Vec<String>>) -> Result<Vec<String>, AppError> {
+    let source = service_types.or(role_names).unwrap_or_default();
+    let mut result = Vec::new();
+
+    for item in source {
+        let normalized = match item.trim() {
+            "measure" | "量尺" => "measure",
+            "install" | "安装" => "install",
+            "ironing" | "熨烫" => "ironing",
+            "cleaning" | "除尘除螨" | "除尘" | "除螨" => "cleaning",
+            _ => return Err(AppError::BadRequest(format!("不支持的服务能力: {}", item))),
+        };
+
+        if !result.iter().any(|existing| existing == normalized) {
+            result.push(normalized.to_string());
+        }
+    }
+
+    Ok(result)
 }
 
 fn build_monthly_trends(tasks: &[TaskEntity]) -> Vec<TechnicianTrendPoint> {

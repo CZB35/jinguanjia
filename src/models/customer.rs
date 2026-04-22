@@ -8,6 +8,7 @@ pub struct CustomerEntity {
     pub mobile: Option<String>,
     pub source: Option<String>,
     pub remark: Option<String>,
+    pub primary_store_id: Option<i64>,
     pub created_by: Option<i64>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,

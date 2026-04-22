@@ -306,7 +306,8 @@ async fn get_agreement(
     let content = item
         .and_then(|cfg| cfg.config_value)
         .map(|raw| parse_json_string_value(&raw))
-        .unwrap_or_default();
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| default_agreement_content(config_key).to_string());
 
     Ok(Json(ApiResponse::success(AgreementResponse {
         agreement_type: agreement_type.to_string(),
@@ -372,4 +373,12 @@ async fn save_agreement(
 
 fn parse_json_string_value(raw: &str) -> String {
     serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.to_string())
+}
+
+fn default_agreement_content(config_key: &str) -> &'static str {
+    match config_key {
+        "user_agreement" => "欢迎使用金管家服务。\n\n1. 用户应保证注册信息真实、准确、完整。\n2. 用户应妥善保管账号与密码，并对账号下的操作承担责任。\n3. 平台有权在法律法规允许范围内提供服务支持与运营管理。\n4. 用户使用过程中不得发布违法违规内容，不得干扰平台正常运行。\n5. 如因业务需要调整服务内容，平台将通过合理方式进行通知。",
+        "privacy_policy" => "我们重视您的个人信息与隐私保护。\n\n1. 为提供服务，系统可能收集手机号、姓名、门店、任务记录等必要信息。\n2. 收集的信息仅用于身份识别、业务处理、服务通知与运营保障。\n3. 未经用户授权或法律法规要求，不会向无关第三方泄露个人信息。\n4. 我们将采取合理安全措施保护您的数据，防止丢失、泄露或被非法使用。\n5. 用户可通过平台提供的方式查询、更正相关信息。",
+        _ => "",
+    }
 }

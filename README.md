@@ -71,6 +71,8 @@ GET /api/health
 4. `migrations/0004_perfect_fields.sql` 完美版字段补充
 5. `migrations/0005_customer_review_images.sql` 客户评价图片表
 6. `migrations/0006_cleanup_bad_test_data_and_seed_demo.sql` 清理坏数据并补演示数据
+7. `migrations/0007_default_agreements.sql` 默认协议数据
+8. `migrations/0008_customer_primary_store_and_store_crud.sql` 客户主门店字段与门店维护增强
 
 ## 接口文档
 

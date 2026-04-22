@@ -33,6 +33,8 @@ pub struct CreateCustomerRequest {
     pub mobile: String,
     pub source: Option<String>,
     pub remark: Option<String>,
+    #[serde(default, alias = "store_id")]
+    pub primary_store_id: Option<i64>,
     pub address: Option<AddressPayload>,
 }
 
@@ -41,6 +43,8 @@ pub struct UpdateCustomerRequest {
     pub name: Option<String>,
     pub source: Option<String>,
     pub remark: Option<String>,
+    #[serde(default, alias = "store_id")]
+    pub primary_store_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -57,6 +61,9 @@ pub struct CustomerItem {
     pub name: String,
     pub mobile: String,
     pub source: Option<String>,
+    pub primary_store_id: Option<i64>,
+    pub primary_store_name: Option<String>,
+    pub store_ids: Vec<i64>,
     pub address_count: usize,
     pub default_address: Option<String>,
     pub order_count: usize,
@@ -79,6 +86,9 @@ pub struct CustomerDetailResponse {
     pub mobile: String,
     pub source: Option<String>,
     pub remark: Option<String>,
+    pub primary_store_id: Option<i64>,
+    pub primary_store_name: Option<String>,
+    pub store_ids: Vec<i64>,
     pub addresses: Vec<AddressPayload>,
     pub task_count: usize,
     pub service_count: usize,
@@ -170,7 +180,7 @@ pub async fn list_customers(
         let store_names = if store_ids.is_empty() {
             Vec::new()
         } else {
-            db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids })
+            db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
                 .await
                 .context("failed to query customer store names")
                 .map_err(AppError::Internal)?
@@ -178,11 +188,16 @@ pub async fn list_customers(
                 .filter_map(|item| item.store_name)
                 .collect::<Vec<_>>()
         };
+        let primary_store_id = customer.primary_store_id.or_else(|| store_ids.first().copied());
+        let primary_store_name = load_store_name(&state, primary_store_id).await?;
         items.push(CustomerItem {
             id: customer_id,
             name: customer.name.unwrap_or_default(),
             mobile: customer.mobile.unwrap_or_default(),
             source: customer.source,
+            primary_store_id,
+            primary_store_name,
+            store_ids: store_ids.clone(),
             address_count: addresses.len(),
             default_address: addresses.iter().find(|item| item.is_default == Some(1)).and_then(|item| item.address.clone()).or_else(|| addresses.first().and_then(|item| item.address.clone())),
             order_count: tasks.len(),
@@ -220,6 +235,8 @@ pub async fn create_customer(
         return Err(AppError::Conflict("该手机号客户已存在".to_string()));
     }
 
+    let primary_store_id = resolve_customer_store_id(&state, &auth_user, payload.primary_store_id).await?;
+
     CustomerEntity::insert(
         state.rb.as_ref(),
         &CustomerEntity {
@@ -228,6 +245,7 @@ pub async fn create_customer(
             mobile: Some(payload.mobile.clone()),
             source: payload.source.clone().or_else(|| Some("manual".to_string())),
             remark: payload.remark.clone(),
+            primary_store_id,
             created_by: Some(auth_user.user_id),
             created_at: None,
             updated_at: None,
@@ -274,7 +292,12 @@ pub async fn update_customer(
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
-    let _ = find_customer(&state, customer_id).await?;
+    let existing_customer = find_customer(&state, customer_id).await?;
+    let primary_store_id = if payload.primary_store_id.is_some() {
+        resolve_customer_store_id(&state, &auth_user, payload.primary_store_id).await?
+    } else {
+        existing_customer.primary_store_id
+    };
 
     CustomerEntity::update_by_map(
         state.rb.as_ref(),
@@ -282,9 +305,10 @@ pub async fn update_customer(
             name: payload.name.clone(),
             source: payload.source.clone(),
             remark: payload.remark.clone(),
+            primary_store_id,
             ..Default::default()
         },
-        value! { "id": customer_id },
+        value! { "id": customer_id, "column": ["name", "source", "remark", "primary_store_id"] },
     )
     .await
     .context("failed to update customer")
@@ -375,7 +399,7 @@ pub async fn search_customer_by_mobile(
         let store_names = if store_ids.is_empty() {
             Vec::new()
         } else {
-            db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids })
+            db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
                 .await
                 .context("failed to query customer store names for search")
                 .map_err(AppError::Internal)?
@@ -383,11 +407,16 @@ pub async fn search_customer_by_mobile(
                 .filter_map(|item| item.store_name)
                 .collect::<Vec<_>>()
         };
+        let primary_store_id = item.primary_store_id.or_else(|| store_ids.first().copied());
+        let primary_store_name = load_store_name(&state, primary_store_id).await?;
         result.push(CustomerItem {
             id: customer_id,
             name: item.name.unwrap_or_default(),
             mobile: item.mobile.unwrap_or_default(),
             source: item.source,
+            primary_store_id,
+            primary_store_name,
+            store_ids: store_ids.clone(),
             address_count: addresses.len(),
             default_address: addresses.iter().find(|addr| addr.is_default == Some(1)).and_then(|addr| addr.address.clone()).or_else(|| addresses.first().and_then(|addr| addr.address.clone())),
             order_count: tasks.len(),
@@ -423,7 +452,7 @@ async fn get_customer_detail_inner(
     let store_names = if store_ids.is_empty() {
         Vec::new()
     } else {
-        db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids })
+        db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
             .await
             .context("failed to query customer detail store names")
             .map_err(AppError::Internal)?
@@ -431,6 +460,8 @@ async fn get_customer_detail_inner(
             .filter_map(|item| item.store_name)
             .collect::<Vec<_>>()
     };
+    let primary_store_id = customer.primary_store_id.or_else(|| store_ids.first().copied());
+    let primary_store_name = load_store_name(state, primary_store_id).await?;
     let default_address = addresses.iter().find(|item| item.is_default == Some(1)).and_then(|item| item.address.clone()).or_else(|| addresses.first().and_then(|item| item.address.clone()));
 
     Ok(Json(ApiResponse::success(CustomerDetailResponse {
@@ -439,6 +470,9 @@ async fn get_customer_detail_inner(
         mobile: customer.mobile.unwrap_or_default(),
         source: customer.source,
         remark: customer.remark,
+        primary_store_id,
+        primary_store_name,
+        store_ids,
         addresses: addresses
             .into_iter()
             .map(|item| AddressPayload {
@@ -483,4 +517,49 @@ async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>,
     .context("failed to query user stores for customer scope")
     .map_err(AppError::Internal)?;
     Ok(stores.into_iter().filter_map(|item| item.store_id).collect())
+}
+
+async fn resolve_customer_store_id(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    requested_store_id: Option<i64>,
+) -> Result<Option<i64>, AppError> {
+    let store_id = if requested_store_id.is_some() {
+        requested_store_id
+    } else if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+        load_user_store_ids(state, auth_user.user_id).await?.into_iter().next()
+    } else {
+        None
+    };
+
+    if let Some(store_id) = store_id {
+        let exists = db::select_one_by_map_compat::<crate::models::store::StoreEntity>(
+            state.rb.as_ref(),
+            "store",
+            value! { "id": store_id },
+        )
+        .await
+        .context("failed to query customer primary store")
+        .map_err(AppError::Internal)?;
+        if exists.is_none() {
+            return Err(AppError::BadRequest("门店不存在".to_string()));
+        }
+    }
+
+    Ok(store_id)
+}
+
+async fn load_store_name(state: &AppState, store_id: Option<i64>) -> Result<Option<String>, AppError> {
+    let Some(store_id) = store_id else {
+        return Ok(None);
+    };
+    let store = db::select_one_by_map_compat::<crate::models::store::StoreEntity>(
+        state.rb.as_ref(),
+        "store",
+        value! { "id": store_id },
+    )
+    .await
+    .context("failed to query store name for customer")
+    .map_err(AppError::Internal)?;
+    Ok(store.and_then(|item| item.store_name))
 }
