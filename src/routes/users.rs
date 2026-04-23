@@ -216,6 +216,8 @@ pub async fn create_user(
         return Err(AppError::BadRequest("请至少分配一个角色".to_string()));
     }
 
+    let store_ids = validate_user_store_binding(&payload.role_codes, payload.store_ids.clone().unwrap_or_default())?;
+
     let exists: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": payload.mobile.as_str() })
         .await
         .context("failed to query existing user by mobile")
@@ -261,7 +263,7 @@ pub async fn create_user(
     let user_id = user.id.unwrap_or_default();
 
     replace_user_roles(&state, user_id, payload.role_codes).await?;
-    replace_user_stores(&state, user_id, payload.store_ids.unwrap_or_default()).await?;
+    replace_user_stores(&state, user_id, store_ids).await?;
 
     get_user_detail_inner(&state, user_id).await
 }
@@ -274,6 +276,13 @@ pub async fn update_user(
 ) -> Result<Json<ApiResponse<UserDetailResponse>>, AppError> {
     ensure_admin_access(&state, &headers)?;
     let _ = find_user(&state, user_id).await?;
+    let current_role_codes = find_role_codes(&state, user_id).await?;
+    let current_store_ids = load_user_store_ids(&state, user_id).await?;
+    let next_role_codes = payload.role_codes.clone().unwrap_or(current_role_codes);
+    let next_store_ids = validate_user_store_binding(
+        &next_role_codes,
+        payload.store_ids.clone().unwrap_or(current_store_ids),
+    )?;
 
     UserEntity::update_by_map(
         state.rb.as_ref(),
@@ -292,8 +301,8 @@ pub async fn update_user(
     if let Some(role_codes) = payload.role_codes {
         replace_user_roles(&state, user_id, role_codes).await?;
     }
-    if let Some(store_ids) = payload.store_ids {
-        replace_user_stores(&state, user_id, store_ids).await?;
+    if payload.store_ids.is_some() || next_store_ids != load_user_store_ids(&state, user_id).await? {
+        replace_user_stores(&state, user_id, next_store_ids).await?;
     }
 
     get_user_detail_inner(&state, user_id).await
@@ -480,6 +489,29 @@ async fn replace_user_stores(state: &AppState, user_id: i64, store_ids: Vec<i64>
         .map_err(AppError::Internal)?;
     }
     Ok(())
+}
+
+async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>, AppError> {
+    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
+        .await
+        .context("failed to query user stores")
+        .map_err(AppError::Internal)?;
+
+    Ok(stores.into_iter().filter_map(|item| item.store_id).collect())
+}
+
+fn validate_user_store_binding(role_codes: &[String], store_ids: Vec<i64>) -> Result<Vec<i64>, AppError> {
+    let requires_single_store = role_codes.iter().any(|role| role == "dealer" || role == "technician");
+
+    if !requires_single_store {
+        return Ok(store_ids);
+    }
+
+    if store_ids.len() != 1 {
+        return Err(AppError::BadRequest("经销商和师傅账号必须且只能绑定一个门店".to_string()));
+    }
+
+    Ok(store_ids)
 }
 
 async fn find_role_codes(state: &AppState, user_id: i64) -> Result<Vec<String>, AppError> {

@@ -1,6 +1,7 @@
 pub mod attachment;
 pub mod audit_log;
 pub mod customer;
+pub mod customer_source;
 pub mod customer_address;
 pub mod customer_review;
 pub mod customer_review_image;

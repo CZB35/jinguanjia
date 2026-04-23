@@ -1,0 +1,50 @@
+SET NAMES utf8mb4;
+
+SET @ddl = IF(
+  EXISTS(
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'store' AND COLUMN_NAME = 'code'
+  ),
+  'SELECT 1',
+  'ALTER TABLE `store` ADD COLUMN `code` VARCHAR(50) NULL COMMENT ''门店编码'' AFTER `store_name`'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @ddl = IF(
+  EXISTS(
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'store' AND COLUMN_NAME = 'remark'
+  ),
+  'SELECT 1',
+  'ALTER TABLE `store` ADD COLUMN `remark` VARCHAR(255) NULL COMMENT ''备注'' AFTER `address`'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @ddl = IF(
+  EXISTS(
+    SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'store' AND INDEX_NAME = 'uk_store_code'
+  ),
+  'SELECT 1',
+  'ALTER TABLE `store` ADD UNIQUE KEY `uk_store_code` (`code`)'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+CREATE TABLE IF NOT EXISTS `customer_source` (
+  `id` BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+  `name` VARCHAR(100) NOT NULL COMMENT '来源名称',
+  `code` VARCHAR(50) NOT NULL COMMENT '来源编码',
+  `sort_no` INT NOT NULL DEFAULT 0 COMMENT '排序号',
+  `remark` VARCHAR(255) NULL COMMENT '备注',
+  `status` VARCHAR(20) NOT NULL DEFAULT 'enabled' COMMENT '状态: enabled/disabled',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  UNIQUE KEY `uk_customer_source_code` (`code`),
+  KEY `idx_customer_source_status_sort` (`status`, `sort_no`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客户来源表';

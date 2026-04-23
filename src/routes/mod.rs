@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod customer_reviews;
+pub mod customer_sources;
 pub mod customers;
 pub mod dashboards;
 pub mod files;
@@ -50,8 +51,10 @@ pub fn router() -> Router<AppState> {
         .route("/customer-reviews/images", post(customer_reviews::upload_customer_review_image))
         .route("/customer-reviews/images/{id}", delete(customer_reviews::delete_customer_review_image))
         .route("/customer-reviews/submit", post(customer_reviews::submit_customer_review))
+        .route("/customer-sources", get(customer_sources::list_customer_sources).post(customer_sources::create_customer_source))
+        .route("/customer-sources/{id}", get(customer_sources::get_customer_source_detail).patch(customer_sources::update_customer_source).delete(customer_sources::delete_customer_source))
         .route("/stores", get(stores::list_stores).post(stores::create_store))
-        .route("/stores/{id}", get(stores::get_store_detail).patch(stores::update_store_detail))
+        .route("/stores/{id}", get(stores::get_store_detail).patch(stores::update_store_detail).delete(stores::delete_store))
         .route("/stores/{id}/status", patch(stores::update_store_status))
         .route("/users/import", post(imports::import_users))
         .route("/users/export", get(imports::export_users))

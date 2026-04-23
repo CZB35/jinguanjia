@@ -165,6 +165,7 @@ pub async fn list_technicians(
 ) -> Result<Json<ApiResponse<TechnicianListResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    let dealer_store_ids = dealer_scope_store_ids(&state, &auth_user).await?;
 
     let technician_role_id = find_role_id_by_code(&state, "technician").await?;
     let user_roles: Vec<UserRoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_role", value! { "role_id": technician_role_id })
@@ -204,6 +205,11 @@ pub async fn list_technicians(
             .context("failed to query technician store relations")
             .map_err(AppError::Internal)?;
         let store_ids: Vec<i64> = store_relations.into_iter().filter_map(|item| item.store_id).collect();
+        if let Some(dealer_store_ids) = &dealer_store_ids
+            && !store_ids.iter().any(|store_id| dealer_store_ids.contains(store_id))
+        {
+            continue;
+        }
         let store_names = if store_ids.is_empty() {
             Vec::new()
         } else {
@@ -256,6 +262,7 @@ pub async fn get_technician_detail(
 ) -> Result<Json<ApiResponse<TechnicianDetailResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    ensure_technician_access(&state, &auth_user, technician_id).await?;
 
     get_technician_detail_inner(&state, technician_id).await
 }
@@ -273,10 +280,10 @@ pub async fn create_technician(
         .clone()
         .filter(|item| !item.trim().is_empty())
         .unwrap_or_else(|| "123456".to_string());
-    let store_id = payload
+    let requested_store_id = payload
         .store_id
-        .or_else(|| payload.store_ids.as_ref().and_then(|item| item.first().copied()))
-        .ok_or_else(|| AppError::BadRequest("请选择所属门店".to_string()))?;
+        .or_else(|| payload.store_ids.as_ref().and_then(|item| item.first().copied()));
+    let store_id = resolve_create_technician_store_id(&state, &auth_user, requested_store_id).await?;
     let service_types = normalize_service_types(payload.service_types.clone(), payload.role_names.clone())?;
 
     if payload.name.trim().is_empty() {
@@ -390,6 +397,7 @@ pub async fn update_technician(
 ) -> Result<Json<ApiResponse<TechnicianDetailResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    ensure_technician_access(&state, &auth_user, technician_id).await?;
 
     let _ = find_user(&state, technician_id).await?;
 
@@ -442,6 +450,7 @@ pub async fn update_technician(
     }
 
     if let Some(store_id) = payload.store_id {
+        let store_id = resolve_technician_store_id(&state, &auth_user, store_id).await?;
         let existing_stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": technician_id })
             .await
             .context("failed to query existing technician stores")
@@ -480,6 +489,7 @@ pub async fn update_technician_status(
 ) -> Result<Json<ApiResponse<TechnicianDetailResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    ensure_technician_access(&state, &auth_user, technician_id).await?;
 
     if payload.status != "enabled" && payload.status != "disabled" {
         return Err(AppError::BadRequest("status只能为enabled或disabled".to_string()));
@@ -507,6 +517,7 @@ pub async fn get_technician_performance(
 ) -> Result<Json<ApiResponse<TechnicianPerformanceResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    ensure_technician_access(&state, &auth_user, technician_id).await?;
 
     let _ = find_user(&state, technician_id).await?;
     let tasks: Vec<crate::models::task::TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "current_technician_id": technician_id })
@@ -539,6 +550,7 @@ pub async fn list_available_technicians(
 ) -> Result<Json<ApiResponse<Vec<TechnicianItem>>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    ensure_store_access(&state, &auth_user, query.store_id).await?;
 
     let store_relations: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "store_id": query.store_id })
         .await
@@ -709,6 +721,97 @@ async fn calculate_technician_average_score(state: &AppState, technician_id: i64
     }
 
     Ok(scores.iter().map(|item| item.total_score.unwrap_or_default() as f64).sum::<f64>() / scores.len() as f64)
+}
+
+async fn ensure_technician_access(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    technician_id: i64,
+) -> Result<(), AppError> {
+    let Some(dealer_store_ids) = dealer_scope_store_ids(state, auth_user).await? else {
+        return Ok(());
+    };
+
+    let technician_store_ids = load_user_store_ids(state, technician_id).await?;
+    if technician_store_ids
+        .iter()
+        .any(|store_id| dealer_store_ids.contains(store_id))
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden("您只能查看或维护所属门店下的师傅".to_string()))
+}
+
+async fn ensure_store_access(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    store_id: i64,
+) -> Result<(), AppError> {
+    let Some(dealer_store_ids) = dealer_scope_store_ids(state, auth_user).await? else {
+        return Ok(());
+    };
+
+    if dealer_store_ids.contains(&store_id) {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden("您只能选择所属门店".to_string()))
+}
+
+async fn resolve_technician_store_id(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    store_id: i64,
+) -> Result<i64, AppError> {
+    ensure_store_access(state, auth_user, store_id).await?;
+    Ok(store_id)
+}
+
+async fn dealer_scope_store_ids(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+) -> Result<Option<Vec<i64>>, AppError> {
+    if !auth_user.has_role("dealer") || auth_user.has_role("hq_reviewer") || auth_user.has_role("super_admin") {
+        return Ok(None);
+    }
+
+    Ok(Some(load_user_store_ids(state, auth_user.user_id).await?))
+}
+
+async fn resolve_create_technician_store_id(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    requested_store_id: Option<i64>,
+) -> Result<i64, AppError> {
+    if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+        return dealer_owned_store_id(state, auth_user).await;
+    }
+
+    let store_id = requested_store_id.ok_or_else(|| AppError::BadRequest("请选择所属门店".to_string()))?;
+    resolve_technician_store_id(state, auth_user, store_id).await
+}
+
+async fn dealer_owned_store_id(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+) -> Result<i64, AppError> {
+    let store_ids = load_user_store_ids(state, auth_user.user_id).await?;
+
+    match store_ids.as_slice() {
+        [store_id] => Ok(*store_id),
+        [] => Err(AppError::Forbidden("当前经销商账号未绑定门店".to_string())),
+        _ => Err(AppError::Conflict("当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string())),
+    }
+}
+
+async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>, AppError> {
+    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
+        .await
+        .context("failed to query user store relations")
+        .map_err(AppError::Internal)?;
+
+    Ok(stores.into_iter().filter_map(|item| item.store_id).collect())
 }
 
 fn normalize_service_types(service_types: Option<Vec<String>>, role_names: Option<Vec<String>>) -> Result<Vec<String>, AppError> {
