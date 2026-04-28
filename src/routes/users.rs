@@ -124,7 +124,7 @@ pub async fn list_users(
         let user_id = user.id.unwrap_or_default();
         let roles = find_role_codes(&state, user_id).await?;
         if let Some(role_code) = &query.role_code
-            && !roles.iter().any(|role| role == role_code)
+            && !roles.iter().any(|role| role == &normalize_role_code_alias(role_code))
         {
             continue;
         }
@@ -144,32 +144,7 @@ pub async fn list_users(
                 .filter_map(|item| item.store_name)
                 .collect::<Vec<_>>()
         };
-        let related_tasks = if store_ids.is_empty() {
-            Vec::new()
-        } else {
-            db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids.clone() })
-                .await
-                .context("failed to query related tasks in list_users")
-                .map_err(AppError::Internal)?
-        };
-        let technician_count = if store_ids.is_empty() {
-            0
-        } else {
-            db::select_by_map_compat::<UserStoreEntity>(state.rb.as_ref(), "user_store", value! { "store_id": store_ids.clone() })
-                .await
-                .context("failed to query technician count in list_users")
-                .map_err(AppError::Internal)?
-                .len()
-        };
-        let customer_count = related_tasks
-            .iter()
-            .filter_map(|item| item.customer_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        let completed_task_count = related_tasks
-            .iter()
-            .filter(|item| item.task_status.as_deref() == Some("completed"))
-            .count();
+        let stats = aggregate_store_scope_stats(&state, &store_ids).await?;
         items.push(UserItem {
             id: user_id,
             name: user.name.unwrap_or_default(),
@@ -177,9 +152,9 @@ pub async fn list_users(
             status: user.status.unwrap_or_else(|| "enabled".to_string()),
             roles,
             store_names,
-            technician_count,
-            customer_count,
-            completed_task_count,
+            technician_count: stats.technician_count,
+            customer_count: stats.customer_count,
+            completed_task_count: stats.completed_task_count,
         });
     }
     let total = items.len();
@@ -216,7 +191,8 @@ pub async fn create_user(
         return Err(AppError::BadRequest("请至少分配一个角色".to_string()));
     }
 
-    let store_ids = validate_user_store_binding(&payload.role_codes, payload.store_ids.clone().unwrap_or_default())?;
+    let normalized_role_codes = payload.role_codes.iter().map(|item| normalize_role_code_alias(item)).collect::<Vec<_>>();
+    let store_ids = validate_user_store_binding(&normalized_role_codes, payload.store_ids.clone().unwrap_or_default())?;
 
     let exists: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": payload.mobile.as_str() })
         .await
@@ -262,7 +238,7 @@ pub async fn create_user(
         .ok_or_else(|| AppError::Internal(anyhow!("user create succeeded but fetch failed")))?;
     let user_id = user.id.unwrap_or_default();
 
-    replace_user_roles(&state, user_id, payload.role_codes).await?;
+    replace_user_roles(&state, user_id, normalized_role_codes).await?;
     replace_user_stores(&state, user_id, store_ids).await?;
 
     get_user_detail_inner(&state, user_id).await
@@ -278,7 +254,11 @@ pub async fn update_user(
     let _ = find_user(&state, user_id).await?;
     let current_role_codes = find_role_codes(&state, user_id).await?;
     let current_store_ids = load_user_store_ids(&state, user_id).await?;
-    let next_role_codes = payload.role_codes.clone().unwrap_or(current_role_codes);
+    let next_role_codes = payload
+        .role_codes
+        .clone()
+        .map(|codes| codes.into_iter().map(|item| normalize_role_code_alias(&item)).collect())
+        .unwrap_or(current_role_codes);
     let next_store_ids = validate_user_store_binding(
         &next_role_codes,
         payload.store_ids.clone().unwrap_or(current_store_ids),
@@ -298,7 +278,8 @@ pub async fn update_user(
     .context("failed to update user")
     .map_err(AppError::Internal)?;
 
-    if let Some(role_codes) = payload.role_codes {
+    if payload.role_codes.is_some() {
+        let role_codes = next_role_codes.clone();
         replace_user_roles(&state, user_id, role_codes).await?;
     }
     if payload.store_ids.is_some() || next_store_ids != load_user_store_ids(&state, user_id).await? {
@@ -385,32 +366,7 @@ async fn get_user_detail_inner(
             .filter_map(|item| item.store_name)
             .collect::<Vec<_>>()
     };
-    let related_tasks = if store_ids.is_empty() {
-        Vec::new()
-    } else {
-        db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids.clone() })
-            .await
-            .context("failed to query user detail related tasks")
-            .map_err(AppError::Internal)?
-    };
-    let technician_count = if store_ids.is_empty() {
-        0
-    } else {
-        db::select_by_map_compat::<UserStoreEntity>(state.rb.as_ref(), "user_store", value! { "store_id": store_ids.clone() })
-            .await
-            .context("failed to query user detail technician count")
-            .map_err(AppError::Internal)?
-            .len()
-    };
-    let customer_count = related_tasks
-        .iter()
-        .filter_map(|item| item.customer_id)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    let completed_task_count = related_tasks
-        .iter()
-        .filter(|item| item.task_status.as_deref() == Some("completed"))
-        .count();
+    let stats = aggregate_store_scope_stats(state, &store_ids).await?;
 
     Ok(Json(ApiResponse::success(UserDetailResponse {
         id: user.id.unwrap_or_default(),
@@ -422,10 +378,79 @@ async fn get_user_detail_inner(
         roles,
         store_ids,
         store_names,
+        technician_count: stats.technician_count,
+        customer_count: stats.customer_count,
+        completed_task_count: stats.completed_task_count,
+    })))
+}
+
+struct StoreScopeStats {
+    technician_count: usize,
+    customer_count: usize,
+    completed_task_count: usize,
+}
+
+async fn aggregate_store_scope_stats(state: &AppState, store_ids: &[i64]) -> Result<StoreScopeStats, AppError> {
+    if store_ids.is_empty() {
+        return Ok(StoreScopeStats {
+            technician_count: 0,
+            customer_count: 0,
+            completed_task_count: 0,
+        });
+    }
+
+    let related_tasks = db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids.to_vec() })
+        .await
+        .context("failed to query related tasks in store scope")
+        .map_err(AppError::Internal)?;
+    let store_relations = db::select_by_map_compat::<UserStoreEntity>(state.rb.as_ref(), "user_store", value! { "store_id": store_ids.to_vec() })
+        .await
+        .context("failed to query store user relations in store scope")
+        .map_err(AppError::Internal)?;
+    let user_ids = store_relations
+        .into_iter()
+        .filter_map(|item| item.user_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let technician_count = count_technician_users(state, &user_ids).await?;
+    let customer_count = related_tasks
+        .iter()
+        .filter_map(|item| item.customer_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let completed_task_count = related_tasks
+        .iter()
+        .filter(|item| item.task_status.as_deref() == Some("completed"))
+        .count();
+
+    Ok(StoreScopeStats {
         technician_count,
         customer_count,
         completed_task_count,
-    })))
+    })
+}
+
+async fn count_technician_users(state: &AppState, user_ids: &[i64]) -> Result<usize, AppError> {
+    if user_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let technician_role_id = find_role_id_by_code(state, "technician").await?;
+    let technician_relations = db::select_by_map_compat::<UserRoleEntity>(
+        state.rb.as_ref(),
+        "user_role",
+        value! { "role_id": technician_role_id, "user_id": user_ids.to_vec() },
+    )
+    .await
+    .context("failed to query technician role relations in store scope")
+    .map_err(AppError::Internal)?;
+
+    Ok(technician_relations
+        .into_iter()
+        .filter_map(|item| item.user_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len())
 }
 
 async fn replace_user_roles(state: &AppState, user_id: i64, role_codes: Vec<String>) -> Result<(), AppError> {
@@ -512,6 +537,16 @@ fn validate_user_store_binding(role_codes: &[String], store_ids: Vec<i64>) -> Re
     }
 
     Ok(store_ids)
+}
+
+fn normalize_role_code_alias(role_code: &str) -> String {
+    match role_code.trim().to_ascii_lowercase().as_str() {
+        "admin" | "role-001" => "super_admin".to_string(),
+        "inspection_admin" | "role-002" => "hq_reviewer".to_string(),
+        "dealer_manager" | "role-003" => "dealer".to_string(),
+        "readonly_admin" | "role-004" => "hq_reviewer".to_string(),
+        _ => role_code.trim().to_string(),
+    }
 }
 
 async fn find_role_codes(state: &AppState, user_id: i64) -> Result<Vec<String>, AppError> {

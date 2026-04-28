@@ -11,6 +11,7 @@ pub struct TaskEntity {
     pub dealer_user_id: Option<i64>,
     pub current_technician_id: Option<i64>,
     pub service_type: Option<String>,
+    pub task_type: Option<String>,
     pub priority: Option<String>,
     pub appointment_time: Option<NaiveDateTime>,
     pub service_time_slot: Option<String>,

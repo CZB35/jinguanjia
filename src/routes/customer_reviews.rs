@@ -183,7 +183,7 @@ pub async fn review_form(
         images: images.into_iter().map(|item| CustomerReviewImagePayload {
             id: item.id.unwrap_or_default(),
             file_name: item.file_name.unwrap_or_default(),
-            file_url: item.file_url.unwrap_or_default(),
+            file_url: storage::public_url(&item.file_url.unwrap_or_default()),
         }).collect(),
     })))
 }
@@ -238,7 +238,7 @@ pub async fn upload_customer_review_image(
     Ok(Json(ApiResponse::success(CustomerReviewImageUploadResponse {
         id: image.id.unwrap_or_default(),
         file_name: image.file_name.unwrap_or_default(),
-        file_url: image.file_url.unwrap_or_default(),
+        file_url: storage::public_url(&image.file_url.unwrap_or_default()),
     })))
 }
 
@@ -405,7 +405,7 @@ pub async fn review_detail(
             .map(|item| CustomerReviewImagePayload {
                 id: item.id.unwrap_or_default(),
                 file_name: item.file_name.unwrap_or_default(),
-                file_url: item.file_url.unwrap_or_default(),
+                file_url: storage::public_url(&item.file_url.unwrap_or_default()),
             })
             .collect(),
         created_at: review.created_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),

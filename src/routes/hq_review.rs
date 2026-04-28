@@ -32,6 +32,7 @@ use crate::{
 pub struct ReviewTaskQuery {
     pub task_status: Option<String>,
     pub service_type: Option<String>,
+    pub task_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +40,7 @@ pub struct ReviewTaskItem {
     pub id: i64,
     pub task_id: i64,
     pub task_no: String,
+    pub task_type: String,
     pub service_type: String,
     pub task_status: String,
     pub service_status: String,
@@ -64,6 +66,7 @@ pub struct ReviewTaskListResponse {
 pub struct ReviewTaskDetailResponse {
     pub id: i64,
     pub task_no: String,
+    pub task_type: String,
     pub service_type: String,
     pub task_status: String,
     pub review_status: String,
@@ -168,6 +171,11 @@ async fn load_review_tasks(state: &AppState, query: &ReviewTaskQuery) -> Result<
         {
             continue;
         }
+        if let Some(task_type) = normalized_task_type_filter(query.task_type.as_deref())?
+            && task.task_type.as_deref() != Some(task_type)
+        {
+            continue;
+        }
         let task_id = task.id.unwrap_or_default();
         let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! { "task_id": task_id })
             .await
@@ -213,6 +221,7 @@ pub async fn get_review_task_detail(
     Ok(Json(ApiResponse::success(ReviewTaskDetailResponse {
         id: task.id.unwrap_or_default(),
         task_no: task.task_no.unwrap_or_default(),
+        task_type: task.task_type.unwrap_or_default(),
         service_type: task.service_type.unwrap_or_default(),
         task_status: task.task_status.unwrap_or_default(),
         review_status: task.review_status.unwrap_or_default(),
@@ -331,6 +340,7 @@ async fn build_review_task_item(
         id: service_item.id.unwrap_or_default(),
         task_id: task.id.unwrap_or_default(),
         task_no: task.task_no.clone().unwrap_or_default(),
+        task_type: task.task_type.clone().unwrap_or_default(),
         service_type: service_item.service_type.clone().unwrap_or_default(),
         task_status: task.task_status.clone().unwrap_or_default(),
         service_status: service_item.service_status.clone().unwrap_or_default(),
@@ -423,4 +433,16 @@ fn format_datetime(input: chrono::NaiveDateTime) -> String {
 
 fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn normalized_task_type_filter(value: Option<&str>) -> Result<Option<&'static str>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "三专" | "3" | "three_special" | "three-special" => Ok(Some("three_special")),
+        "四专" | "4" | "four_special" | "four-special" => Ok(Some("four_special")),
+        _ => Err(AppError::BadRequest("task_type只能为三专/四专或three_special/four_special".to_string())),
+    }
 }

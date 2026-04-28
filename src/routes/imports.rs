@@ -1,10 +1,10 @@
-use std::{io::Write, path::Path};
+use std::{collections::HashMap, io::Write, path::Path};
 
 use anyhow::{Context, anyhow};
 use axum::{
     Json,
     body::Body,
-    extract::{Multipart, State},
+    extract::{Multipart, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
@@ -43,6 +43,21 @@ pub struct ImportResult {
     pub success_count: usize,
     pub failed_count: usize,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportTemplateQuery {
+    pub role_code: Option<String>,
+}
+
+#[derive(Debug)]
+struct ImportedUserRow {
+    name: String,
+    mobile: String,
+    password: String,
+    role_codes: Vec<String>,
+    store_ids: Vec<i64>,
+    status: String,
 }
 
 pub async fn batch_delete_users(
@@ -126,53 +141,100 @@ pub async fn export_users(
     Ok(response)
 }
 
+pub async fn download_user_import_template(
+    Query(query): Query<ImportTemplateQuery>,
+) -> Result<Response, AppError> {
+    let normalized_role_code = query.role_code.as_deref().map(normalize_role_code_alias);
+    let (file_name, content) = if normalized_role_code.as_deref() == Some("dealer") {
+        (
+            "dealers-import-template.csv",
+            "name,mobile,password,store_id,status\n示例经销商,13800009999,123456,1,enabled\n",
+        )
+    } else {
+        (
+            "users-import-template.csv",
+            "name,mobile,password,role_codes,store_ids,status\n示例用户,13800009999,123456,dealer,1,enabled\n",
+        )
+    };
+
+    let mut response = Response::new(Body::from(content.as_bytes().to_vec()));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", file_name))
+            .map_err(|_| AppError::Internal(anyhow!("invalid content disposition header")))?,
+    );
+    Ok(response)
+}
+
 pub async fn import_users(
     State(state): State<AppState>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<ImportResult>>, AppError> {
     ensure_admin_access(&state, &headers)?;
-    let upload = read_single_multipart(multipart).await?;
-
-    let content = String::from_utf8(upload.bytes)
-        .map_err(|_| AppError::BadRequest("导入文件必须为UTF-8编码CSV".to_string()))?;
+    let upload = read_import_multipart(multipart).await?;
+    let rows = parse_import_rows(&upload)?;
+    let default_role_codes = resolve_default_role_codes(&upload.fields);
     let mut success_count = 0usize;
     let mut failed_count = 0usize;
     let mut errors = Vec::new();
 
-    for (index, line) in content.lines().enumerate().skip(1) {
-        if line.trim().is_empty() {
-            continue;
+    for (index, mut row) in rows.into_iter().enumerate() {
+        if row.role_codes.is_empty() {
+            row.role_codes = default_role_codes.clone();
         }
-        let cols: Vec<&str> = line.split(',').collect();
-        if cols.len() < 5 {
+        row.role_codes = row.role_codes.into_iter().map(|item| normalize_role_code_alias(&item)).collect();
+        if row.name.trim().is_empty() || row.mobile.trim().is_empty() || row.password.trim().is_empty() {
             failed_count += 1;
-            errors.push(format!("第{}行字段不足", index + 1));
+            errors.push(format!("第{}行必填字段缺失", index + 2));
+            continue;
+        }
+        if row.role_codes.is_empty() {
+            failed_count += 1;
+            errors.push(format!("第{}行缺少角色编码", index + 2));
+            continue;
+        }
+        if let Err(error) = validate_import_store_binding(&row.role_codes, &row.store_ids) {
+            failed_count += 1;
+            errors.push(format!("第{}行{}", index + 2, error));
+            continue;
+        }
+        let mut resolved_role_ids = Vec::new();
+        let mut missing_role = None;
+        for role_code in &row.role_codes {
+            if let Some(role_id) = find_role_id_by_code(&state, role_code).await? {
+                resolved_role_ids.push(role_id);
+            } else {
+                missing_role = Some(role_code.clone());
+                break;
+            }
+        }
+        if let Some(role_code) = missing_role {
+            failed_count += 1;
+            errors.push(format!("第{}行角色不存在: {}", index + 2, role_code));
             continue;
         }
 
-        let name = cols[0].trim();
-        let mobile = cols[1].trim();
-        let password = cols[2].trim();
-        let role_codes: Vec<String> = cols[3].split('|').map(|item| item.trim().to_string()).filter(|item| !item.is_empty()).collect();
-        let store_ids: Vec<i64> = cols[4].split('|').filter_map(|item| item.trim().parse().ok()).collect();
-        let status = cols.get(5).copied().unwrap_or("enabled").trim();
-
-        let exists: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": mobile })
+        let exists: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": row.mobile.as_str() })
             .await
             .context("failed to check existing import user")
             .map_err(AppError::Internal)?;
         if !exists.is_empty() {
             failed_count += 1;
-            errors.push(format!("第{}行手机号已存在: {}", index + 1, mobile));
+            errors.push(format!("第{}行手机号已存在: {}", index + 2, row.mobile));
             continue;
         }
 
-        let password_hash = match hash(password, 10) {
+        let password_hash = match hash(&row.password, 10) {
             Ok(item) => item,
             Err(_) => {
                 failed_count += 1;
-                errors.push(format!("第{}行密码处理失败", index + 1));
+                errors.push(format!("第{}行密码处理失败", index + 2));
                 continue;
             }
         };
@@ -181,9 +243,9 @@ pub async fn import_users(
             state.rb.as_ref(),
             &UserEntity {
                 id: None,
-                mobile: Some(mobile.to_string()),
+                mobile: Some(row.mobile.clone()),
                 password_hash: Some(password_hash),
-                name: Some(name.to_string()),
+                name: Some(row.name.clone()),
                 nickname: None,
                 email: None,
                 avatar_url: None,
@@ -191,7 +253,7 @@ pub async fn import_users(
                 id_card: None,
                 emergency_contact_name: None,
                 emergency_contact_mobile: None,
-                status: Some(status.to_string()),
+                status: Some(normalize_user_status(Some(row.status.as_str()))?),
                 last_login_at: None,
                 last_login_ip: None,
                 created_at: None,
@@ -203,30 +265,28 @@ pub async fn import_users(
         .context("failed to insert imported user")
         .map_err(AppError::Internal)?;
 
-        let user: UserEntity = db::select_one_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": mobile })
+        let user: UserEntity = db::select_one_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": row.mobile.as_str() })
             .await
             .context("failed to fetch imported user")
             .map_err(AppError::Internal)?
             .ok_or_else(|| AppError::Internal(anyhow!("imported user fetch failed")))?;
         let user_id = user.id.unwrap_or_default();
 
-        for role_code in role_codes {
-            if let Some(role_id) = find_role_id_by_code(&state, &role_code).await? {
-                UserRoleEntity::insert(
-                    state.rb.as_ref(),
-                    &UserRoleEntity {
-                        id: None,
-                        user_id: Some(user_id),
-                        role_id: Some(role_id),
-                        created_at: None,
-                    },
-                )
-                .await
-                .context("failed to bind imported user role")
-                .map_err(AppError::Internal)?;
-            }
+        for role_id in resolved_role_ids {
+            UserRoleEntity::insert(
+                state.rb.as_ref(),
+                &UserRoleEntity {
+                    id: None,
+                    user_id: Some(user_id),
+                    role_id: Some(role_id),
+                    created_at: None,
+                },
+            )
+            .await
+            .context("failed to bind imported user role")
+            .map_err(AppError::Internal)?;
         }
-        for store_id in store_ids {
+        for store_id in row.store_ids {
             UserStoreEntity::insert(
                 state.rb.as_ref(),
                 &UserStoreEntity {
@@ -257,7 +317,7 @@ pub async fn import_scores(
 ) -> Result<Json<ApiResponse<ImportResult>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["hq_reviewer", "super_admin"])?;
-    let upload = read_single_multipart(multipart).await?;
+    let upload = read_import_multipart(multipart).await?;
 
     let ext = Path::new(&upload.file_name)
         .extension()
@@ -383,26 +443,220 @@ struct ScoreImportRow {
 struct UploadField {
     file_name: String,
     bytes: Vec<u8>,
+    fields: HashMap<String, String>,
 }
 
-async fn read_single_multipart(mut multipart: Multipart) -> Result<UploadField, AppError> {
-    let field = multipart
+async fn read_import_multipart(mut multipart: Multipart) -> Result<UploadField, AppError> {
+    let mut fields = HashMap::new();
+    let mut file_name = None;
+    let mut bytes = None;
+
+    while let Some(field) = multipart
         .next_field()
         .await
         .context("failed to read import multipart field")
         .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::BadRequest("请上传文件".to_string()))?;
-    let file_name = field
-        .file_name()
+    {
+        let name = field.name().map(ToString::to_string).unwrap_or_default();
+        if let Some(current_file_name) = field.file_name().map(ToString::to_string) {
+            let file_bytes = field
+                .bytes()
+                .await
+                .context("failed to read import file bytes")
+                .map_err(AppError::Internal)?
+                .to_vec();
+            file_name = Some(current_file_name);
+            bytes = Some(file_bytes);
+        } else {
+            let text = field
+                .text()
+                .await
+                .context("failed to read import multipart text field")
+                .map_err(AppError::Internal)?;
+            if !name.is_empty() {
+                fields.insert(name, text);
+            }
+        }
+    }
+
+    Ok(UploadField {
+        file_name: file_name.ok_or_else(|| AppError::BadRequest("请上传文件".to_string()))?,
+        bytes: bytes.ok_or_else(|| AppError::BadRequest("请上传文件".to_string()))?,
+        fields,
+    })
+}
+
+fn parse_import_rows(upload: &UploadField) -> Result<Vec<ImportedUserRow>, AppError> {
+    let ext = Path::new(&upload.file_name)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ext == "csv" {
+        return parse_user_csv(&upload.bytes);
+    }
+    if ["xls", "xlsx"].contains(&ext.as_str()) {
+        return parse_user_excel(&upload.file_name, &upload.bytes);
+    }
+
+    Err(AppError::BadRequest("用户导入仅支持 csv/xls/xlsx 文件".to_string()))
+}
+
+fn parse_user_csv(bytes: &[u8]) -> Result<Vec<ImportedUserRow>, AppError> {
+    let content = String::from_utf8(bytes.to_vec())
+        .map_err(|_| AppError::BadRequest("用户导入CSV文件必须为UTF-8编码".to_string()))?;
+    let mut lines = content.lines();
+    let headers = lines
+        .next()
+        .ok_or_else(|| AppError::BadRequest("导入文件不能为空".to_string()))?
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .collect::<Vec<_>>();
+    let header_map = build_header_index_map(&headers);
+    let mut rows = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = line.split(',').map(|item| item.trim().to_string()).collect::<Vec<_>>();
+        rows.push(parse_import_row_values(&header_map, &cols));
+    }
+    Ok(rows)
+}
+
+fn parse_user_excel(file_name: &str, bytes: &[u8]) -> Result<Vec<ImportedUserRow>, AppError> {
+    let temp_dir = std::env::temp_dir();
+    let temp_path = temp_dir.join(format!("{}-{}", Uuid::new_v4(), file_name));
+    {
+        let mut file = std::fs::File::create(&temp_path)
+            .map_err(|_| AppError::Internal(anyhow!("failed to create temp user import file")))?;
+        file.write_all(bytes)
+            .map_err(|_| AppError::Internal(anyhow!("failed to write temp user import file")))?;
+    }
+    let result = parse_user_excel_file(&temp_path);
+    let _ = std::fs::remove_file(&temp_path);
+    result
+}
+
+fn parse_user_excel_file(path: &Path) -> Result<Vec<ImportedUserRow>, AppError> {
+    let mut workbook = open_workbook_auto(path)
+        .map_err(|_| AppError::BadRequest("无法读取用户导入文件".to_string()))?;
+    let sheet_name = workbook
+        .sheet_names()
+        .first()
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("用户导入文件没有工作表".to_string()))?;
+    let range = workbook
+        .worksheet_range(&sheet_name)
+        .map_err(|_| AppError::BadRequest("读取用户导入工作表失败".to_string()))?;
+    let mut row_iter = range.rows();
+    let headers = row_iter
+        .next()
+        .ok_or_else(|| AppError::BadRequest("导入文件不能为空".to_string()))?
+        .iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>();
+    let header_map = build_header_index_map(&headers);
+    let mut rows = Vec::new();
+    for row in row_iter {
+        let cols = row.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        if cols.iter().all(|item| item.trim().is_empty()) {
+            continue;
+        }
+        rows.push(parse_import_row_values(&header_map, &cols));
+    }
+    Ok(rows)
+}
+
+fn build_header_index_map(headers: &[String]) -> HashMap<String, usize> {
+    let mut header_map = HashMap::new();
+    for (index, header) in headers.iter().enumerate() {
+        let normalized = header.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            header_map.insert(normalized, index);
+        }
+    }
+    header_map
+}
+
+fn parse_import_row_values(header_map: &HashMap<String, usize>, cols: &[String]) -> ImportedUserRow {
+    let name = value_by_keys(header_map, cols, &["name", "姓名"]);
+    let mobile = value_by_keys(header_map, cols, &["mobile", "手机号", "电话"]);
+    let password = value_by_keys(header_map, cols, &["password", "密码"]);
+    let role_code = value_by_keys(header_map, cols, &["role_code", "role_codes", "角色编码", "角色"]);
+    let store_value = value_by_keys(header_map, cols, &["store_id", "store_ids", "门店id", "所属门店", "门店"]);
+    let status = value_by_keys(header_map, cols, &["status", "状态"]);
+
+    ImportedUserRow {
+        name,
+        mobile,
+        password,
+        role_codes: split_multi_values(&role_code),
+        store_ids: split_multi_i64_values(&store_value),
+        status: if status.trim().is_empty() { "enabled".to_string() } else { status },
+    }
+}
+
+fn value_by_keys(header_map: &HashMap<String, usize>, cols: &[String], keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(index) = header_map.get(&key.to_ascii_lowercase()) {
+            return cols.get(*index).cloned().unwrap_or_default().trim().to_string();
+        }
+    }
+    String::new()
+}
+
+fn split_multi_values(value: &str) -> Vec<String> {
+    value
+        .split('|')
+        .flat_map(|item| item.split('、'))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
         .map(ToString::to_string)
-        .ok_or_else(|| AppError::BadRequest("上传文件名不能为空".to_string()))?;
-    let bytes = field
-        .bytes()
-        .await
-        .context("failed to read import file bytes")
-        .map_err(AppError::Internal)?
-        .to_vec();
-    Ok(UploadField { file_name, bytes })
+        .collect()
+}
+
+fn split_multi_i64_values(value: &str) -> Vec<i64> {
+    value
+        .split('|')
+        .flat_map(|item| item.split('、'))
+        .filter_map(|item| item.trim().parse::<i64>().ok())
+        .collect()
+}
+
+fn resolve_default_role_codes(fields: &HashMap<String, String>) -> Vec<String> {
+    fields
+        .get("role_code")
+        .map(|item| split_multi_values(item))
+        .or_else(|| fields.get("role_codes").map(|item| split_multi_values(item)))
+        .unwrap_or_default()
+}
+
+fn normalize_role_code_alias(role_code: &str) -> String {
+    match role_code.trim().to_ascii_lowercase().as_str() {
+        "admin" | "role-001" => "super_admin".to_string(),
+        "inspection_admin" | "role-002" => "hq_reviewer".to_string(),
+        "dealer_manager" | "role-003" => "dealer".to_string(),
+        "readonly_admin" | "role-004" => "hq_reviewer".to_string(),
+        _ => role_code.trim().to_string(),
+    }
+}
+
+fn validate_import_store_binding(role_codes: &[String], store_ids: &[i64]) -> Result<(), String> {
+    let requires_single_store = role_codes.iter().any(|role| role == "dealer" || role == "technician");
+    if requires_single_store && store_ids.len() != 1 {
+        return Err("经销商和师傅账号必须且只能绑定一个门店".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_user_status(value: Option<&str>) -> Result<String, AppError> {
+    match value.unwrap_or("enabled").trim().to_ascii_lowercase().as_str() {
+        "enabled" | "active" => Ok("enabled".to_string()),
+        "disabled" | "inactive" => Ok("disabled".to_string()),
+        _ => Err(AppError::BadRequest("用户状态只能为enabled/disabled或active/inactive".to_string())),
+    }
 }
 
 fn parse_score_csv(bytes: &[u8]) -> Result<Vec<ScoreImportRow>, AppError> {

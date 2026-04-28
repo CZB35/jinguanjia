@@ -108,7 +108,7 @@ pub async fn upload_task_attachment(
     Ok(Json(ApiResponse::success(UploadResponse {
         id: item.id.unwrap_or_default(),
         file_name: item.file_name.unwrap_or_default(),
-        file_url: item.file_url.unwrap_or_default(),
+        file_url: storage::public_url(&item.file_url.unwrap_or_default()),
         file_size: item.file_size.unwrap_or_default(),
         mime_type: item.mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
     })))
@@ -130,7 +130,7 @@ pub async fn list_task_attachments(
         .map(|item: AttachmentEntity| FileItem {
             id: item.id.unwrap_or_default(),
             file_name: item.file_name.unwrap_or_default(),
-            file_url: item.file_url.unwrap_or_default(),
+            file_url: storage::public_url(&item.file_url.unwrap_or_default()),
             file_size: item.file_size.unwrap_or_default(),
             mime_type: item.mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
         })
@@ -174,7 +174,7 @@ pub async fn list_task_evidences(
         .map(|item: EvidenceEntity| FileItem {
             id: item.id.unwrap_or_default(),
             file_name: item.file_name.unwrap_or_default(),
-            file_url: item.file_url.unwrap_or_default(),
+            file_url: storage::public_url(&item.file_url.unwrap_or_default()),
             file_size: item.file_size.unwrap_or_default(),
             mime_type: item.mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
         })
@@ -385,7 +385,7 @@ async fn upload_evidence(
     Ok(Json(ApiResponse::success(UploadResponse {
         id: item.id.unwrap_or_default(),
         file_name: item.file_name.unwrap_or_default(),
-        file_url: item.file_url.unwrap_or_default(),
+        file_url: storage::public_url(&item.file_url.unwrap_or_default()),
         file_size: item.file_size.unwrap_or_default(),
         mime_type: item.mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
     })))

@@ -45,7 +45,10 @@ pub struct ProfileResponse {
     pub status: String,
     pub job_no: String,
     pub role_names: Vec<String>,
+    pub store_id: Option<i64>,
+    pub store_ids: Vec<i64>,
     pub store_names: Vec<String>,
+    pub primary_store_id: Option<i64>,
     pub primary_store_name: Option<String>,
     pub technician_count: usize,
     pub customer_count: usize,
@@ -335,6 +338,7 @@ async fn build_profile_response(state: &AppState, user: UserEntity) -> Result<Pr
             .filter_map(|item| item.store_name)
             .collect()
     };
+    let primary_store_id = store_ids.first().copied();
     let primary_store_name = store_names.first().cloned();
     let is_technician_only = role_codes.contains(&"technician".to_string()) && !role_codes.contains(&"dealer".to_string()) && !role_codes.contains(&"hq_reviewer".to_string()) && !role_codes.contains(&"super_admin".to_string());
     let now = chrono::Utc::now();
@@ -384,7 +388,10 @@ async fn build_profile_response(state: &AppState, user: UserEntity) -> Result<Pr
         status: user.status.unwrap_or_else(|| "enabled".to_string()),
         job_no: format!("DL-{:08}", user_id),
         role_names,
+        store_id: primary_store_id,
+        store_ids,
         store_names,
+        primary_store_id,
         primary_store_name,
         technician_count,
         customer_count,

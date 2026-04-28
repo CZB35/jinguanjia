@@ -53,3 +53,8 @@ pub async fn save_bytes(
 pub fn full_path(state: &AppState, relative_path: &str) -> PathBuf {
     PathBuf::from(&state.config.storage.upload_dir).join(relative_path)
 }
+
+pub fn public_url(relative_path: &str) -> String {
+    let normalized = relative_path.trim().trim_start_matches('/').replace('\\', "/");
+    format!("/uploads/{}", normalized)
+}

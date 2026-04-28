@@ -380,10 +380,33 @@ pub async fn search_customer_by_mobile(
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
-    let customers: Vec<CustomerEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer", value! { "mobile": query.mobile.as_str() })
+    if query.mobile.trim().is_empty() {
+        return Err(AppError::BadRequest("mobile不能为空".to_string()));
+    }
+
+    let mut customers: Vec<CustomerEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer", value! {})
         .await
         .context("failed to search customer by mobile")
         .map_err(AppError::Internal)?;
+    customers.retain(|item| item.mobile.as_deref().unwrap_or_default().contains(query.mobile.trim()));
+
+    if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+        let store_ids = load_user_store_ids(&state, auth_user.user_id).await?;
+        if store_ids.is_empty() {
+            customers.clear();
+        } else {
+            let scoped_tasks = db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids })
+                .await
+                .context("failed to query dealer scoped tasks for customer mobile search")
+                .map_err(AppError::Internal)?;
+            let visible_customer_ids = scoped_tasks
+                .into_iter()
+                .filter_map(|item| item.customer_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            customers.retain(|customer| customer.id.map(|id| visible_customer_ids.contains(&id)).unwrap_or(false));
+        }
+    }
+
     let mut result = Vec::new();
     for item in customers {
         let customer_id = item.id.unwrap_or_default();
@@ -524,10 +547,10 @@ async fn resolve_customer_store_id(
     auth_user: &auth::CurrentAuthUser,
     requested_store_id: Option<i64>,
 ) -> Result<Option<i64>, AppError> {
-    let store_id = if requested_store_id.is_some() {
+    let store_id = if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+        Some(dealer_owned_store_id(state, auth_user).await?)
+    } else if requested_store_id.is_some() {
         requested_store_id
-    } else if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
-        load_user_store_ids(state, auth_user.user_id).await?.into_iter().next()
     } else {
         None
     };
@@ -547,6 +570,19 @@ async fn resolve_customer_store_id(
     }
 
     Ok(store_id)
+}
+
+async fn dealer_owned_store_id(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+) -> Result<i64, AppError> {
+    let store_ids = load_user_store_ids(state, auth_user.user_id).await?;
+
+    match store_ids.as_slice() {
+        [store_id] => Ok(*store_id),
+        [] => Err(AppError::Forbidden("当前经销商账号未绑定门店".to_string())),
+        _ => Err(AppError::Conflict("当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string())),
+    }
 }
 
 async fn load_store_name(state: &AppState, store_id: Option<i64>) -> Result<Option<String>, AppError> {

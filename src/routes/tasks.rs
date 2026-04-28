@@ -343,6 +343,7 @@ pub async fn create_task(
         dealer_user_id: Some(dealer_user_id),
         current_technician_id: None,
         service_type: Some(primary_service_type.clone()),
+        task_type: derive_task_type_from_service_types(&service_types),
         priority: Some(payload.priority.clone().unwrap_or_else(|| "normal".to_string())),
         appointment_time: Some(appointment_time),
         service_time_slot: payload.service_time_slot.clone(),
@@ -464,7 +465,7 @@ async fn load_task_summaries(
             .context("failed to query technician tasks")
             .map_err(AppError::Internal)?
     } else if auth_user.has_role("dealer") {
-        let store_id = first_store_id_for_user(&state, auth_user.user_id).await?;
+        let store_id = dealer_owned_store_id(&state, auth_user.user_id).await?;
         db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_id })
             .await
             .context("failed to query dealer tasks")
@@ -480,7 +481,7 @@ async fn load_task_summaries(
 
     let mut items = Vec::with_capacity(tasks.len());
     for task in tasks {
-        items.push(build_task_summary(state, task).await?);
+        items.push(build_task_summary(state, auth_user, task).await?);
     }
 
     items.retain(|item| filter_task_summary(item, query));
@@ -538,11 +539,12 @@ pub async fn get_task_detail(
     let progress_tracks = build_progress_tracks(&task, &service_items, &assignments, &executions, evidences.len());
     let customer_mobile = customer.mobile.clone().unwrap_or_default();
     let service_items_payload = map_task_service_item_payloads(service_items);
-    let task_tags = build_task_tags(&task, &service_items_payload);
-    let task_status_text = task_status_text(&task_status).to_string();
-    let display_status = display_status(&task_status).to_string();
-    let display_status_text = display_status_text(&task_status).to_string();
-    let review_status_text = review_status_text(&review_status).to_string();
+    let technician_only = is_technician_only(&auth_user);
+    let task_tags = build_task_tags(&task, &service_items_payload, technician_only);
+    let task_status_text = task_status_text_for_viewer(&task_status, technician_only).to_string();
+    let display_status = display_status_for_viewer(&task_status, technician_only).to_string();
+    let display_status_text = display_status_text_for_viewer(&task_status, technician_only).to_string();
+    let review_status_text = review_status_text_for_viewer(&review_status, &task_status, technician_only).to_string();
     let score_status_text = score_status_text(&score_status).to_string();
     let priority_text_value = priority_text(&priority).to_string();
     let can_contact_customer = !customer_mobile.is_empty();
@@ -559,7 +561,7 @@ pub async fn get_task_detail(
             id: item.id.unwrap_or_default(),
             evidence_type: item.evidence_type.clone().unwrap_or_default(),
             file_name: item.file_name.clone().unwrap_or_default(),
-            file_url: item.file_url.clone().unwrap_or_default(),
+            file_url: crate::storage::public_url(&item.file_url.clone().unwrap_or_default()),
             created_at: item.created_at.map(format_datetime),
         })
         .collect::<Vec<_>>();
@@ -1192,7 +1194,11 @@ fn filter_task_summary(item: &TaskSummary, query: &TaskListQuery) -> bool {
     true
 }
 
-async fn build_task_summary(state: &AppState, task: TaskEntity) -> Result<TaskSummary, AppError> {
+async fn build_task_summary(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    task: TaskEntity,
+) -> Result<TaskSummary, AppError> {
     let customer = find_customer_by_id(state, task.customer_id).await?;
     let address = find_address_by_id(state, task.customer_address_id).await?;
     let store = find_store_by_id(state, task.store_id).await?;
@@ -1203,10 +1209,11 @@ async fn build_task_summary(state: &AppState, task: TaskEntity) -> Result<TaskSu
     let task_status = task.task_status.clone().unwrap_or_default();
     let review_status = task.review_status.clone().unwrap_or_default();
     let score_status = task.score_status.clone().unwrap_or_default();
-    let task_status_text_value = task_status_text(&task_status).to_string();
-    let display_status_value = display_status(&task_status).to_string();
-    let display_status_text_value = display_status_text(&task_status).to_string();
-    let review_status_text_value = review_status_text(&review_status).to_string();
+    let technician_only = is_technician_only(auth_user);
+    let task_status_text_value = task_status_text_for_viewer(&task_status, technician_only).to_string();
+    let display_status_value = display_status_for_viewer(&task_status, technician_only).to_string();
+    let display_status_text_value = display_status_text_for_viewer(&task_status, technician_only).to_string();
+    let review_status_text_value = review_status_text_for_viewer(&review_status, &task_status, technician_only).to_string();
     let score_status_text_value = score_status_text(&score_status).to_string();
     let progress_percent = task_progress_percent(&service_items, task.task_status.as_deref());
     let is_overdue = task_is_overdue(&task);
@@ -1227,7 +1234,7 @@ async fn build_task_summary(state: &AppState, task: TaskEntity) -> Result<TaskSu
         .or(task.service_type.clone())
         .unwrap_or_default();
     let service_items_payload = map_task_service_item_payloads(service_items);
-    let task_tags = build_task_tags(&task, &service_items_payload);
+    let task_tags = build_task_tags(&task, &service_items_payload, technician_only);
 
     Ok(TaskSummary {
         id: task.id.unwrap_or_default(),
@@ -1267,7 +1274,7 @@ async fn resolve_store_id(
     requested_store_id: Option<i64>,
 ) -> Result<i64, AppError> {
     if auth_user.has_role("dealer") {
-        return first_store_id_for_user(state, auth_user.user_id).await;
+        return dealer_owned_store_id(state, auth_user.user_id).await;
     }
 
     requested_store_id.ok_or_else(|| AppError::BadRequest("store_id不能为空".to_string()))
@@ -1470,7 +1477,7 @@ async fn ensure_task_access(
     }
 
     if auth_user.has_role("dealer") {
-        let store_id = first_store_id_for_user(state, auth_user.user_id).await?;
+        let store_id = dealer_owned_store_id(state, auth_user.user_id).await?;
         if task.store_id == Some(store_id) {
             return Ok(());
         }
@@ -1480,16 +1487,18 @@ async fn ensure_task_access(
     Err(AppError::Forbidden("您没有权限执行该操作".to_string()))
 }
 
-async fn first_store_id_for_user(state: &AppState, user_id: i64) -> Result<i64, AppError> {
+async fn dealer_owned_store_id(state: &AppState, user_id: i64) -> Result<i64, AppError> {
     let relations: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
         .await
         .context("failed to query user store relation")
         .map_err(AppError::Internal)?;
 
-    relations
-        .into_iter()
-        .find_map(|item| item.store_id)
-        .ok_or_else(|| AppError::Forbidden("当前账号未绑定门店".to_string()))
+    let store_ids = relations.into_iter().filter_map(|item| item.store_id).collect::<Vec<_>>();
+    match store_ids.as_slice() {
+        [store_id] => Ok(*store_id),
+        [] => Err(AppError::Forbidden("当前账号未绑定门店".to_string())),
+        _ => Err(AppError::Conflict("当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string())),
+    }
 }
 
 async fn latest_task_assignment(state: &AppState, task_id: i64) -> Result<TaskAssignmentEntity, AppError> {
@@ -1721,6 +1730,20 @@ fn resolved_service_types(payload: &CreateTaskRequest) -> Result<Vec<String>, Ap
     }
 
     Err(AppError::BadRequest("请选择服务环节".to_string()))
+}
+
+fn derive_task_type_from_service_types(service_types: &[String]) -> Option<String> {
+    match service_types
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+    {
+        3 => Some("three_special".to_string()),
+        4 => Some("four_special".to_string()),
+        _ => None,
+    }
 }
 
 async fn create_task_service_items(
@@ -1992,7 +2015,7 @@ fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn build_task_tags(task: &TaskEntity, service_items: &[TaskServiceItemPayload]) -> Vec<String> {
+fn build_task_tags(task: &TaskEntity, service_items: &[TaskServiceItemPayload], technician_only: bool) -> Vec<String> {
     let mut tags = service_items
         .iter()
         .map(|item| service_type_label(Some(item.service_type.as_str())).to_string())
@@ -2000,13 +2023,52 @@ fn build_task_tags(task: &TaskEntity, service_items: &[TaskServiceItemPayload]) 
     if task_is_overdue(task) {
         tags.push("已逾期".to_string());
     }
-    if task.review_status.as_deref() == Some("reviewed") {
+    if task.review_status.as_deref() == Some("reviewed") && !technician_only {
         tags.push("已评价".to_string());
     }
     if task.score_status.as_deref() == Some("scored") {
         tags.push("已评分".to_string());
     }
     tags
+}
+
+fn task_status_text_for_viewer(status: &str, technician_only: bool) -> &'static str {
+    if technician_only && status == "pending_hq_score" {
+        return "已完成";
+    }
+
+    task_status_text(status)
+}
+
+fn display_status_for_viewer(status: &str, technician_only: bool) -> &'static str {
+    if technician_only && status == "pending_hq_score" {
+        return "completed";
+    }
+
+    display_status(status)
+}
+
+fn display_status_text_for_viewer(status: &str, technician_only: bool) -> &'static str {
+    if technician_only && status == "pending_hq_score" {
+        return "已完成";
+    }
+
+    display_status_text(status)
+}
+
+fn review_status_text_for_viewer(review_status: &str, task_status: &str, technician_only: bool) -> &'static str {
+    if technician_only && task_status == "pending_hq_score" {
+        return "已完成";
+    }
+
+    review_status_text(review_status)
+}
+
+fn is_technician_only(auth_user: &auth::CurrentAuthUser) -> bool {
+    auth_user.has_role("technician")
+        && !auth_user.has_role("dealer")
+        && !auth_user.has_role("hq_reviewer")
+        && !auth_user.has_role("super_admin")
 }
 
 fn primary_role(auth_user: &auth::CurrentAuthUser) -> &str {

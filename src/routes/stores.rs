@@ -40,6 +40,10 @@ pub struct StoreItem {
     pub code: Option<String>,
     pub contact_name: Option<String>,
     pub contact_mobile: Option<String>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
+    pub region_text: String,
     pub address: Option<String>,
     pub remark: Option<String>,
     pub business_hours: Option<String>,
@@ -63,6 +67,9 @@ pub struct CreateStoreRequest {
     #[serde(alias = "name")]
     pub store_name: String,
     pub code: Option<String>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
     pub address: Option<String>,
     pub remark: Option<String>,
     pub business_hours: Option<String>,
@@ -76,6 +83,9 @@ pub struct UpdateStoreRequest {
     #[serde(default, alias = "name")]
     pub store_name: Option<String>,
     pub code: Option<String>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
     pub address: Option<String>,
     pub remark: Option<String>,
     pub business_hours: Option<String>,
@@ -180,9 +190,9 @@ pub async fn create_store(
             code: code.clone(),
             contact_name: normalize_optional_owned(payload.contact_name),
             contact_mobile: normalize_optional_owned(payload.contact_mobile),
-            province: None,
-            city: None,
-            district: None,
+            province: normalize_optional_owned(payload.province),
+            city: normalize_optional_owned(payload.city),
+            district: normalize_optional_owned(payload.district),
             address: normalize_optional_owned(payload.address),
             remark: normalize_optional_owned(payload.remark),
             business_hours: normalize_optional_owned(payload.business_hours),
@@ -256,6 +266,18 @@ pub async fn update_store_detail(
     let updated = StoreEntity {
         store_name: Some(next_store_name),
         code: next_code,
+        province: payload
+            .province
+            .map(|value| normalize_optional_text(Some(value.as_str())))
+            .unwrap_or_else(|| existing.province.clone()),
+        city: payload
+            .city
+            .map(|value| normalize_optional_text(Some(value.as_str())))
+            .unwrap_or_else(|| existing.city.clone()),
+        district: payload
+            .district
+            .map(|value| normalize_optional_text(Some(value.as_str())))
+            .unwrap_or_else(|| existing.district.clone()),
         address: payload
             .address
             .map(|value| normalize_optional_text(Some(value.as_str())))
@@ -283,7 +305,7 @@ pub async fn update_store_detail(
     StoreEntity::update_by_map(
         state.rb.as_ref(),
         &updated,
-        value! { "id": store_id, "column": ["store_name", "code", "address", "remark", "business_hours", "contact_name", "contact_mobile", "status"] },
+        value! { "id": store_id, "column": ["store_name", "code", "province", "city", "district", "address", "remark", "business_hours", "contact_name", "contact_mobile", "status"] },
     )
     .await
     .context("failed to update store detail")
@@ -380,6 +402,7 @@ async fn build_store_item(state: &AppState, store: StoreEntity) -> Result<StoreI
         .map_err(AppError::Internal)?
         .len();
     let store_name = store.store_name.unwrap_or_default();
+    let region_text = join_region(store.province.as_deref(), store.city.as_deref(), store.district.as_deref());
 
     Ok(StoreItem {
         id: store_id,
@@ -388,6 +411,10 @@ async fn build_store_item(state: &AppState, store: StoreEntity) -> Result<StoreI
         code: store.code,
         contact_name: store.contact_name,
         contact_mobile: store.contact_mobile,
+        province: store.province,
+        city: store.city,
+        district: store.district,
+        region_text,
         address: store.address,
         remark: store.remark,
         business_hours: store.business_hours,
@@ -530,4 +557,14 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
+}
+
+fn join_region(province: Option<&str>, city: Option<&str>, district: Option<&str>) -> String {
+    [province, city, district]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
 }
