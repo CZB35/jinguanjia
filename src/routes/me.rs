@@ -19,9 +19,13 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateProfileRequest {
+    #[serde(default, alias = "user_name", alias = "username")]
     pub name: Option<String>,
+    #[serde(default, alias = "nick_name", alias = "nickName")]
     pub nickname: Option<String>,
+    #[serde(default)]
     pub email: Option<String>,
+    #[serde(default, alias = "avatar", alias = "avatarUrl")]
     pub avatar_url: Option<String>,
 }
 
@@ -97,16 +101,41 @@ pub async fn update_profile(
     Json(payload): Json<UpdateProfileRequest>,
 ) -> Result<Json<ApiResponse<ProfileResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
+    let name = normalize_optional_owned(payload.name);
+    let nickname = normalize_optional_owned(payload.nickname);
+    let email = normalize_optional_owned(payload.email);
+    let avatar_url = normalize_optional_owned(payload.avatar_url);
+    let mut columns = Vec::new();
+    if name.is_some() {
+        columns.push("name");
+    }
+    if nickname.is_some() {
+        columns.push("nickname");
+    }
+    if email.is_some() {
+        columns.push("email");
+    }
+    if avatar_url.is_some() {
+        columns.push("avatar_url");
+    }
+
+    if columns.is_empty() {
+        let user = find_user(&state, auth_user.user_id).await?;
+        return Ok(Json(ApiResponse::success(
+            build_profile_response(&state, user).await?,
+        )));
+    }
+
     UserEntity::update_by_map(
         state.rb.as_ref(),
         &UserEntity {
-            name: payload.name,
-            nickname: payload.nickname,
-            email: payload.email,
-            avatar_url: payload.avatar_url,
+            name,
+            nickname,
+            email,
+            avatar_url,
             ..Default::default()
         },
-        value! { "id": auth_user.user_id },
+        value! { "id": auth_user.user_id, "column": columns },
     )
     .await
     .context("failed to update profile")
@@ -326,6 +355,17 @@ fn to_response(item: UserMessageSettingEntity) -> MessageSettingsResponse {
 
 fn bool_to_i32(value: bool) -> i32 {
     if value { 1 } else { 0 }
+}
+
+fn normalize_optional_owned(value: Option<String>) -> Option<String> {
+    value.and_then(|item| normalize_optional_text(Some(item.as_str())))
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
 }
 
 async fn find_user(state: &AppState, user_id: i64) -> Result<UserEntity, AppError> {
