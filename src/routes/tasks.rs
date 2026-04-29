@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow};
 use axum::{
-    body::Body,
     Json,
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
@@ -11,24 +11,15 @@ use rbs::value;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    audit,
-    auth,
-    db,
+    audit, auth, db,
     error::AppError,
     models::{
-        dealer_review::DealerReviewEntity,
-        audit_log::AuditLogEntity,
-        customer::CustomerEntity,
-        customer_address::CustomerAddressEntity,
-        evidence::EvidenceEntity,
-        store::StoreEntity,
-        task::TaskEntity,
-        task_assignment::TaskAssignmentEntity,
-        task_execution::TaskExecutionEntity,
-        task_service_item::TaskServiceItemEntity,
-        technician_skill::TechnicianSkillEntity,
-        user::UserEntity,
-        user_store::UserStoreEntity,
+        audit_log::AuditLogEntity, customer::CustomerEntity,
+        customer_address::CustomerAddressEntity, dealer_review::DealerReviewEntity,
+        evidence::EvidenceEntity, store::StoreEntity, task::TaskEntity,
+        task_assignment::TaskAssignmentEntity, task_execution::TaskExecutionEntity,
+        task_service_item::TaskServiceItemEntity, technician_skill::TechnicianSkillEntity,
+        user::UserEntity, user_store::UserStoreEntity,
     },
     notify,
     response::ApiResponse,
@@ -78,8 +69,26 @@ pub struct TaskListQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct AssignTaskRequest {
-    pub technician_id: i64,
+    pub technician_id: Option<i64>,
+    pub service_type: Option<String>,
+    pub service_item_id: Option<i64>,
+    pub assignments: Option<Vec<ServiceAssignmentRequest>>,
     pub assign_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ServiceAssignmentRequest {
+    pub service_type: Option<String>,
+    pub service_item_id: Option<i64>,
+    pub technician_id: i64,
+}
+
+#[derive(Debug)]
+struct ResolvedAssignment {
+    service_item_id: Option<i64>,
+    service_type: String,
+    technician_id: i64,
+    from_technician_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,9 +331,16 @@ pub async fn create_task(
     ensure_store_exists(&state, store_id).await?;
 
     let customer = find_or_create_customer(&state, &payload, dealer_user_id, store_id).await?;
-    let customer_id = customer.id.ok_or_else(|| AppError::Internal(anyhow!("customer.id missing")))?;
-    let customer_address_id =
-        resolve_customer_address_id(&state, customer_id, payload.address_id, payload.address.as_ref()).await?;
+    let customer_id = customer
+        .id
+        .ok_or_else(|| AppError::Internal(anyhow!("customer.id missing")))?;
+    let customer_address_id = resolve_customer_address_id(
+        &state,
+        customer_id,
+        payload.address_id,
+        payload.address.as_ref(),
+    )
+    .await?;
 
     let task_no = generate_task_no();
     let appointment_time = parse_datetime(&payload.appointment_time)?;
@@ -344,7 +360,12 @@ pub async fn create_task(
         current_technician_id: None,
         service_type: Some(primary_service_type.clone()),
         task_type: derive_task_type_from_service_types(&service_types),
-        priority: Some(payload.priority.clone().unwrap_or_else(|| "normal".to_string())),
+        priority: Some(
+            payload
+                .priority
+                .clone()
+                .unwrap_or_else(|| "normal".to_string()),
+        ),
         appointment_time: Some(appointment_time),
         service_time_slot: payload.service_time_slot.clone(),
         task_desc: payload.task_desc.clone(),
@@ -355,7 +376,12 @@ pub async fn create_task(
         is_overdue: Some(0),
         latest_assignment_id: None,
         latest_execution_id: None,
-        source: Some(payload.customer_source.clone().unwrap_or_else(|| "mini_program".to_string())),
+        source: Some(
+            payload
+                .customer_source
+                .clone()
+                .unwrap_or_else(|| "mini_program".to_string()),
+        ),
         created_by: Some(dealer_user_id),
         created_at: None,
         updated_at: None,
@@ -365,11 +391,18 @@ pub async fn create_task(
     TaskEntity::insert(state.rb.as_ref(), &task)
         .await
         .context("failed to create task")
-    .map_err(AppError::Internal)?;
+        .map_err(AppError::Internal)?;
 
     let created = find_task_by_task_no(&state, &task_no).await?;
-    create_task_service_items(&state, created.id.unwrap_or_default(), &service_types, appointment_time).await?;
-    let created_service_items = load_task_service_item_entities(&state, created.id.unwrap_or_default()).await?;
+    create_task_service_items(
+        &state,
+        created.id.unwrap_or_default(),
+        &service_types,
+        appointment_time,
+    )
+    .await?;
+    let created_service_items =
+        load_task_service_item_entities(&state, created.id.unwrap_or_default()).await?;
 
     audit::write_audit_log(
         &state,
@@ -387,7 +420,9 @@ pub async fn create_task(
     Ok(Json(ApiResponse::success(CreateTaskResponse {
         id: created.id.unwrap_or_default(),
         task_no,
-        task_status: created.task_status.unwrap_or_else(|| "pending_assign".to_string()),
+        task_status: created
+            .task_status
+            .unwrap_or_else(|| "pending_assign".to_string()),
         store_id,
         dealer_user_id,
         service_items: map_task_service_item_payloads(created_service_items),
@@ -403,7 +438,10 @@ pub async fn list_tasks(
     let items = load_task_summaries(&state, &auth_user, &query).await?;
 
     let total = items.len();
-    Ok(Json(ApiResponse::success(TaskListResponse { items, total })))
+    Ok(Json(ApiResponse::success(TaskListResponse {
+        items,
+        total,
+    })))
 }
 
 pub async fn export_tasks(
@@ -458,18 +496,25 @@ async fn load_task_summaries(
     auth_user: &auth::CurrentAuthUser,
     query: &TaskListQuery,
 ) -> Result<Vec<TaskSummary>, AppError> {
-
     let mut tasks = if auth_user.has_role("technician") {
-        db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "current_technician_id": auth_user.user_id })
-            .await
-            .context("failed to query technician tasks")
-            .map_err(AppError::Internal)?
+        db::select_by_map_compat::<TaskEntity>(
+            state.rb.as_ref(),
+            "task",
+            value! { "current_technician_id": auth_user.user_id },
+        )
+        .await
+        .context("failed to query technician tasks")
+        .map_err(AppError::Internal)?
     } else if auth_user.has_role("dealer") {
         let store_id = dealer_owned_store_id(&state, auth_user.user_id).await?;
-        db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_id })
-            .await
-            .context("failed to query dealer tasks")
-            .map_err(AppError::Internal)?
+        db::select_by_map_compat::<TaskEntity>(
+            state.rb.as_ref(),
+            "task",
+            value! { "store_id": store_id },
+        )
+        .await
+        .context("failed to query dealer tasks")
+        .map_err(AppError::Internal)?
     } else {
         db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! {})
             .await
@@ -510,41 +555,65 @@ pub async fn get_task_detail(
     } else {
         None
     };
-    let assignments: Vec<TaskAssignmentEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_assignment", value! { "task_id": task_id })
-        .await
-        .context("failed to query task assignments")
-        .map_err(AppError::Internal)?;
-    let executions: Vec<TaskExecutionEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_execution", value! { "task_id": task_id })
-        .await
-        .context("failed to query task executions")
-        .map_err(AppError::Internal)?;
-    let evidences: Vec<EvidenceEntity> = db::select_by_map_compat(state.rb.as_ref(), "evidence", value! { "task_id": task_id })
-        .await
-        .context("failed to query task evidence")
-        .map_err(AppError::Internal)?;
-    let dealer_review: Option<DealerReviewEntity> = db::select_one_by_map_compat(state.rb.as_ref(), "dealer_review", value! { "task_id": task_id })
-        .await
-        .context("failed to query dealer review for task detail")
-        .map_err(AppError::Internal)?;
+    let assignments: Vec<TaskAssignmentEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_assignment",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query task assignments")
+    .map_err(AppError::Internal)?;
+    let executions: Vec<TaskExecutionEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_execution",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query task executions")
+    .map_err(AppError::Internal)?;
+    let evidences: Vec<EvidenceEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "evidence", value! { "task_id": task_id })
+            .await
+            .context("failed to query task evidence")
+            .map_err(AppError::Internal)?;
+    let dealer_review: Option<DealerReviewEntity> = db::select_one_by_map_compat(
+        state.rb.as_ref(),
+        "dealer_review",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query dealer review for task detail")
+    .map_err(AppError::Internal)?;
     let service_items = load_task_service_item_entities(&state, task_id).await?;
     let task_status = task.task_status.clone().unwrap_or_default();
     let review_status = task.review_status.clone().unwrap_or_default();
     let score_status = task.score_status.clone().unwrap_or_default();
-    let priority = task.priority.clone().unwrap_or_else(|| "normal".to_string());
+    let priority = task
+        .priority
+        .clone()
+        .unwrap_or_else(|| "normal".to_string());
     let task_desc = task.task_desc.clone();
     let task_remark = task.task_remark.clone();
     let service_time_slot = task.service_time_slot.clone();
     let progress_percent = task_progress_percent(&service_items, task.task_status.as_deref());
     let completed_step_count = completed_step_count(&service_items, task.task_status.as_deref());
-    let progress_tracks = build_progress_tracks(&task, &service_items, &assignments, &executions, evidences.len());
+    let progress_tracks = build_progress_tracks(
+        &task,
+        &service_items,
+        &assignments,
+        &executions,
+        evidences.len(),
+    );
     let customer_mobile = customer.mobile.clone().unwrap_or_default();
     let service_items_payload = map_task_service_item_payloads(service_items);
     let technician_only = is_technician_only(&auth_user);
     let task_tags = build_task_tags(&task, &service_items_payload, technician_only);
     let task_status_text = task_status_text_for_viewer(&task_status, technician_only).to_string();
     let display_status = display_status_for_viewer(&task_status, technician_only).to_string();
-    let display_status_text = display_status_text_for_viewer(&task_status, technician_only).to_string();
-    let review_status_text = review_status_text_for_viewer(&review_status, &task_status, technician_only).to_string();
+    let display_status_text =
+        display_status_text_for_viewer(&task_status, technician_only).to_string();
+    let review_status_text =
+        review_status_text_for_viewer(&review_status, &task_status, technician_only).to_string();
     let score_status_text = score_status_text(&score_status).to_string();
     let priority_text_value = priority_text(&priority).to_string();
     let can_contact_customer = !customer_mobile.is_empty();
@@ -619,7 +688,10 @@ pub async fn get_task_detail(
         total_step_count: 3,
         progress_tracks,
         can_assign: matches!(task.task_status.as_deref(), Some("pending_assign")),
-        can_reassign: matches!(task.task_status.as_deref(), Some("pending_execute") | Some("executing")),
+        can_reassign: matches!(
+            task.task_status.as_deref(),
+            Some("pending_execute") | Some("executing")
+        ),
         can_submit_review: matches!(task.task_status.as_deref(), Some("pending_dealer_review")),
         can_contact_customer,
         review_info: dealer_review.map(|review| ReviewInfoPayload {
@@ -667,33 +739,146 @@ pub async fn assign_task(
 
     let task = find_task_by_id(&state, task_id).await?;
     let before_task = task.clone();
+    ensure_task_access(&state, &auth_user, &task).await?;
     if task.task_status.as_deref() != Some("pending_assign") {
         return Err(AppError::Conflict("当前任务状态不允许分派技师".to_string()));
     }
 
-    ensure_technician_assignable(&state, &task, payload.technician_id).await?;
+    if is_legacy_whole_task_assignment(&payload) {
+        let technician_id = payload
+            .technician_id
+            .ok_or_else(|| AppError::BadRequest("请选择技师".to_string()))?;
+        ensure_technician_assignable(&state, &task, technician_id).await?;
 
-    let assignment = TaskAssignmentEntity {
-        id: None,
-        task_id: Some(task_id),
-        from_technician_id: task.current_technician_id,
-        to_technician_id: Some(payload.technician_id),
-        assign_type: Some("assign".to_string()),
-        assign_reason: payload.assign_reason.clone(),
-        assigned_by: Some(auth_user.user_id),
-        assigned_at: Some(Utc::now().naive_utc()),
-    };
-    TaskAssignmentEntity::insert(state.rb.as_ref(), &assignment)
+        let assignment = TaskAssignmentEntity {
+            id: None,
+            task_id: Some(task_id),
+            from_technician_id: task.current_technician_id,
+            to_technician_id: Some(technician_id),
+            assign_type: Some("assign".to_string()),
+            assign_reason: payload.assign_reason.clone(),
+            assigned_by: Some(auth_user.user_id),
+            assigned_at: Some(Utc::now().naive_utc()),
+        };
+        TaskAssignmentEntity::insert(state.rb.as_ref(), &assignment)
+            .await
+            .context("failed to create task assignment")
+            .map_err(AppError::Internal)?;
+
+        let latest_assignment = latest_task_assignment(&state, task_id).await?;
+        TaskEntity::update_by_map(
+            state.rb.as_ref(),
+            &TaskEntity {
+                current_technician_id: Some(technician_id),
+                task_status: Some("pending_execute".to_string()),
+                latest_assignment_id: latest_assignment.id,
+                ..Default::default()
+            },
+            value! { "id": task_id },
+        )
         .await
-        .context("failed to create task assignment")
+        .context("failed to update task assignment state")
+        .map_err(AppError::Internal)?;
+        sync_task_service_items_on_assign(&state, task_id, technician_id, "pending_execute", 0)
+            .await?;
+
+        let after_task = find_task_by_id(&state, task_id).await?;
+        let _ = notify::create_notice(
+            &state,
+            technician_id,
+            "task_assign",
+            task_id,
+            "新任务待执行",
+            "您有一条新的待执行任务，请及时处理",
+        )
+        .await;
+        audit::write_audit_log(
+            &state,
+            "task",
+            task_id,
+            "assign_task",
+            auth_user.user_id,
+            primary_role(&auth_user),
+            Some(&before_task),
+            Some(&after_task),
+            payload.assign_reason.clone(),
+        )
+        .await?;
+
+        return Ok(Json(ApiResponse::success(TaskActionResponse {
+            task_id,
+            task_status: "pending_execute".to_string(),
+        })));
+    }
+
+    let service_items = load_task_service_item_entities(&state, task_id).await?;
+    let assignments = resolve_assignment_targets(&payload, &task, &service_items)?;
+    ensure_unique_assignment_targets(&assignments)?;
+
+    for assignment in &assignments {
+        ensure_technician_assignable_for_service(
+            &state,
+            &task,
+            assignment.technician_id,
+            &assignment.service_type,
+        )
+        .await?;
+        TaskAssignmentEntity::insert(
+            state.rb.as_ref(),
+            &TaskAssignmentEntity {
+                id: None,
+                task_id: Some(task_id),
+                from_technician_id: assignment.from_technician_id,
+                to_technician_id: Some(assignment.technician_id),
+                assign_type: Some("assign".to_string()),
+                assign_reason: payload.assign_reason.clone(),
+                assigned_by: Some(auth_user.user_id),
+                assigned_at: Some(Utc::now().naive_utc()),
+            },
+        )
+        .await
+        .context("failed to create task service assignment")
         .map_err(AppError::Internal)?;
 
+        if let Some(service_item_id) = assignment.service_item_id {
+            TaskServiceItemEntity::update_by_map(
+                state.rb.as_ref(),
+                &TaskServiceItemEntity {
+                    technician_id: Some(assignment.technician_id),
+                    service_status: Some("pending_execute".to_string()),
+                    progress_percent: Some(0),
+                    ..Default::default()
+                },
+                value! { "id": service_item_id },
+            )
+            .await
+            .context("failed to update task service item assignment")
+            .map_err(AppError::Internal)?;
+        }
+    }
+
     let latest_assignment = latest_task_assignment(&state, task_id).await?;
+    let updated_service_items = load_task_service_item_entities(&state, task_id).await?;
+    let all_service_items_assigned = updated_service_items.is_empty()
+        || updated_service_items
+            .iter()
+            .all(|item| item.technician_id.is_some());
+    let task_status = if all_service_items_assigned {
+        "pending_execute".to_string()
+    } else {
+        task.task_status
+            .clone()
+            .unwrap_or_else(|| "pending_assign".to_string())
+    };
+    let primary_technician_id = assignments
+        .first()
+        .map(|item| item.technician_id)
+        .ok_or_else(|| AppError::BadRequest("请选择技师".to_string()))?;
     TaskEntity::update_by_map(
         state.rb.as_ref(),
         &TaskEntity {
-            current_technician_id: Some(payload.technician_id),
-            task_status: Some("pending_execute".to_string()),
+            current_technician_id: Some(primary_technician_id),
+            task_status: Some(task_status.clone()),
             latest_assignment_id: latest_assignment.id,
             ..Default::default()
         },
@@ -702,18 +887,24 @@ pub async fn assign_task(
     .await
     .context("failed to update task assignment state")
     .map_err(AppError::Internal)?;
-    sync_task_service_items_on_assign(&state, task_id, payload.technician_id, "pending_execute", 0).await?;
 
     let after_task = find_task_by_id(&state, task_id).await?;
-    let _ = notify::create_notice(
-        &state,
-        payload.technician_id,
-        "task_assign",
-        task_id,
-        "新任务待执行",
-        "您有一条新的待执行任务，请及时处理",
-    )
-    .await;
+    let mut notified_technician_ids = Vec::new();
+    for assignment in &assignments {
+        if notified_technician_ids.contains(&assignment.technician_id) {
+            continue;
+        }
+        notified_technician_ids.push(assignment.technician_id);
+        let _ = notify::create_notice(
+            &state,
+            assignment.technician_id,
+            "task_assign",
+            task_id,
+            "新任务待执行",
+            "您有一条新的待执行任务，请及时处理",
+        )
+        .await;
+    }
     audit::write_audit_log(
         &state,
         "task",
@@ -729,7 +920,7 @@ pub async fn assign_task(
 
     Ok(Json(ApiResponse::success(TaskActionResponse {
         task_id,
-        task_status: "pending_execute".to_string(),
+        task_status,
     })))
 }
 
@@ -925,7 +1116,10 @@ pub async fn reassign_task(
 
     let task = find_task_by_id(&state, task_id).await?;
     let before_task = task.clone();
-    if !matches!(task.task_status.as_deref(), Some("pending_execute") | Some("executing")) {
+    if !matches!(
+        task.task_status.as_deref(),
+        Some("pending_execute") | Some("executing")
+    ) {
         return Err(AppError::Conflict("当前任务状态不允许重派技师".to_string()));
     }
     if task.current_technician_id == Some(payload.technician_id) {
@@ -971,7 +1165,8 @@ pub async fn reassign_task(
     .await
     .context("failed to update task after reassign")
     .map_err(AppError::Internal)?;
-    sync_task_service_items_on_assign(&state, task_id, payload.technician_id, "pending_execute", 0).await?;
+    sync_task_service_items_on_assign(&state, task_id, payload.technician_id, "pending_execute", 0)
+        .await?;
 
     let after_task = find_task_by_id(&state, task_id).await?;
     let _ = notify::create_notice(
@@ -1017,7 +1212,10 @@ pub async fn close_task(
 
     let task = find_task_by_id(&state, task_id).await?;
     let before_task = task.clone();
-    if matches!(task.task_status.as_deref(), Some("completed") | Some("closed")) {
+    if matches!(
+        task.task_status.as_deref(),
+        Some("completed") | Some("closed")
+    ) {
         return Err(AppError::Conflict("当前任务状态不允许关闭".to_string()));
     }
 
@@ -1063,10 +1261,14 @@ pub async fn task_logs(
     let task = find_task_by_id(&state, task_id).await?;
     ensure_task_access(&state, &auth_user, &task).await?;
 
-    let logs: Vec<AuditLogEntity> = db::select_by_map_compat(state.rb.as_ref(), "audit_log", value! { "biz_type": "task", "biz_id": task_id })
-        .await
-        .context("failed to query task logs")
-        .map_err(AppError::Internal)?;
+    let logs: Vec<AuditLogEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "audit_log",
+        value! { "biz_type": "task", "biz_id": task_id },
+    )
+    .await
+    .context("failed to query task logs")
+    .map_err(AppError::Internal)?;
     let items = logs
         .into_iter()
         .map(|item| TaskLogItem {
@@ -1082,7 +1284,10 @@ pub async fn task_logs(
         .collect::<Vec<_>>();
     let total = items.len();
 
-    Ok(Json(ApiResponse::success(TaskLogListResponse { items, total })))
+    Ok(Json(ApiResponse::success(TaskLogListResponse {
+        items,
+        total,
+    })))
 }
 
 fn validate_create_task_request(payload: &CreateTaskRequest) -> Result<(), AppError> {
@@ -1122,7 +1327,11 @@ fn validate_create_task_request(payload: &CreateTaskRequest) -> Result<(), AppEr
 
 fn filter_task_item(task: &TaskEntity, query: &TaskListQuery) -> bool {
     if let Some(task_no) = &query.task_no
-        && !task.task_no.as_deref().unwrap_or_default().contains(task_no)
+        && !task
+            .task_no
+            .as_deref()
+            .unwrap_or_default()
+            .contains(task_no)
     {
         return false;
     }
@@ -1157,10 +1366,15 @@ fn filter_task_item(task: &TaskEntity, query: &TaskListQuery) -> bool {
         return false;
     }
     if let Some(appointment_start) = &query.appointment_start {
-        let Ok(start_at) = NaiveDateTime::parse_from_str(appointment_start, "%Y-%m-%d %H:%M:%S") else {
+        let Ok(start_at) = NaiveDateTime::parse_from_str(appointment_start, "%Y-%m-%d %H:%M:%S")
+        else {
             return false;
         };
-        if task.appointment_time.map(|dt| dt < start_at).unwrap_or(true) {
+        if task
+            .appointment_time
+            .map(|dt| dt < start_at)
+            .unwrap_or(true)
+        {
             return false;
         }
     }
@@ -1177,7 +1391,10 @@ fn filter_task_item(task: &TaskEntity, query: &TaskListQuery) -> bool {
 
 fn filter_task_summary(item: &TaskSummary, query: &TaskListQuery) -> bool {
     if let Some(service_type) = &query.service_type
-        && !item.service_items.iter().any(|task_item| task_item.service_type == *service_type)
+        && !item
+            .service_items
+            .iter()
+            .any(|task_item| task_item.service_type == *service_type)
     {
         return false;
     }
@@ -1210,10 +1427,13 @@ async fn build_task_summary(
     let review_status = task.review_status.clone().unwrap_or_default();
     let score_status = task.score_status.clone().unwrap_or_default();
     let technician_only = is_technician_only(auth_user);
-    let task_status_text_value = task_status_text_for_viewer(&task_status, technician_only).to_string();
+    let task_status_text_value =
+        task_status_text_for_viewer(&task_status, technician_only).to_string();
     let display_status_value = display_status_for_viewer(&task_status, technician_only).to_string();
-    let display_status_text_value = display_status_text_for_viewer(&task_status, technician_only).to_string();
-    let review_status_text_value = review_status_text_for_viewer(&review_status, &task_status, technician_only).to_string();
+    let display_status_text_value =
+        display_status_text_for_viewer(&task_status, technician_only).to_string();
+    let review_status_text_value =
+        review_status_text_for_viewer(&review_status, &task_status, technician_only).to_string();
     let score_status_text_value = score_status_text(&score_status).to_string();
     let progress_percent = task_progress_percent(&service_items, task.task_status.as_deref());
     let is_overdue = task_is_overdue(&task);
@@ -1257,7 +1477,10 @@ async fn build_task_summary(
         store_id: task.store_id.unwrap_or_default(),
         store_name: store.store_name.unwrap_or_default(),
         dealer_user_id: task.dealer_user_id.unwrap_or_default(),
-        dealer_name: dealer.as_ref().and_then(|item| item.name.clone()).unwrap_or_default(),
+        dealer_name: dealer
+            .as_ref()
+            .and_then(|item| item.name.clone())
+            .unwrap_or_default(),
         current_technician_id: task.current_technician_id,
         technician_name: technician.as_ref().and_then(|item| item.name.clone()),
         technician_mobile: technician.as_ref().and_then(|item| item.mobile.clone()),
@@ -1322,7 +1545,11 @@ async fn find_or_create_customer(
             .await
             .context("failed to reload customer after primary store backfill")
             .map_err(AppError::Internal)?
-            .ok_or_else(|| AppError::Internal(anyhow!("customer reload failed after primary store backfill")))?;
+            .ok_or_else(|| {
+                AppError::Internal(anyhow!(
+                    "customer reload failed after primary store backfill"
+                ))
+            })?;
             return Ok(refreshed);
         }
         return Ok(customer);
@@ -1332,7 +1559,10 @@ async fn find_or_create_customer(
         id: None,
         name: Some(payload.customer_name.clone()),
         mobile: Some(payload.customer_mobile.clone()),
-        source: payload.customer_source.clone().or_else(|| Some("mini_program".to_string())),
+        source: payload
+            .customer_source
+            .clone()
+            .or_else(|| Some("mini_program".to_string())),
         remark: None,
         primary_store_id: Some(store_id),
         created_by: Some(created_by),
@@ -1410,25 +1640,9 @@ async fn ensure_technician_assignable(
     task: &TaskEntity,
     technician_id: i64,
 ) -> Result<(), AppError> {
-    let technician = find_user_by_id(state, Some(technician_id)).await?;
-    if technician.status.as_deref() == Some("disabled") {
-        return Err(AppError::Conflict("所选技师已禁用，无法分派".to_string()));
-    }
-
-    let store_id = task.store_id.ok_or_else(|| AppError::Internal(anyhow!("task.store_id missing")))?;
-    let user_store: Vec<UserStoreEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "user_store",
-        value! { "user_id": technician_id, "store_id": store_id },
-    )
-    .await
-    .context("failed to query technician store relation")
-    .map_err(AppError::Internal)?;
-    if user_store.is_empty() {
-        return Err(AppError::Conflict("不能分派非当前门店技师".to_string()));
-    }
-
-    let task_id = task.id.ok_or_else(|| AppError::Internal(anyhow!("task.id missing")))?;
+    let task_id = task
+        .id
+        .ok_or_else(|| AppError::Internal(anyhow!("task.id missing")))?;
     let task_service_items = load_task_service_item_entities(state, task_id).await?;
     let required_service_types = if task_service_items.is_empty() {
         vec![
@@ -1444,19 +1658,168 @@ async fn ensure_technician_assignable(
     };
 
     for service_type in required_service_types {
-        let skills: Vec<TechnicianSkillEntity> = db::select_by_map_compat(
-            state.rb.as_ref(),
-            "technician_skill",
-            value! { "user_id": technician_id, "service_type": service_type.as_str() },
-        )
-        .await
-        .context("failed to query technician skill")
-        .map_err(AppError::Internal)?;
-        if skills.is_empty() {
-            return Err(AppError::Conflict("所选技师不具备当前服务能力".to_string()));
-        }
+        ensure_technician_assignable_for_service(state, task, technician_id, &service_type).await?;
     }
 
+    Ok(())
+}
+
+async fn ensure_technician_assignable_for_service(
+    state: &AppState,
+    task: &TaskEntity,
+    technician_id: i64,
+    service_type: &str,
+) -> Result<(), AppError> {
+    let technician = find_user_by_id(state, Some(technician_id)).await?;
+    if technician.status.as_deref() == Some("disabled") {
+        return Err(AppError::Conflict("所选技师已禁用，无法分派".to_string()));
+    }
+
+    let store_id = task
+        .store_id
+        .ok_or_else(|| AppError::Internal(anyhow!("task.store_id missing")))?;
+    let user_store: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": technician_id, "store_id": store_id },
+    )
+    .await
+    .context("failed to query technician store relation")
+    .map_err(AppError::Internal)?;
+    if user_store.is_empty() {
+        return Err(AppError::Conflict("不能分派非当前门店技师".to_string()));
+    }
+
+    let skills: Vec<TechnicianSkillEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "technician_skill",
+        value! { "user_id": technician_id, "service_type": service_type },
+    )
+    .await
+    .context("failed to query technician skill")
+    .map_err(AppError::Internal)?;
+    if skills.is_empty() {
+        return Err(AppError::Conflict(format!(
+            "所选技师不具备{}服务能力",
+            service_type_label(Some(service_type))
+        )));
+    }
+
+    Ok(())
+}
+
+fn is_legacy_whole_task_assignment(payload: &AssignTaskRequest) -> bool {
+    payload.assignments.is_none()
+        && payload.service_item_id.is_none()
+        && payload
+            .service_type
+            .as_ref()
+            .map(|item| item.trim().is_empty())
+            .unwrap_or(true)
+}
+
+fn resolve_assignment_targets(
+    payload: &AssignTaskRequest,
+    task: &TaskEntity,
+    service_items: &[TaskServiceItemEntity],
+) -> Result<Vec<ResolvedAssignment>, AppError> {
+    let mut assignments = Vec::new();
+    if let Some(items) = &payload.assignments {
+        if items.is_empty() {
+            return Err(AppError::BadRequest(
+                "请至少选择一个服务环节分配".to_string(),
+            ));
+        }
+        for item in items {
+            assignments.push(resolve_assignment_target(
+                task,
+                service_items,
+                item.service_item_id,
+                item.service_type.as_deref(),
+                item.technician_id,
+            )?);
+        }
+        return Ok(assignments);
+    }
+
+    let technician_id = payload
+        .technician_id
+        .ok_or_else(|| AppError::BadRequest("请选择技师".to_string()))?;
+    assignments.push(resolve_assignment_target(
+        task,
+        service_items,
+        payload.service_item_id,
+        payload.service_type.as_deref(),
+        technician_id,
+    )?);
+    Ok(assignments)
+}
+
+fn resolve_assignment_target(
+    task: &TaskEntity,
+    service_items: &[TaskServiceItemEntity],
+    service_item_id: Option<i64>,
+    service_type: Option<&str>,
+    technician_id: i64,
+) -> Result<ResolvedAssignment, AppError> {
+    if let Some(service_item_id) = service_item_id {
+        let item = service_items
+            .iter()
+            .find(|item| item.id == Some(service_item_id))
+            .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+        return Ok(ResolvedAssignment {
+            service_item_id: Some(service_item_id),
+            service_type: item.service_type.clone().ok_or_else(|| {
+                AppError::Internal(anyhow!("task_service_item.service_type missing"))
+            })?,
+            technician_id,
+            from_technician_id: item.technician_id,
+        });
+    }
+
+    let service_type = service_type
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .ok_or_else(|| AppError::BadRequest("请选择服务环节".to_string()))?;
+
+    if service_items.is_empty() {
+        if task.service_type.as_deref() != Some(service_type) {
+            return Err(AppError::BadRequest("服务环节不属于当前任务".to_string()));
+        }
+        return Ok(ResolvedAssignment {
+            service_item_id: None,
+            service_type: service_type.to_string(),
+            technician_id,
+            from_technician_id: task.current_technician_id,
+        });
+    }
+
+    let item = service_items
+        .iter()
+        .find(|item| item.service_type.as_deref() == Some(service_type))
+        .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+    Ok(ResolvedAssignment {
+        service_item_id: item.id,
+        service_type: service_type.to_string(),
+        technician_id,
+        from_technician_id: item.technician_id,
+    })
+}
+
+fn ensure_unique_assignment_targets(assignments: &[ResolvedAssignment]) -> Result<(), AppError> {
+    let mut seen = Vec::new();
+    for assignment in assignments {
+        let key = assignment
+            .service_item_id
+            .map(|id| format!("id:{id}"))
+            .unwrap_or_else(|| format!("type:{}", assignment.service_type));
+        if seen.contains(&key) {
+            return Err(AppError::BadRequest(
+                "同一个服务环节不能重复分配".to_string(),
+            ));
+        }
+        seen.push(key);
+    }
     Ok(())
 }
 
@@ -1488,24 +1851,40 @@ async fn ensure_task_access(
 }
 
 async fn dealer_owned_store_id(state: &AppState, user_id: i64) -> Result<i64, AppError> {
-    let relations: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
-        .await
-        .context("failed to query user store relation")
-        .map_err(AppError::Internal)?;
+    let relations: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query user store relation")
+    .map_err(AppError::Internal)?;
 
-    let store_ids = relations.into_iter().filter_map(|item| item.store_id).collect::<Vec<_>>();
+    let store_ids = relations
+        .into_iter()
+        .filter_map(|item| item.store_id)
+        .collect::<Vec<_>>();
     match store_ids.as_slice() {
         [store_id] => Ok(*store_id),
         [] => Err(AppError::Forbidden("当前账号未绑定门店".to_string())),
-        _ => Err(AppError::Conflict("当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string())),
+        _ => Err(AppError::Conflict(
+            "当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string(),
+        )),
     }
 }
 
-async fn latest_task_assignment(state: &AppState, task_id: i64) -> Result<TaskAssignmentEntity, AppError> {
-    let assignments: Vec<TaskAssignmentEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_assignment", value! { "task_id": task_id })
-        .await
-        .context("failed to query latest task assignment")
-        .map_err(AppError::Internal)?;
+async fn latest_task_assignment(
+    state: &AppState,
+    task_id: i64,
+) -> Result<TaskAssignmentEntity, AppError> {
+    let assignments: Vec<TaskAssignmentEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_assignment",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query latest task assignment")
+    .map_err(AppError::Internal)?;
 
     assignments
         .into_iter()
@@ -1513,11 +1892,18 @@ async fn latest_task_assignment(state: &AppState, task_id: i64) -> Result<TaskAs
         .ok_or_else(|| AppError::Internal(anyhow!("task assignment missing after insert")))
 }
 
-async fn latest_task_execution(state: &AppState, task_id: i64) -> Result<TaskExecutionEntity, AppError> {
-    let executions: Vec<TaskExecutionEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_execution", value! { "task_id": task_id })
-        .await
-        .context("failed to query latest task execution")
-        .map_err(AppError::Internal)?;
+async fn latest_task_execution(
+    state: &AppState,
+    task_id: i64,
+) -> Result<TaskExecutionEntity, AppError> {
+    let executions: Vec<TaskExecutionEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_execution",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query latest task execution")
+    .map_err(AppError::Internal)?;
 
     executions
         .into_iter()
@@ -1526,10 +1912,11 @@ async fn latest_task_execution(state: &AppState, task_id: i64) -> Result<TaskExe
 }
 
 async fn find_task_by_task_no(state: &AppState, task_no: &str) -> Result<TaskEntity, AppError> {
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "task_no": task_no })
-        .await
-        .context("failed to query task by task_no")
-        .map_err(AppError::Internal)?;
+    let tasks: Vec<TaskEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "task", value! { "task_no": task_no })
+            .await
+            .context("failed to query task by task_no")
+            .map_err(AppError::Internal)?;
 
     tasks
         .into_iter()
@@ -1538,10 +1925,11 @@ async fn find_task_by_task_no(state: &AppState, task_no: &str) -> Result<TaskEnt
 }
 
 async fn find_task_by_id(state: &AppState, task_id: i64) -> Result<TaskEntity, AppError> {
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
-        .await
-        .context("failed to query task by id")
-        .map_err(AppError::Internal)?;
+    let tasks: Vec<TaskEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
+            .await
+            .context("failed to query task by id")
+            .map_err(AppError::Internal)?;
 
     let task = tasks
         .into_iter()
@@ -1553,11 +1941,18 @@ async fn find_task_by_id(state: &AppState, task_id: i64) -> Result<TaskEntity, A
     Ok(task)
 }
 
-async fn find_task_execution_by_id(state: &AppState, execution_id: i64) -> Result<TaskExecutionEntity, AppError> {
-    let executions: Vec<TaskExecutionEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_execution", value! { "id": execution_id })
-        .await
-        .context("failed to query task execution by id")
-        .map_err(AppError::Internal)?;
+async fn find_task_execution_by_id(
+    state: &AppState,
+    execution_id: i64,
+) -> Result<TaskExecutionEntity, AppError> {
+    let executions: Vec<TaskExecutionEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_execution",
+        value! { "id": execution_id },
+    )
+    .await
+    .context("failed to query task execution by id")
+    .map_err(AppError::Internal)?;
 
     executions
         .into_iter()
@@ -1565,12 +1960,17 @@ async fn find_task_execution_by_id(state: &AppState, execution_id: i64) -> Resul
         .ok_or_else(|| AppError::NotFound("执行记录不存在".to_string()))
 }
 
-async fn find_customer_by_id(state: &AppState, customer_id: Option<i64>) -> Result<CustomerEntity, AppError> {
-    let customer_id = customer_id.ok_or_else(|| AppError::Internal(anyhow!("customer_id missing")))?;
-    let customers: Vec<CustomerEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer", value! { "id": customer_id })
-        .await
-        .context("failed to query customer by id")
-        .map_err(AppError::Internal)?;
+async fn find_customer_by_id(
+    state: &AppState,
+    customer_id: Option<i64>,
+) -> Result<CustomerEntity, AppError> {
+    let customer_id =
+        customer_id.ok_or_else(|| AppError::Internal(anyhow!("customer_id missing")))?;
+    let customers: Vec<CustomerEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "customer", value! { "id": customer_id })
+            .await
+            .context("failed to query customer by id")
+            .map_err(AppError::Internal)?;
 
     customers
         .into_iter()
@@ -1583,10 +1983,14 @@ async fn find_address_by_id(
     address_id: Option<i64>,
 ) -> Result<CustomerAddressEntity, AppError> {
     let address_id = address_id.ok_or_else(|| AppError::Internal(anyhow!("address_id missing")))?;
-    let addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer_address", value! { "id": address_id })
-        .await
-        .context("failed to query address by id")
-        .map_err(AppError::Internal)?;
+    let addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "customer_address",
+        value! { "id": address_id },
+    )
+    .await
+    .context("failed to query address by id")
+    .map_err(AppError::Internal)?;
 
     addresses
         .into_iter()
@@ -1594,12 +1998,16 @@ async fn find_address_by_id(
         .ok_or_else(|| AppError::NotFound("客户地址不存在".to_string()))
 }
 
-async fn find_store_by_id(state: &AppState, store_id: Option<i64>) -> Result<StoreEntity, AppError> {
+async fn find_store_by_id(
+    state: &AppState,
+    store_id: Option<i64>,
+) -> Result<StoreEntity, AppError> {
     let store_id = store_id.ok_or_else(|| AppError::Internal(anyhow!("store_id missing")))?;
-    let stores: Vec<StoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "store", value! { "id": store_id })
-        .await
-        .context("failed to query store by id")
-        .map_err(AppError::Internal)?;
+    let stores: Vec<StoreEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "store", value! { "id": store_id })
+            .await
+            .context("failed to query store by id")
+            .map_err(AppError::Internal)?;
 
     stores
         .into_iter()
@@ -1609,10 +2017,11 @@ async fn find_store_by_id(state: &AppState, store_id: Option<i64>) -> Result<Sto
 
 async fn find_user_by_id(state: &AppState, user_id: Option<i64>) -> Result<UserEntity, AppError> {
     let user_id = user_id.ok_or_else(|| AppError::Internal(anyhow!("user_id missing")))?;
-    let users: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "id": user_id })
-        .await
-        .context("failed to query user by id")
-        .map_err(AppError::Internal)?;
+    let users: Vec<UserEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "user", value! { "id": user_id })
+            .await
+            .context("failed to query user by id")
+            .map_err(AppError::Internal)?;
 
     users
         .into_iter()
@@ -1650,7 +2059,15 @@ fn completed_step_count(service_items: &[TaskServiceItemEntity], status: Option<
     if !service_items.is_empty() {
         return service_items
             .iter()
-            .filter(|item| matches!(item.service_status.as_deref(), Some("pending_dealer_review") | Some("pending_hq_score") | Some("completed") | Some("closed")))
+            .filter(|item| {
+                matches!(
+                    item.service_status.as_deref(),
+                    Some("pending_dealer_review")
+                        | Some("pending_hq_score")
+                        | Some("completed")
+                        | Some("closed")
+                )
+            })
             .count() as i32;
     }
 
@@ -1670,9 +2087,21 @@ fn build_progress_tracks(
     executions: &[TaskExecutionEntity],
     evidence_count: usize,
 ) -> Vec<ProgressTrackItem> {
-    let assigned_at = assignments.iter().filter_map(|item| item.assigned_at).min().map(format_datetime);
-    let started_at = executions.iter().filter_map(|item| item.started_at).min().map(format_datetime);
-    let shot_at = executions.iter().filter_map(|item| item.started_at).min().map(format_datetime);
+    let assigned_at = assignments
+        .iter()
+        .filter_map(|item| item.assigned_at)
+        .min()
+        .map(format_datetime);
+    let started_at = executions
+        .iter()
+        .filter_map(|item| item.started_at)
+        .min()
+        .map(format_datetime);
+    let shot_at = executions
+        .iter()
+        .filter_map(|item| item.started_at)
+        .min()
+        .map(format_datetime);
 
     vec![
         ProgressTrackItem {
@@ -1691,20 +2120,49 @@ fn build_progress_tracks(
             time: shot_at,
         },
         ProgressTrackItem {
-            title: format!("完成{}", service_type_label(service_items.first().and_then(|item| item.service_type.as_deref()).or(task.service_type.as_deref()))),
+            title: format!(
+                "完成{}",
+                service_type_label(
+                    service_items
+                        .first()
+                        .and_then(|item| item.service_type.as_deref())
+                        .or(task.service_type.as_deref())
+                )
+            ),
             finished: if !service_items.is_empty() {
-                service_items.iter().all(|item| matches!(item.service_status.as_deref(), Some("pending_dealer_review") | Some("pending_hq_score") | Some("completed") | Some("closed")))
+                service_items.iter().all(|item| {
+                    matches!(
+                        item.service_status.as_deref(),
+                        Some("pending_dealer_review")
+                            | Some("pending_hq_score")
+                            | Some("completed")
+                            | Some("closed")
+                    )
+                })
             } else {
-                matches!(task.task_status.as_deref(), Some("pending_dealer_review") | Some("pending_hq_score") | Some("completed") | Some("closed"))
+                matches!(
+                    task.task_status.as_deref(),
+                    Some("pending_dealer_review")
+                        | Some("pending_hq_score")
+                        | Some("completed")
+                        | Some("closed")
+                )
             },
-            time: executions.iter().filter_map(|item| item.submitted_at).max().map(format_datetime),
+            time: executions
+                .iter()
+                .filter_map(|item| item.submitted_at)
+                .max()
+                .map(format_datetime),
         },
     ]
 }
 
 fn task_progress_percent(service_items: &[TaskServiceItemEntity], status: Option<&str>) -> i32 {
     if !service_items.is_empty() {
-        let total = service_items.iter().map(|item| item.progress_percent.unwrap_or_default()).sum::<i32>();
+        let total = service_items
+            .iter()
+            .map(|item| item.progress_percent.unwrap_or_default())
+            .sum::<i32>();
         return total / service_items.len() as i32;
     }
 
@@ -1781,16 +2239,23 @@ async fn load_task_service_item_entities(
     state: &AppState,
     task_id: i64,
 ) -> Result<Vec<TaskServiceItemEntity>, AppError> {
-    let mut items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! { "task_id": task_id })
-        .await
-        .context("failed to query task service items")
-        .map_err(AppError::Internal)?;
+    let mut items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query task service items")
+    .map_err(AppError::Internal)?;
     items.sort_by_key(|item| item.sort_no.unwrap_or_default());
     Ok(items)
 }
 
-fn map_task_service_item_payloads(items: Vec<TaskServiceItemEntity>) -> Vec<TaskServiceItemPayload> {
-    items.into_iter()
+fn map_task_service_item_payloads(
+    items: Vec<TaskServiceItemEntity>,
+) -> Vec<TaskServiceItemPayload> {
+    items
+        .into_iter()
         .map(|item| {
             let is_overdue = service_item_is_overdue(&item);
             TaskServiceItemPayload {
@@ -1900,7 +2365,11 @@ async fn sync_task_service_items_status(
                 &TaskServiceItemEntity {
                     service_status: Some(service_status.to_string()),
                     progress_percent: Some(progress_percent),
-                    completed_at: if progress_percent >= 100 { Some(Utc::now().naive_utc()) } else { None },
+                    completed_at: if progress_percent >= 100 {
+                        Some(Utc::now().naive_utc())
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 },
                 value! { "id": id },
@@ -1997,14 +2466,21 @@ fn task_is_overdue(task: &TaskEntity) -> bool {
         .appointment_time
         .map(|dt| dt < Utc::now().naive_utc())
         .unwrap_or(false);
-    overdue_by_time && !matches!(task.task_status.as_deref(), Some("completed") | Some("closed"))
+    overdue_by_time
+        && !matches!(
+            task.task_status.as_deref(),
+            Some("completed") | Some("closed")
+        )
 }
 
 fn service_item_is_overdue(item: &TaskServiceItemEntity) -> bool {
     item.scheduled_time
         .map(|dt| dt < Utc::now().naive_utc())
         .unwrap_or(false)
-        && !matches!(item.service_status.as_deref(), Some("completed") | Some("closed"))
+        && !matches!(
+            item.service_status.as_deref(),
+            Some("completed") | Some("closed")
+        )
 }
 
 fn overdue_text(is_overdue: bool) -> &'static str {
@@ -2015,7 +2491,11 @@ fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn build_task_tags(task: &TaskEntity, service_items: &[TaskServiceItemPayload], technician_only: bool) -> Vec<String> {
+fn build_task_tags(
+    task: &TaskEntity,
+    service_items: &[TaskServiceItemPayload],
+    technician_only: bool,
+) -> Vec<String> {
     let mut tags = service_items
         .iter()
         .map(|item| service_type_label(Some(item.service_type.as_str())).to_string())
@@ -2056,7 +2536,11 @@ fn display_status_text_for_viewer(status: &str, technician_only: bool) -> &'stat
     display_status_text(status)
 }
 
-fn review_status_text_for_viewer(review_status: &str, task_status: &str, technician_only: bool) -> &'static str {
+fn review_status_text_for_viewer(
+    review_status: &str,
+    task_status: &str,
+    technician_only: bool,
+) -> &'static str {
     if technician_only && task_status == "pending_hq_score" {
         return "已完成";
     }
@@ -2072,26 +2556,45 @@ fn is_technician_only(auth_user: &auth::CurrentAuthUser) -> bool {
 }
 
 fn primary_role(auth_user: &auth::CurrentAuthUser) -> &str {
-    auth_user.roles.first().map(|item| item.as_str()).unwrap_or("unknown")
+    auth_user
+        .roles
+        .first()
+        .map(|item| item.as_str())
+        .unwrap_or("unknown")
 }
 
-async fn calculate_technician_average_score(state: &AppState, technician_id: i64) -> Result<f64, AppError> {
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "current_technician_id": technician_id })
-        .await
-        .context("failed to query technician tasks for detail score")
-        .map_err(AppError::Internal)?;
+async fn calculate_technician_average_score(
+    state: &AppState,
+    technician_id: i64,
+) -> Result<f64, AppError> {
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "current_technician_id": technician_id },
+    )
+    .await
+    .context("failed to query technician tasks for detail score")
+    .map_err(AppError::Internal)?;
     let task_ids: Vec<i64> = tasks.into_iter().filter_map(|item| item.id).collect();
     if task_ids.is_empty() {
         return Ok(0.0);
     }
 
-    let scores: Vec<crate::models::hq_score::HqScoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! { "task_id": task_ids })
-        .await
-        .context("failed to query hq scores for detail score")
-        .map_err(AppError::Internal)?;
+    let scores: Vec<crate::models::hq_score::HqScoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "hq_score",
+        value! { "task_id": task_ids },
+    )
+    .await
+    .context("failed to query hq scores for detail score")
+    .map_err(AppError::Internal)?;
     if scores.is_empty() {
         return Ok(0.0);
     }
 
-    Ok(scores.iter().map(|item| item.total_score.unwrap_or_default() as f64).sum::<f64>() / scores.len() as f64)
+    Ok(scores
+        .iter()
+        .map(|item| item.total_score.unwrap_or_default() as f64)
+        .sum::<f64>()
+        / scores.len() as f64)
 }

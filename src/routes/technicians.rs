@@ -10,16 +10,11 @@ use rbs::value;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
     models::{
-        hq_score::HqScoreEntity,
-        role::RoleEntity,
-        task::TaskEntity,
-        technician_skill::TechnicianSkillEntity,
-        user::UserEntity,
-        user_role::UserRoleEntity,
+        hq_score::HqScoreEntity, role::RoleEntity, task::TaskEntity,
+        technician_skill::TechnicianSkillEntity, user::UserEntity, user_role::UserRoleEntity,
         user_store::UserStoreEntity,
     },
     response::ApiResponse,
@@ -37,6 +32,12 @@ pub struct TechnicianListQuery {
 pub struct AvailableTechnicianQuery {
     pub store_id: i64,
     pub service_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AvailableTechnicianGroupedQuery {
+    pub store_id: i64,
+    pub service_types: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +108,18 @@ pub struct TechnicianListResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AvailableTechnicianGroupedResponse {
+    pub groups: Vec<AvailableTechnicianGroup>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AvailableTechnicianGroup {
+    pub service_type: String,
+    pub service_type_text: String,
+    pub technicians: Vec<TechnicianItem>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct TechnicianDetailResponse {
     pub id: i64,
     pub name: String,
@@ -168,12 +181,19 @@ pub async fn list_technicians(
     let dealer_store_ids = dealer_scope_store_ids(&state, &auth_user).await?;
 
     let technician_role_id = find_role_id_by_code(&state, "technician").await?;
-    let user_roles: Vec<UserRoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_role", value! { "role_id": technician_role_id })
-        .await
-        .context("failed to query technician role relations")
-        .map_err(AppError::Internal)?;
+    let user_roles: Vec<UserRoleEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_role",
+        value! { "role_id": technician_role_id },
+    )
+    .await
+    .context("failed to query technician role relations")
+    .map_err(AppError::Internal)?;
 
-    let user_ids: Vec<i64> = user_roles.into_iter().filter_map(|item| item.user_id).collect();
+    let user_ids: Vec<i64> = user_roles
+        .into_iter()
+        .filter_map(|item| item.user_id)
+        .collect();
     let mut items = Vec::new();
     for user_id in user_ids {
         let user = find_user(&state, user_id).await?;
@@ -188,11 +208,18 @@ pub async fn list_technicians(
             continue;
         }
 
-        let skills: Vec<TechnicianSkillEntity> = db::select_by_map_compat(state.rb.as_ref(), "technician_skill", value! { "user_id": user_id })
-            .await
-            .context("failed to query technician skills")
-            .map_err(AppError::Internal)?;
-        let service_types: Vec<String> = skills.into_iter().filter_map(|item| item.service_type).collect();
+        let skills: Vec<TechnicianSkillEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "technician_skill",
+            value! { "user_id": user_id },
+        )
+        .await
+        .context("failed to query technician skills")
+        .map_err(AppError::Internal)?;
+        let service_types: Vec<String> = skills
+            .into_iter()
+            .filter_map(|item| item.service_type)
+            .collect();
         if let Some(service_type) = &query.service_type
             && !service_types.iter().any(|item| item == service_type)
         {
@@ -200,35 +227,66 @@ pub async fn list_technicians(
         }
 
         let role_names = find_role_names(&state, user_id).await?;
-        let store_relations: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
-            .await
-            .context("failed to query technician store relations")
-            .map_err(AppError::Internal)?;
-        let store_ids: Vec<i64> = store_relations.into_iter().filter_map(|item| item.store_id).collect();
+        let store_relations: Vec<UserStoreEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "user_store",
+            value! { "user_id": user_id },
+        )
+        .await
+        .context("failed to query technician store relations")
+        .map_err(AppError::Internal)?;
+        let store_ids: Vec<i64> = store_relations
+            .into_iter()
+            .filter_map(|item| item.store_id)
+            .collect();
         if let Some(dealer_store_ids) = &dealer_store_ids
-            && !store_ids.iter().any(|store_id| dealer_store_ids.contains(store_id))
+            && !store_ids
+                .iter()
+                .any(|store_id| dealer_store_ids.contains(store_id))
         {
             continue;
         }
         let store_names = if store_ids.is_empty() {
             Vec::new()
         } else {
-            db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids })
-                .await
-                .context("failed to query technician store names")
-                .map_err(AppError::Internal)?
-                .into_iter()
-                .filter_map(|item| item.store_name)
-                .collect::<Vec<_>>()
-        };
-        let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "current_technician_id": user_id })
+            db::select_by_map_compat::<crate::models::store::StoreEntity>(
+                state.rb.as_ref(),
+                "store",
+                value! { "id": store_ids },
+            )
             .await
-            .context("failed to query technician tasks")
-            .map_err(AppError::Internal)?;
+            .context("failed to query technician store names")
+            .map_err(AppError::Internal)?
+            .into_iter()
+            .filter_map(|item| item.store_name)
+            .collect::<Vec<_>>()
+        };
+        let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task",
+            value! { "current_technician_id": user_id },
+        )
+        .await
+        .context("failed to query technician tasks")
+        .map_err(AppError::Internal)?;
         let average_score = calculate_technician_average_score(&state, user_id).await?;
-        let completed_order_count = tasks.iter().filter(|item| item.task_status.as_deref() == Some("completed")).count();
-        let pending_order_count = tasks.iter().filter(|item| item.task_status.as_deref() != Some("completed") && item.task_status.as_deref() != Some("closed")).count();
-        let current_task = tasks.iter().find(|item| matches!(item.task_status.as_deref(), Some("pending_execute") | Some("executing")));
+        let completed_order_count = tasks
+            .iter()
+            .filter(|item| item.task_status.as_deref() == Some("completed"))
+            .count();
+        let pending_order_count = tasks
+            .iter()
+            .filter(|item| {
+                item.task_status.as_deref() != Some("completed")
+                    && item.task_status.as_deref() != Some("closed")
+            })
+            .count();
+        let current_task = tasks.iter().find(|item| {
+            matches!(
+                item.task_status.as_deref(),
+                Some("pending_execute") | Some("executing")
+            )
+        });
 
         items.push(TechnicianItem {
             id: user_id,
@@ -240,7 +298,11 @@ pub async fn list_technicians(
             status: user.status.unwrap_or_else(|| "enabled".to_string()),
             role_names,
             store_names,
-            work_status: if current_task.is_some() { "busy".to_string() } else { "idle".to_string() },
+            work_status: if current_task.is_some() {
+                "busy".to_string()
+            } else {
+                "idle".to_string()
+            },
             service_types,
             average_score,
             completed_order_count,
@@ -252,7 +314,10 @@ pub async fn list_technicians(
     }
 
     let total = items.len();
-    Ok(Json(ApiResponse::success(TechnicianListResponse { items, total })))
+    Ok(Json(ApiResponse::success(TechnicianListResponse {
+        items,
+        total,
+    })))
 }
 
 pub async fn get_technician_detail(
@@ -280,11 +345,16 @@ pub async fn create_technician(
         .clone()
         .filter(|item| !item.trim().is_empty())
         .unwrap_or_else(|| "123456".to_string());
-    let requested_store_id = payload
-        .store_id
-        .or_else(|| payload.store_ids.as_ref().and_then(|item| item.first().copied()));
-    let store_id = resolve_create_technician_store_id(&state, &auth_user, requested_store_id).await?;
-    let service_types = normalize_service_types(payload.service_types.clone(), payload.role_names.clone())?;
+    let requested_store_id = payload.store_id.or_else(|| {
+        payload
+            .store_ids
+            .as_ref()
+            .and_then(|item| item.first().copied())
+    });
+    let store_id =
+        resolve_create_technician_store_id(&state, &auth_user, requested_store_id).await?;
+    let service_types =
+        normalize_service_types(payload.service_types.clone(), payload.role_names.clone())?;
 
     if payload.name.trim().is_empty() {
         return Err(AppError::BadRequest("请输入技师姓名".to_string()));
@@ -299,10 +369,14 @@ pub async fn create_technician(
         return Err(AppError::BadRequest("请至少选择一个服务能力".to_string()));
     }
 
-    let exists: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": payload.mobile.as_str() })
-        .await
-        .context("failed to query existing user by mobile")
-        .map_err(AppError::Internal)?;
+    let exists: Vec<UserEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user",
+        value! { "mobile": payload.mobile.as_str() },
+    )
+    .await
+    .context("failed to query existing user by mobile")
+    .map_err(AppError::Internal)?;
     if !exists.is_empty() {
         return Err(AppError::Conflict("该手机号账号已存在".to_string()));
     }
@@ -321,7 +395,12 @@ pub async fn create_technician(
             nickname: payload.nickname.clone(),
             email: None,
             avatar_url: payload.avatar_url.clone(),
-            job_no: payload.job_no.clone().or_else(|| Some(format!("SF{:08}", Utc::now().timestamp_millis().rem_euclid(100_000_000)))),
+            job_no: payload.job_no.clone().or_else(|| {
+                Some(format!(
+                    "SF{:08}",
+                    Utc::now().timestamp_millis().rem_euclid(100_000_000)
+                ))
+            }),
             id_card: payload.id_card.clone(),
             emergency_contact_name: payload.emergency_contact_name.clone(),
             emergency_contact_mobile: payload.emergency_contact_mobile.clone(),
@@ -337,11 +416,15 @@ pub async fn create_technician(
     .context("failed to create technician user")
     .map_err(AppError::Internal)?;
 
-    let user: UserEntity = db::select_one_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": payload.mobile.as_str() })
-        .await
-        .context("failed to fetch created technician")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::Internal(anyhow!("technician create succeeded but fetch failed")))?;
+    let user: UserEntity = db::select_one_by_map_compat(
+        state.rb.as_ref(),
+        "user",
+        value! { "mobile": payload.mobile.as_str() },
+    )
+    .await
+    .context("failed to fetch created technician")
+    .map_err(AppError::Internal)?
+    .ok_or_else(|| AppError::Internal(anyhow!("technician create succeeded but fetch failed")))?;
     let user_id = user.id.unwrap_or_default();
 
     let role_id = find_role_id_by_code(&state, "technician").await?;
@@ -421,10 +504,14 @@ pub async fn update_technician(
     .map_err(AppError::Internal)?;
 
     if let Some(service_types) = payload.service_types {
-        let existing: Vec<TechnicianSkillEntity> = db::select_by_map_compat(state.rb.as_ref(), "technician_skill", value! { "user_id": technician_id })
-            .await
-            .context("failed to query existing technician skills")
-            .map_err(AppError::Internal)?;
+        let existing: Vec<TechnicianSkillEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "technician_skill",
+            value! { "user_id": technician_id },
+        )
+        .await
+        .context("failed to query existing technician skills")
+        .map_err(AppError::Internal)?;
         for skill in existing {
             if let Some(id) = skill.id {
                 TechnicianSkillEntity::delete_by_map(state.rb.as_ref(), value! { "id": id })
@@ -451,10 +538,14 @@ pub async fn update_technician(
 
     if let Some(store_id) = payload.store_id {
         let store_id = resolve_technician_store_id(&state, &auth_user, store_id).await?;
-        let existing_stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": technician_id })
-            .await
-            .context("failed to query existing technician stores")
-            .map_err(AppError::Internal)?;
+        let existing_stores: Vec<UserStoreEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "user_store",
+            value! { "user_id": technician_id },
+        )
+        .await
+        .context("failed to query existing technician stores")
+        .map_err(AppError::Internal)?;
         for relation in existing_stores {
             if let Some(id) = relation.id {
                 UserStoreEntity::delete_by_map(state.rb.as_ref(), value! { "id": id })
@@ -492,7 +583,9 @@ pub async fn update_technician_status(
     ensure_technician_access(&state, &auth_user, technician_id).await?;
 
     if payload.status != "enabled" && payload.status != "disabled" {
-        return Err(AppError::BadRequest("status只能为enabled或disabled".to_string()));
+        return Err(AppError::BadRequest(
+            "status只能为enabled或disabled".to_string(),
+        ));
     }
 
     UserEntity::update_by_map(
@@ -520,19 +613,34 @@ pub async fn get_technician_performance(
     ensure_technician_access(&state, &auth_user, technician_id).await?;
 
     let _ = find_user(&state, technician_id).await?;
-    let tasks: Vec<crate::models::task::TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "current_technician_id": technician_id })
-        .await
-        .context("failed to query technician tasks")
-        .map_err(AppError::Internal)?;
-    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! { "scorer_id": technician_id })
-        .await
-        .context("failed to query technician scores")
-        .map_err(AppError::Internal)?;
-    let completed_tasks = tasks.iter().filter(|item| item.task_status.as_deref() == Some("completed")).count();
+    let tasks: Vec<crate::models::task::TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "current_technician_id": technician_id },
+    )
+    .await
+    .context("failed to query technician tasks")
+    .map_err(AppError::Internal)?;
+    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "hq_score",
+        value! { "scorer_id": technician_id },
+    )
+    .await
+    .context("failed to query technician scores")
+    .map_err(AppError::Internal)?;
+    let completed_tasks = tasks
+        .iter()
+        .filter(|item| item.task_status.as_deref() == Some("completed"))
+        .count();
     let average_score = if scores.is_empty() {
         0.0
     } else {
-        scores.iter().map(|item| item.total_score.unwrap_or_default() as f64).sum::<f64>() / scores.len() as f64
+        scores
+            .iter()
+            .map(|item| item.total_score.unwrap_or_default() as f64)
+            .sum::<f64>()
+            / scores.len() as f64
     };
 
     Ok(Json(ApiResponse::success(TechnicianPerformanceResponse {
@@ -552,32 +660,81 @@ pub async fn list_available_technicians(
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
     ensure_store_access(&state, &auth_user, query.store_id).await?;
 
-    let store_relations: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "store_id": query.store_id })
-        .await
-        .context("failed to query available technician store relations")
-        .map_err(AppError::Internal)?;
-    let store_name = db::select_one_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": query.store_id })
-        .await
-        .context("failed to query available technician store")
-        .map_err(AppError::Internal)?
-        .and_then(|item| item.store_name)
-        .unwrap_or_default();
+    let store_relations = load_store_relations(&state, query.store_id).await?;
+    let store_name = load_store_name(&state, query.store_id).await?;
+
+    Ok(Json(ApiResponse::success(
+        available_technicians_for_service(
+            &state,
+            &store_relations,
+            &store_name,
+            &query.service_type,
+        )
+        .await?,
+    )))
+}
+
+pub async fn list_available_technicians_grouped(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AvailableTechnicianGroupedQuery>,
+) -> Result<Json<ApiResponse<AvailableTechnicianGroupedResponse>>, AppError> {
+    let auth_user = auth::authenticate(&state, &headers)?;
+    auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    ensure_store_access(&state, &auth_user, query.store_id).await?;
+
+    let service_types = parse_service_types_param(&query.service_types)?;
+    let store_relations = load_store_relations(&state, query.store_id).await?;
+    let store_name = load_store_name(&state, query.store_id).await?;
+    let mut groups = Vec::with_capacity(service_types.len());
+
+    for service_type in service_types {
+        groups.push(AvailableTechnicianGroup {
+            service_type: service_type.clone(),
+            service_type_text: service_type_label(&service_type).to_string(),
+            technicians: available_technicians_for_service(
+                &state,
+                &store_relations,
+                &store_name,
+                &service_type,
+            )
+            .await?,
+        });
+    }
+
+    Ok(Json(ApiResponse::success(
+        AvailableTechnicianGroupedResponse { groups },
+    )))
+}
+
+async fn available_technicians_for_service(
+    state: &AppState,
+    store_relations: &[UserStoreEntity],
+    store_name: &str,
+    service_type: &str,
+) -> Result<Vec<TechnicianItem>, AppError> {
     let mut items = Vec::new();
     for relation in store_relations {
-        let Some(user_id) = relation.user_id else { continue; };
-        let user = find_user(&state, user_id).await?;
+        let Some(user_id) = relation.user_id else {
+            continue;
+        };
+        let user = find_user(state, user_id).await?;
         if user.status.as_deref() != Some("enabled") {
             continue;
         }
         let skills: Vec<TechnicianSkillEntity> = db::select_by_map_compat(
             state.rb.as_ref(),
             "technician_skill",
-            value! { "user_id": user_id, "service_type": query.service_type.as_str() },
+            value! { "user_id": user_id },
         )
         .await
         .context("failed to query available technician skills")
         .map_err(AppError::Internal)?;
-        if skills.is_empty() {
+        let service_types = skills
+            .into_iter()
+            .filter_map(|item| item.service_type)
+            .collect::<Vec<_>>();
+        if !service_types.iter().any(|item| item == service_type) {
             continue;
         }
         items.push(TechnicianItem {
@@ -589,9 +746,9 @@ pub async fn list_available_technicians(
             job_no: user.job_no.clone(),
             status: user.status.unwrap_or_else(|| "enabled".to_string()),
             role_names: vec!["技师".to_string()],
-            store_names: vec![store_name.clone()],
+            store_names: vec![store_name.to_string()],
             work_status: "idle".to_string(),
-            service_types: vec![query.service_type.clone()],
+            service_types,
             average_score: 0.0,
             completed_order_count: 0,
             pending_order_count: 0,
@@ -601,7 +758,67 @@ pub async fn list_available_technicians(
         });
     }
 
-    Ok(Json(ApiResponse::success(items)))
+    Ok(items)
+}
+
+async fn load_store_relations(
+    state: &AppState,
+    store_id: i64,
+) -> Result<Vec<UserStoreEntity>, AppError> {
+    db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "store_id": store_id },
+    )
+    .await
+    .context("failed to query available technician store relations")
+    .map_err(AppError::Internal)
+}
+
+async fn load_store_name(state: &AppState, store_id: i64) -> Result<String, AppError> {
+    Ok(
+        db::select_one_by_map_compat::<crate::models::store::StoreEntity>(
+            state.rb.as_ref(),
+            "store",
+            value! { "id": store_id },
+        )
+        .await
+        .context("failed to query available technician store")
+        .map_err(AppError::Internal)?
+        .and_then(|item| item.store_name)
+        .unwrap_or_default(),
+    )
+}
+
+fn parse_service_types_param(input: &str) -> Result<Vec<String>, AppError> {
+    let mut service_types = Vec::new();
+    for item in input.split(',') {
+        let service_type = item.trim();
+        if service_type.is_empty()
+            || service_types
+                .iter()
+                .any(|existing| existing == service_type)
+        {
+            continue;
+        }
+        service_types.push(service_type.to_string());
+    }
+
+    if service_types.is_empty() {
+        return Err(AppError::BadRequest("请选择服务环节".to_string()));
+    }
+
+    Ok(service_types)
+}
+
+fn service_type_label(service_type: &str) -> &'static str {
+    match service_type {
+        "measure" => "量尺服务",
+        "install" => "安装服务",
+        "ironing" => "熨烫服务",
+        "cleaning" => "除尘除螨服务",
+        _ => "其他服务",
+    }
 }
 
 async fn get_technician_detail_inner(
@@ -609,35 +826,61 @@ async fn get_technician_detail_inner(
     technician_id: i64,
 ) -> Result<Json<ApiResponse<TechnicianDetailResponse>>, AppError> {
     let user = find_user(state, technician_id).await?;
-    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": technician_id })
-        .await
-        .context("failed to query technician stores")
-        .map_err(AppError::Internal)?;
-    let skills: Vec<TechnicianSkillEntity> = db::select_by_map_compat(state.rb.as_ref(), "technician_skill", value! { "user_id": technician_id })
-        .await
-        .context("failed to query technician skills")
-        .map_err(AppError::Internal)?;
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "current_technician_id": technician_id })
-        .await
-        .context("failed to query technician task counts")
-        .map_err(AppError::Internal)?;
+    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": technician_id },
+    )
+    .await
+    .context("failed to query technician stores")
+    .map_err(AppError::Internal)?;
+    let skills: Vec<TechnicianSkillEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "technician_skill",
+        value! { "user_id": technician_id },
+    )
+    .await
+    .context("failed to query technician skills")
+    .map_err(AppError::Internal)?;
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "current_technician_id": technician_id },
+    )
+    .await
+    .context("failed to query technician task counts")
+    .map_err(AppError::Internal)?;
     let average_score = calculate_technician_average_score(state, technician_id).await?;
     let role_names = find_role_names(state, technician_id).await?;
     let store_ids: Vec<i64> = stores.iter().filter_map(|item| item.store_id).collect();
     let store_names = if store_ids.is_empty() {
         Vec::new()
     } else {
-        db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
-            .await
-            .context("failed to query technician detail store names")
-            .map_err(AppError::Internal)?
-            .into_iter()
-            .filter_map(|item| item.store_name)
-            .collect::<Vec<_>>()
+        db::select_by_map_compat::<crate::models::store::StoreEntity>(
+            state.rb.as_ref(),
+            "store",
+            value! { "id": store_ids.clone() },
+        )
+        .await
+        .context("failed to query technician detail store names")
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .filter_map(|item| item.store_name)
+        .collect::<Vec<_>>()
     };
-    let current_task = tasks.iter().find(|item| matches!(item.task_status.as_deref(), Some("pending_execute") | Some("executing")));
-    let work_status = if current_task.is_some() { "busy".to_string() } else { "idle".to_string() };
-    let recent_tasks = tasks.iter()
+    let current_task = tasks.iter().find(|item| {
+        matches!(
+            item.task_status.as_deref(),
+            Some("pending_execute") | Some("executing")
+        )
+    });
+    let work_status = if current_task.is_some() {
+        "busy".to_string()
+    } else {
+        "idle".to_string()
+    };
+    let recent_tasks = tasks
+        .iter()
         .take(10)
         .map(|item| TechnicianTaskItem {
             task_id: item.id.unwrap_or_default(),
@@ -645,7 +888,9 @@ async fn get_technician_detail_inner(
             service_type: item.service_type.clone().unwrap_or_default(),
             task_status: item.task_status.clone().unwrap_or_default(),
             customer_id: item.customer_id.unwrap_or_default(),
-            appointment_time: item.appointment_time.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+            appointment_time: item
+                .appointment_time
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
         })
         .collect::<Vec<_>>();
     let monthly_trends = build_monthly_trends(&tasks);
@@ -665,11 +910,23 @@ async fn get_technician_detail_inner(
         store_ids,
         store_names,
         role_names,
-        service_types: skills.into_iter().filter_map(|item| item.service_type).collect(),
+        service_types: skills
+            .into_iter()
+            .filter_map(|item| item.service_type)
+            .collect(),
         work_status,
         average_score,
-        pending_task_count: tasks.iter().filter(|item| item.task_status.as_deref() != Some("completed") && item.task_status.as_deref() != Some("closed")).count(),
-        completed_task_count: tasks.iter().filter(|item| item.task_status.as_deref() == Some("completed")).count(),
+        pending_task_count: tasks
+            .iter()
+            .filter(|item| {
+                item.task_status.as_deref() != Some("completed")
+                    && item.task_status.as_deref() != Some("closed")
+            })
+            .count(),
+        completed_task_count: tasks
+            .iter()
+            .filter(|item| item.task_status.as_deref() == Some("completed"))
+            .count(),
         current_task_no: current_task.and_then(|item| item.task_no.clone()),
         current_task_status: current_task.and_then(|item| item.task_status.clone()),
         recent_tasks,
@@ -678,49 +935,79 @@ async fn get_technician_detail_inner(
 }
 
 async fn find_role_id_by_code(state: &AppState, role_code: &str) -> Result<i64, AppError> {
-    db::select_one_by_map_compat::<RoleEntity>(state.rb.as_ref(), "role", value! { "role_code": role_code })
-        .await
-        .context("failed to query role by code")
-        .map_err(AppError::Internal)?
-        .and_then(|item| item.id)
-        .ok_or_else(|| AppError::Internal(anyhow!("role not found: {role_code}")))
+    db::select_one_by_map_compat::<RoleEntity>(
+        state.rb.as_ref(),
+        "role",
+        value! { "role_code": role_code },
+    )
+    .await
+    .context("failed to query role by code")
+    .map_err(AppError::Internal)?
+    .and_then(|item| item.id)
+    .ok_or_else(|| AppError::Internal(anyhow!("role not found: {role_code}")))
 }
 
 async fn find_role_names(state: &AppState, user_id: i64) -> Result<Vec<String>, AppError> {
-    let relations: Vec<UserRoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_role", value! { "user_id": user_id })
-        .await
-        .context("failed to query technician role relations")
-        .map_err(AppError::Internal)?;
-    let role_ids: Vec<i64> = relations.into_iter().filter_map(|item| item.role_id).collect();
+    let relations: Vec<UserRoleEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_role",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query technician role relations")
+    .map_err(AppError::Internal)?;
+    let role_ids: Vec<i64> = relations
+        .into_iter()
+        .filter_map(|item| item.role_id)
+        .collect();
     if role_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let roles: Vec<RoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "role", value! { "id": role_ids })
-        .await
-        .context("failed to query role names")
-        .map_err(AppError::Internal)?;
-    Ok(roles.into_iter().filter_map(|item| item.role_name).collect())
+    let roles: Vec<RoleEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "role", value! { "id": role_ids })
+            .await
+            .context("failed to query role names")
+            .map_err(AppError::Internal)?;
+    Ok(roles
+        .into_iter()
+        .filter_map(|item| item.role_name)
+        .collect())
 }
 
-async fn calculate_technician_average_score(state: &AppState, technician_id: i64) -> Result<f64, AppError> {
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "current_technician_id": technician_id })
-        .await
-        .context("failed to query technician tasks for score calc")
-        .map_err(AppError::Internal)?;
+async fn calculate_technician_average_score(
+    state: &AppState,
+    technician_id: i64,
+) -> Result<f64, AppError> {
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "current_technician_id": technician_id },
+    )
+    .await
+    .context("failed to query technician tasks for score calc")
+    .map_err(AppError::Internal)?;
     let task_ids: Vec<i64> = tasks.into_iter().filter_map(|item| item.id).collect();
     if task_ids.is_empty() {
         return Ok(0.0);
     }
 
-    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! { "task_id": task_ids })
-        .await
-        .context("failed to query hq scores for technician score calc")
-        .map_err(AppError::Internal)?;
+    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "hq_score",
+        value! { "task_id": task_ids },
+    )
+    .await
+    .context("failed to query hq scores for technician score calc")
+    .map_err(AppError::Internal)?;
     if scores.is_empty() {
         return Ok(0.0);
     }
 
-    Ok(scores.iter().map(|item| item.total_score.unwrap_or_default() as f64).sum::<f64>() / scores.len() as f64)
+    Ok(scores
+        .iter()
+        .map(|item| item.total_score.unwrap_or_default() as f64)
+        .sum::<f64>()
+        / scores.len() as f64)
 }
 
 async fn ensure_technician_access(
@@ -740,7 +1027,9 @@ async fn ensure_technician_access(
         return Ok(());
     }
 
-    Err(AppError::Forbidden("您只能查看或维护所属门店下的师傅".to_string()))
+    Err(AppError::Forbidden(
+        "您只能查看或维护所属门店下的师傅".to_string(),
+    ))
 }
 
 async fn ensure_store_access(
@@ -772,7 +1061,10 @@ async fn dealer_scope_store_ids(
     state: &AppState,
     auth_user: &auth::CurrentAuthUser,
 ) -> Result<Option<Vec<i64>>, AppError> {
-    if !auth_user.has_role("dealer") || auth_user.has_role("hq_reviewer") || auth_user.has_role("super_admin") {
+    if !auth_user.has_role("dealer")
+        || auth_user.has_role("hq_reviewer")
+        || auth_user.has_role("super_admin")
+    {
         return Ok(None);
     }
 
@@ -784,11 +1076,15 @@ async fn resolve_create_technician_store_id(
     auth_user: &auth::CurrentAuthUser,
     requested_store_id: Option<i64>,
 ) -> Result<i64, AppError> {
-    if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+    if auth_user.has_role("dealer")
+        && !auth_user.has_role("hq_reviewer")
+        && !auth_user.has_role("super_admin")
+    {
         return dealer_owned_store_id(state, auth_user).await;
     }
 
-    let store_id = requested_store_id.ok_or_else(|| AppError::BadRequest("请选择所属门店".to_string()))?;
+    let store_id =
+        requested_store_id.ok_or_else(|| AppError::BadRequest("请选择所属门店".to_string()))?;
     resolve_technician_store_id(state, auth_user, store_id).await
 }
 
@@ -801,20 +1097,32 @@ async fn dealer_owned_store_id(
     match store_ids.as_slice() {
         [store_id] => Ok(*store_id),
         [] => Err(AppError::Forbidden("当前经销商账号未绑定门店".to_string())),
-        _ => Err(AppError::Conflict("当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string())),
+        _ => Err(AppError::Conflict(
+            "当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string(),
+        )),
     }
 }
 
 async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>, AppError> {
-    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
-        .await
-        .context("failed to query user store relations")
-        .map_err(AppError::Internal)?;
+    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query user store relations")
+    .map_err(AppError::Internal)?;
 
-    Ok(stores.into_iter().filter_map(|item| item.store_id).collect())
+    Ok(stores
+        .into_iter()
+        .filter_map(|item| item.store_id)
+        .collect())
 }
 
-fn normalize_service_types(service_types: Option<Vec<String>>, role_names: Option<Vec<String>>) -> Result<Vec<String>, AppError> {
+fn normalize_service_types(
+    service_types: Option<Vec<String>>,
+    role_names: Option<Vec<String>>,
+) -> Result<Vec<String>, AppError> {
     let source = service_types.or(role_names).unwrap_or_default();
     let mut result = Vec::new();
 
@@ -842,11 +1150,19 @@ fn build_monthly_trends(tasks: &[TaskEntity]) -> Vec<TechnicianTrendPoint> {
         let month = now - chrono::Duration::days(30 * offset);
         let total_tasks = tasks
             .iter()
-            .filter(|item| item.appointment_time.map(|dt| dt.year() == month.year() && dt.month() == month.month()).unwrap_or(false))
+            .filter(|item| {
+                item.appointment_time
+                    .map(|dt| dt.year() == month.year() && dt.month() == month.month())
+                    .unwrap_or(false)
+            })
             .count();
         let completed_tasks = tasks
             .iter()
-            .filter(|item| item.appointment_time.map(|dt| dt.year() == month.year() && dt.month() == month.month()).unwrap_or(false))
+            .filter(|item| {
+                item.appointment_time
+                    .map(|dt| dt.year() == month.year() && dt.month() == month.month())
+                    .unwrap_or(false)
+            })
             .filter(|item| item.task_status.as_deref() == Some("completed"))
             .count();
         points.push(TechnicianTrendPoint {
