@@ -171,6 +171,18 @@ pub struct CreateTaskResponse {
     pub store_id: i64,
     pub dealer_user_id: i64,
     pub service_items: Vec<TaskServiceItemPayload>,
+    pub items: Vec<CreateTaskItemResponse>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct CreateTaskItemResponse {
+    pub id: i64,
+    pub task_no: String,
+    pub task_status: String,
+    pub service_type: String,
+    pub store_id: i64,
+    pub dealer_user_id: i64,
+    pub service_items: Vec<TaskServiceItemPayload>,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,90 +382,105 @@ pub async fn create_task(
     )
     .await?;
 
-    let task_no = generate_task_no();
     let appointment_time = parse_datetime(&payload.appointment_time)?;
     let service_types = resolved_service_types(&payload)?;
-    let primary_service_type = service_types
+    let mut created_items = Vec::with_capacity(service_types.len());
+    for service_type in service_types {
+        let task_no = generate_task_no();
+        let task = TaskEntity {
+            id: None,
+            task_no: Some(task_no.clone()),
+            customer_id: Some(customer_id),
+            customer_address_id: Some(customer_address_id),
+            store_id: Some(store_id),
+            dealer_user_id: Some(dealer_user_id),
+            current_technician_id: None,
+            service_type: Some(service_type.clone()),
+            task_type: None,
+            priority: Some(
+                payload
+                    .priority
+                    .clone()
+                    .unwrap_or_else(|| "normal".to_string()),
+            ),
+            appointment_time: Some(appointment_time),
+            service_time_slot: payload.service_time_slot.clone(),
+            task_desc: payload.task_desc.clone(),
+            task_remark: payload.task_remark.clone(),
+            task_status: Some("pending_assign".to_string()),
+            review_status: Some("pending".to_string()),
+            score_status: Some("pending".to_string()),
+            is_overdue: Some(0),
+            latest_assignment_id: None,
+            latest_execution_id: None,
+            source: Some(
+                payload
+                    .customer_source
+                    .clone()
+                    .unwrap_or_else(|| "mini_program".to_string()),
+            ),
+            created_by: Some(dealer_user_id),
+            created_at: None,
+            updated_at: None,
+            deleted_at: None,
+        };
+
+        TaskEntity::insert(state.rb.as_ref(), &task)
+            .await
+            .context("failed to create task")
+            .map_err(AppError::Internal)?;
+
+        let created = find_task_by_task_no(&state, &task_no).await?;
+        create_task_service_items(
+            &state,
+            created.id.unwrap_or_default(),
+            std::slice::from_ref(&service_type),
+            appointment_time,
+        )
+        .await?;
+        let created_service_items =
+            load_task_service_item_entities(&state, created.id.unwrap_or_default()).await?;
+
+        audit::write_audit_log(
+            &state,
+            "task",
+            created.id.unwrap_or_default(),
+            "create_task",
+            auth_user.user_id,
+            primary_role(&auth_user),
+            None::<&TaskEntity>,
+            Some(&created),
+            Some("创建任务".to_string()),
+        )
+        .await?;
+
+        created_items.push(CreateTaskItemResponse {
+            id: created.id.unwrap_or_default(),
+            task_no,
+            task_status: created
+                .task_status
+                .clone()
+                .unwrap_or_else(|| "pending_assign".to_string()),
+            service_type,
+            store_id,
+            dealer_user_id,
+            service_items: map_task_service_item_payloads(created_service_items),
+        });
+    }
+
+    let first = created_items
         .first()
         .cloned()
-        .ok_or_else(|| AppError::BadRequest("请选择服务环节".to_string()))?;
-
-    let task = TaskEntity {
-        id: None,
-        task_no: Some(task_no.clone()),
-        customer_id: Some(customer_id),
-        customer_address_id: Some(customer_address_id),
-        store_id: Some(store_id),
-        dealer_user_id: Some(dealer_user_id),
-        current_technician_id: None,
-        service_type: Some(primary_service_type.clone()),
-        task_type: derive_task_type_from_service_types(&service_types),
-        priority: Some(
-            payload
-                .priority
-                .clone()
-                .unwrap_or_else(|| "normal".to_string()),
-        ),
-        appointment_time: Some(appointment_time),
-        service_time_slot: payload.service_time_slot.clone(),
-        task_desc: payload.task_desc.clone(),
-        task_remark: payload.task_remark.clone(),
-        task_status: Some("pending_assign".to_string()),
-        review_status: Some("pending".to_string()),
-        score_status: Some("pending".to_string()),
-        is_overdue: Some(0),
-        latest_assignment_id: None,
-        latest_execution_id: None,
-        source: Some(
-            payload
-                .customer_source
-                .clone()
-                .unwrap_or_else(|| "mini_program".to_string()),
-        ),
-        created_by: Some(dealer_user_id),
-        created_at: None,
-        updated_at: None,
-        deleted_at: None,
-    };
-
-    TaskEntity::insert(state.rb.as_ref(), &task)
-        .await
-        .context("failed to create task")
-        .map_err(AppError::Internal)?;
-
-    let created = find_task_by_task_no(&state, &task_no).await?;
-    create_task_service_items(
-        &state,
-        created.id.unwrap_or_default(),
-        &service_types,
-        appointment_time,
-    )
-    .await?;
-    let created_service_items =
-        load_task_service_item_entities(&state, created.id.unwrap_or_default()).await?;
-
-    audit::write_audit_log(
-        &state,
-        "task",
-        created.id.unwrap_or_default(),
-        "create_task",
-        auth_user.user_id,
-        primary_role(&auth_user),
-        None::<&TaskEntity>,
-        Some(&created),
-        Some("创建任务".to_string()),
-    )
-    .await?;
+        .ok_or_else(|| AppError::Internal(anyhow!("no task created")))?;
 
     Ok(Json(ApiResponse::success(CreateTaskResponse {
-        id: created.id.unwrap_or_default(),
-        task_no,
-        task_status: created
-            .task_status
-            .unwrap_or_else(|| "pending_assign".to_string()),
-        store_id,
-        dealer_user_id,
-        service_items: map_task_service_item_payloads(created_service_items),
+        id: first.id,
+        task_no: first.task_no,
+        task_status: first.task_status,
+        store_id: first.store_id,
+        dealer_user_id: first.dealer_user_id,
+        service_items: first.service_items,
+        items: created_items,
     })))
 }
 
@@ -2579,7 +2606,7 @@ fn format_datetime(input: NaiveDateTime) -> String {
 }
 
 fn generate_task_no() -> String {
-    format!("RW{}", Utc::now().format("%Y%m%d%H%M%S%3f"))
+    format!("RW{}", Utc::now().format("%Y%m%d%H%M%S%6f"))
 }
 
 fn progress_percent_for_status(status: Option<&str>) -> i32 {
@@ -2816,20 +2843,6 @@ fn resolved_service_types(payload: &CreateTaskRequest) -> Result<Vec<String>, Ap
     }
 
     Err(AppError::BadRequest("请选择服务环节".to_string()))
-}
-
-fn derive_task_type_from_service_types(service_types: &[String]) -> Option<String> {
-    match service_types
-        .iter()
-        .map(|item| item.trim())
-        .filter(|item| !item.is_empty())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-    {
-        3 => Some("three_special".to_string()),
-        4 => Some("four_special".to_string()),
-        _ => None,
-    }
 }
 
 async fn create_task_service_items(
