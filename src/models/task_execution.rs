@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct TaskExecutionEntity {
     pub id: Option<i64>,
     pub task_id: Option<i64>,
+    pub service_item_id: Option<i64>,
+    pub service_type: Option<String>,
     pub technician_id: Option<i64>,
     pub started_at: Option<NaiveDateTime>,
     pub submitted_at: Option<NaiveDateTime>,

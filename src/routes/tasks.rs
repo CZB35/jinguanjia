@@ -68,6 +68,12 @@ pub struct TaskListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TaskDetailQuery {
+    pub service_item_id: Option<i64>,
+    pub service_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AssignTaskRequest {
     pub technician_id: Option<i64>,
     pub service_type: Option<String>,
@@ -100,11 +106,15 @@ pub struct ReassignTaskRequest {
 #[derive(Debug, Deserialize)]
 pub struct StartTaskRequest {
     pub confirm_standard_read: bool,
+    pub service_item_id: Option<i64>,
+    pub service_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitTaskRequest {
     pub execution_id: i64,
+    pub service_item_id: Option<i64>,
+    pub service_type: Option<String>,
     pub submit_remark: Option<String>,
 }
 
@@ -116,8 +126,10 @@ pub struct CloseTaskRequest {
 #[derive(Debug, Serialize)]
 pub struct TaskSummary {
     pub id: i64,
+    pub service_item_id: Option<i64>,
     pub task_no: String,
     pub service_type: String,
+    pub service_status: Option<String>,
     pub service_items: Vec<TaskServiceItemPayload>,
     pub service_items_text: String,
     pub task_status: String,
@@ -310,6 +322,9 @@ pub struct ExecutionPayload {
 pub struct TaskActionResponse {
     pub task_id: i64,
     pub task_status: String,
+    pub service_item_id: Option<i64>,
+    pub service_type: Option<String>,
+    pub execution_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -509,16 +524,11 @@ async fn load_task_summaries(
     auth_user: &auth::CurrentAuthUser,
     query: &TaskListQuery,
 ) -> Result<Vec<TaskSummary>, AppError> {
-    let mut tasks = if auth_user.has_role("technician") {
-        db::select_by_map_compat::<TaskEntity>(
-            state.rb.as_ref(),
-            "task",
-            value! { "current_technician_id": auth_user.user_id },
-        )
-        .await
-        .context("failed to query technician tasks")
-        .map_err(AppError::Internal)?
-    } else if auth_user.has_role("dealer") {
+    if is_technician_only(auth_user) {
+        return load_technician_task_summaries(state, auth_user, query).await;
+    }
+
+    let mut tasks = if auth_user.has_role("dealer") {
         let store_id = dealer_owned_store_id(&state, auth_user.user_id).await?;
         db::select_by_map_compat::<TaskEntity>(
             state.rb.as_ref(),
@@ -539,7 +549,59 @@ async fn load_task_summaries(
 
     let mut items = Vec::with_capacity(tasks.len());
     for task in tasks {
-        items.push(build_task_summary(state, auth_user, task).await?);
+        items.push(build_task_summary(state, auth_user, task, None).await?);
+    }
+
+    items.retain(|item| filter_task_summary(item, query));
+    Ok(items)
+}
+
+async fn load_technician_task_summaries(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    query: &TaskListQuery,
+) -> Result<Vec<TaskSummary>, AppError> {
+    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "technician_id": auth_user.user_id },
+    )
+    .await
+    .context("failed to query technician service item tasks")
+    .map_err(AppError::Internal)?;
+
+    let mut items = Vec::new();
+    let mut task_ids_with_service_items = std::collections::BTreeSet::new();
+    for service_item in service_items {
+        let Some(task_id) = service_item.task_id else {
+            continue;
+        };
+        let task = find_task_by_id(state, task_id).await?;
+        if !filter_task_item_for_technician(&task, query) {
+            continue;
+        }
+        task_ids_with_service_items.insert(task_id);
+        items.push(build_task_summary(state, auth_user, task, Some(service_item)).await?);
+    }
+
+    let legacy_tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "current_technician_id": auth_user.user_id },
+    )
+    .await
+    .context("failed to query legacy technician tasks")
+    .map_err(AppError::Internal)?;
+    for task in legacy_tasks {
+        let Some(task_id) = task.id else {
+            continue;
+        };
+        if task_ids_with_service_items.contains(&task_id)
+            || !filter_task_item_for_technician(&task, query)
+        {
+            continue;
+        }
+        items.push(build_task_summary(state, auth_user, task, None).await?);
     }
 
     items.retain(|item| filter_task_summary(item, query));
@@ -550,6 +612,7 @@ pub async fn get_task_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<i64>,
+    Query(query): Query<TaskDetailQuery>,
 ) -> Result<Json<ApiResponse<TaskDetailResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     let task = find_task_by_id(&state, task_id).await?;
@@ -560,11 +623,6 @@ pub async fn get_task_detail(
     let store = find_store_by_id(&state, task.store_id).await?;
     let dealer = if let Some(dealer_user_id) = task.dealer_user_id {
         Some(find_user_by_id(&state, Some(dealer_user_id)).await?)
-    } else {
-        None
-    };
-    let technician = if let Some(technician_id) = task.current_technician_id {
-        Some(find_user_by_id(&state, Some(technician_id)).await?)
     } else {
         None
     };
@@ -598,6 +656,8 @@ pub async fn get_task_detail(
     .context("failed to query dealer review for task detail")
     .map_err(AppError::Internal)?;
     let service_items = load_task_service_item_entities(&state, task_id).await?;
+    let visible_service_items =
+        scoped_service_items_for_detail(&auth_user, &service_items, &query)?;
     let task_status = task.task_status.clone().unwrap_or_default();
     let review_status = task.review_status.clone().unwrap_or_default();
     let score_status = task.score_status.clone().unwrap_or_default();
@@ -608,11 +668,12 @@ pub async fn get_task_detail(
     let task_desc = task.task_desc.clone();
     let task_remark = task.task_remark.clone();
     let service_time_slot = task.service_time_slot.clone();
-    let progress_percent = task_progress_percent(&service_items, task.task_status.as_deref());
+    let progress_percent =
+        task_progress_percent(&visible_service_items, task.task_status.as_deref());
     let progress_tracks = build_progress_tracks(
         &state,
         &task,
-        &service_items,
+        &visible_service_items,
         &assignments,
         &executions,
         &evidences,
@@ -621,7 +682,7 @@ pub async fn get_task_detail(
     let completed_step_count = progress_tracks.iter().filter(|item| item.finished).count() as i32;
     let total_step_count = progress_tracks.len() as i32;
     let customer_mobile = customer.mobile.clone().unwrap_or_default();
-    let service_items_payload = map_task_service_item_payloads(service_items);
+    let service_items_payload = map_task_service_item_payloads(visible_service_items.clone());
     let technician_only = is_technician_only(&auth_user);
     let task_tags = build_task_tags(&task, &service_items_payload, technician_only);
     let task_status_text = task_status_text_for_viewer(&task_status, technician_only).to_string();
@@ -635,7 +696,16 @@ pub async fn get_task_detail(
     let can_contact_customer = !customer_mobile.is_empty();
     let is_overdue = task_is_overdue(&task);
     let overdue_text = overdue_text(is_overdue).to_string();
-    let technician_average_score = if let Some(technician_id) = task.current_technician_id {
+    let detail_technician_id = visible_service_items
+        .first()
+        .and_then(|item| item.technician_id)
+        .or(task.current_technician_id);
+    let technician = if let Some(technician_id) = detail_technician_id {
+        Some(find_user_by_id(&state, Some(technician_id)).await?)
+    } else {
+        None
+    };
+    let technician_average_score = if let Some(technician_id) = detail_technician_id {
         calculate_technician_average_score(&state, technician_id).await?
     } else {
         0.0
@@ -799,15 +869,31 @@ pub async fn assign_task(
             .await?;
 
         let after_task = find_task_by_id(&state, task_id).await?;
-        let _ = notify::create_notice(
-            &state,
-            technician_id,
-            "task_assign",
-            task_id,
-            "新任务待执行",
-            "您有一条新的待执行任务，请及时处理",
-        )
-        .await;
+        let assigned_service_items = load_task_service_item_entities(&state, task_id).await?;
+        if assigned_service_items.is_empty() {
+            send_task_assignment_notice(
+                &state,
+                technician_id,
+                task_id,
+                task.service_type.as_deref(),
+                "task_assign",
+            )
+            .await;
+        } else {
+            for service_item in assigned_service_items
+                .iter()
+                .filter(|item| item.technician_id == Some(technician_id))
+            {
+                send_task_assignment_notice(
+                    &state,
+                    technician_id,
+                    task_id,
+                    service_item.service_type.as_deref(),
+                    "task_assign",
+                )
+                .await;
+            }
+        }
         audit::write_audit_log(
             &state,
             "task",
@@ -824,6 +910,9 @@ pub async fn assign_task(
         return Ok(Json(ApiResponse::success(TaskActionResponse {
             task_id,
             task_status: "pending_execute".to_string(),
+            service_item_id: None,
+            service_type: None,
+            execution_id: None,
         })));
     }
 
@@ -905,19 +994,13 @@ pub async fn assign_task(
     .map_err(AppError::Internal)?;
 
     let after_task = find_task_by_id(&state, task_id).await?;
-    let mut notified_technician_ids = Vec::new();
     for assignment in &assignments {
-        if notified_technician_ids.contains(&assignment.technician_id) {
-            continue;
-        }
-        notified_technician_ids.push(assignment.technician_id);
-        let _ = notify::create_notice(
+        send_task_assignment_notice(
             &state,
             assignment.technician_id,
-            "task_assign",
             task_id,
-            "新任务待执行",
-            "您有一条新的待执行任务，请及时处理",
+            Some(assignment.service_type.as_str()),
+            "task_assign",
         )
         .await;
     }
@@ -937,6 +1020,9 @@ pub async fn assign_task(
     Ok(Json(ApiResponse::success(TaskActionResponse {
         task_id,
         task_status,
+        service_item_id: None,
+        service_type: None,
+        execution_id: None,
     })))
 }
 
@@ -955,16 +1041,27 @@ pub async fn start_task(
 
     let task = find_task_by_id(&state, task_id).await?;
     let before_task = task.clone();
-    if task.task_status.as_deref() != Some("pending_execute") {
-        return Err(AppError::Conflict("当前任务状态不允许开始执行".to_string()));
-    }
-    if task.current_technician_id != Some(auth_user.user_id) {
-        return Err(AppError::Forbidden("您不是该任务当前执行技师".to_string()));
-    }
+    let service_item = resolve_technician_service_item_for_action(
+        &state,
+        &task,
+        auth_user.user_id,
+        payload.service_item_id,
+        payload.service_type.as_deref(),
+        &["pending_execute"],
+        "开始执行",
+    )
+    .await?;
+    let service_item_id = service_item.as_ref().and_then(|item| item.id);
+    let service_type = service_item
+        .as_ref()
+        .and_then(|item| item.service_type.clone())
+        .or_else(|| task.service_type.clone());
 
     let execution = TaskExecutionEntity {
         id: None,
         task_id: Some(task_id),
+        service_item_id,
+        service_type: service_type.clone(),
         technician_id: Some(auth_user.user_id),
         started_at: Some(Utc::now().naive_utc()),
         submitted_at: None,
@@ -991,20 +1088,25 @@ pub async fn start_task(
     .await
     .context("failed to update task execution state")
     .map_err(AppError::Internal)?;
-    sync_task_service_items_on_start(&state, task_id, auth_user.user_id).await?;
+    if let Some(service_item_id) = service_item_id {
+        TaskServiceItemEntity::update_by_map(
+            state.rb.as_ref(),
+            &TaskServiceItemEntity {
+                service_status: Some("executing".to_string()),
+                started_at: Some(Utc::now().naive_utc()),
+                progress_percent: Some(60),
+                ..Default::default()
+            },
+            value! { "id": service_item_id },
+        )
+        .await
+        .context("failed to update task service item on start")
+        .map_err(AppError::Internal)?;
+    } else {
+        sync_task_service_items_on_start(&state, task_id, auth_user.user_id).await?;
+    }
 
     let after_task = find_task_by_id(&state, task_id).await?;
-    if let Some(dealer_user_id) = task.dealer_user_id {
-        let _ = notify::create_notice(
-            &state,
-            dealer_user_id,
-            "task_submit",
-            task_id,
-            "任务待评价",
-            "技师已提交检核，请尽快评价",
-        )
-        .await;
-    }
     audit::write_audit_log(
         &state,
         "task",
@@ -1021,6 +1123,9 @@ pub async fn start_task(
     Ok(Json(ApiResponse::success(TaskActionResponse {
         task_id,
         task_status: "executing".to_string(),
+        service_item_id,
+        service_type,
+        execution_id: latest_execution.id,
     })))
 }
 
@@ -1038,14 +1143,60 @@ pub async fn submit_task(
     if task.task_status.as_deref() != Some("executing") {
         return Err(AppError::Conflict("当前任务状态不允许提交检核".to_string()));
     }
-    if task.current_technician_id != Some(auth_user.user_id) {
-        return Err(AppError::Forbidden("您不是该任务当前执行技师".to_string()));
-    }
 
     let execution = find_task_execution_by_id(&state, payload.execution_id).await?;
     if execution.task_id != Some(task_id) || execution.technician_id != Some(auth_user.user_id) {
         return Err(AppError::Forbidden("执行记录与当前任务不匹配".to_string()));
     }
+    if execution.execution_status.as_deref() == Some("submitted") {
+        return Err(AppError::Conflict("当前服务环节已提交检核".to_string()));
+    }
+
+    let service_item =
+        if let Some(service_item_id) = execution.service_item_id.or(payload.service_item_id) {
+            if let Some(payload_service_item_id) = payload.service_item_id
+                && execution.service_item_id.is_some()
+                && execution.service_item_id != Some(payload_service_item_id)
+            {
+                return Err(AppError::BadRequest("提交环节与执行记录不匹配".to_string()));
+            }
+            let items = load_task_service_item_entities(&state, task_id).await?;
+            let item = items
+                .into_iter()
+                .find(|item| item.id == Some(service_item_id))
+                .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+            if item.technician_id != Some(auth_user.user_id) {
+                return Err(AppError::Forbidden(
+                    "您不是该服务环节当前执行技师".to_string(),
+                ));
+            }
+            if item.service_status.as_deref() != Some("executing") {
+                return Err(AppError::Conflict(
+                    "当前服务环节状态不允许提交检核".to_string(),
+                ));
+            }
+            Some(item)
+        } else {
+            resolve_technician_service_item_for_action(
+                &state,
+                &task,
+                auth_user.user_id,
+                None,
+                payload
+                    .service_type
+                    .as_deref()
+                    .or(execution.service_type.as_deref()),
+                &["executing"],
+                "提交检核",
+            )
+            .await?
+        };
+    let service_item_id = service_item.as_ref().and_then(|item| item.id);
+    let service_type = service_item
+        .as_ref()
+        .and_then(|item| item.service_type.clone())
+        .or_else(|| execution.service_type.clone())
+        .or_else(|| task.service_type.clone());
 
     let evidences: Vec<EvidenceEntity> = db::select_by_map_compat(
         state.rb.as_ref(),
@@ -1073,10 +1224,44 @@ pub async fn submit_task(
     .context("failed to update execution submit state")
     .map_err(AppError::Internal)?;
 
+    if let Some(service_item_id) = service_item_id {
+        TaskServiceItemEntity::update_by_map(
+            state.rb.as_ref(),
+            &TaskServiceItemEntity {
+                service_status: Some("pending_dealer_review".to_string()),
+                completed_at: Some(Utc::now().naive_utc()),
+                progress_percent: Some(90),
+                ..Default::default()
+            },
+            value! { "id": service_item_id },
+        )
+        .await
+        .context("failed to update task service item on submit")
+        .map_err(AppError::Internal)?;
+    } else {
+        sync_task_service_items_on_submit(&state, task_id).await?;
+    }
+
+    let updated_service_items = load_task_service_item_entities(&state, task_id).await?;
+    let task_status = if updated_service_items.is_empty()
+        || updated_service_items.iter().all(|item| {
+            matches!(
+                item.service_status.as_deref(),
+                Some("pending_dealer_review")
+                    | Some("pending_hq_score")
+                    | Some("completed")
+                    | Some("closed")
+            )
+        }) {
+        "pending_dealer_review".to_string()
+    } else {
+        "executing".to_string()
+    };
+
     TaskEntity::update_by_map(
         state.rb.as_ref(),
         &TaskEntity {
-            task_status: Some("pending_dealer_review".to_string()),
+            task_status: Some(task_status.clone()),
             ..Default::default()
         },
         value! { "id": task_id },
@@ -1084,10 +1269,11 @@ pub async fn submit_task(
     .await
     .context("failed to update task submit state")
     .map_err(AppError::Internal)?;
-    sync_task_service_items_on_submit(&state, task_id).await?;
 
     let after_task = find_task_by_id(&state, task_id).await?;
-    if let Some(dealer_user_id) = task.dealer_user_id {
+    if task_status == "pending_dealer_review"
+        && let Some(dealer_user_id) = task.dealer_user_id
+    {
         let _ = notify::create_notice(
             &state,
             dealer_user_id,
@@ -1113,7 +1299,10 @@ pub async fn submit_task(
 
     Ok(Json(ApiResponse::success(TaskActionResponse {
         task_id,
-        task_status: "pending_dealer_review".to_string(),
+        task_status,
+        service_item_id,
+        service_type,
+        execution_id: Some(payload.execution_id),
     })))
 }
 
@@ -1210,6 +1399,9 @@ pub async fn reassign_task(
     Ok(Json(ApiResponse::success(TaskActionResponse {
         task_id,
         task_status: "pending_execute".to_string(),
+        service_item_id: None,
+        service_type: None,
+        execution_id: None,
     })))
 }
 
@@ -1265,6 +1457,9 @@ pub async fn close_task(
     Ok(Json(ApiResponse::success(TaskActionResponse {
         task_id,
         task_status: "closed".to_string(),
+        service_item_id: None,
+        service_type: None,
+        execution_id: None,
     })))
 }
 
@@ -1405,7 +1600,71 @@ fn filter_task_item(task: &TaskEntity, query: &TaskListQuery) -> bool {
     true
 }
 
+fn filter_task_item_for_technician(task: &TaskEntity, query: &TaskListQuery) -> bool {
+    if let Some(task_no) = &query.task_no
+        && !task
+            .task_no
+            .as_deref()
+            .unwrap_or_default()
+            .contains(task_no)
+    {
+        return false;
+    }
+    if let Some(store_id) = query.store_id
+        && task.store_id != Some(store_id)
+    {
+        return false;
+    }
+    if let Some(dealer_user_id) = query.dealer_user_id
+        && task.dealer_user_id != Some(dealer_user_id)
+    {
+        return false;
+    }
+    if let Some(appointment_start) = &query.appointment_start {
+        let Ok(start_at) = NaiveDateTime::parse_from_str(appointment_start, "%Y-%m-%d %H:%M:%S")
+        else {
+            return false;
+        };
+        if task
+            .appointment_time
+            .map(|dt| dt < start_at)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+    if let Some(appointment_end) = &query.appointment_end {
+        let Ok(end_at) = NaiveDateTime::parse_from_str(appointment_end, "%Y-%m-%d %H:%M:%S") else {
+            return false;
+        };
+        if task.appointment_time.map(|dt| dt > end_at).unwrap_or(true) {
+            return false;
+        }
+    }
+    true
+}
+
 fn filter_task_summary(item: &TaskSummary, query: &TaskListQuery) -> bool {
+    if let Some(task_status) = &query.task_status
+        && item.task_status != *task_status
+    {
+        return false;
+    }
+    if let Some(review_status) = &query.review_status
+        && item.review_status != *review_status
+    {
+        return false;
+    }
+    if let Some(score_status) = &query.score_status
+        && item.score_status != *score_status
+    {
+        return false;
+    }
+    if let Some(technician_id) = query.technician_id
+        && item.current_technician_id != Some(technician_id)
+    {
+        return false;
+    }
     if let Some(service_type) = &query.service_type
         && !item
             .service_items
@@ -1431,6 +1690,7 @@ async fn build_task_summary(
     state: &AppState,
     auth_user: &auth::CurrentAuthUser,
     task: TaskEntity,
+    service_item_scope: Option<TaskServiceItemEntity>,
 ) -> Result<TaskSummary, AppError> {
     let customer = find_customer_by_id(state, task.customer_id).await?;
     let address = find_address_by_id(state, task.customer_address_id).await?;
@@ -1439,7 +1699,11 @@ async fn build_task_summary(
     let customer_name = customer.name.unwrap_or_default();
     let customer_mobile = customer.mobile.unwrap_or_default();
     let task_no = task.task_no.clone().unwrap_or_default();
-    let task_status = task.task_status.clone().unwrap_or_default();
+    let task_status = service_item_scope
+        .as_ref()
+        .and_then(|item| item.service_status.clone())
+        .or_else(|| task.task_status.clone())
+        .unwrap_or_default();
     let review_status = task.review_status.clone().unwrap_or_default();
     let score_status = task.score_status.clone().unwrap_or_default();
     let technician_only = is_technician_only(auth_user);
@@ -1451,7 +1715,12 @@ async fn build_task_summary(
     let review_status_text_value =
         review_status_text_for_viewer(&review_status, &task_status, technician_only).to_string();
     let score_status_text_value = score_status_text(&score_status).to_string();
-    let progress_percent = task_progress_percent(&service_items, task.task_status.as_deref());
+    let visible_service_items = service_item_scope
+        .as_ref()
+        .map(|item| vec![item.clone()])
+        .unwrap_or_else(|| service_items.clone());
+    let progress_percent =
+        task_progress_percent(&visible_service_items, Some(task_status.as_str()));
     let is_overdue = task_is_overdue(&task);
     let overdue_text_value = overdue_text(is_overdue).to_string();
     let dealer = if let Some(dealer_user_id) = task.dealer_user_id {
@@ -1459,23 +1728,29 @@ async fn build_task_summary(
     } else {
         None
     };
-    let technician = if let Some(technician_id) = task.current_technician_id {
+    let current_technician_id = service_item_scope
+        .as_ref()
+        .and_then(|item| item.technician_id)
+        .or(task.current_technician_id);
+    let technician = if let Some(technician_id) = current_technician_id {
         find_user_by_id(state, Some(technician_id)).await.ok()
     } else {
         None
     };
-    let primary_service_type = service_items
+    let primary_service_type = visible_service_items
         .first()
         .and_then(|item| item.service_type.clone())
         .or(task.service_type.clone())
         .unwrap_or_default();
-    let service_items_payload = map_task_service_item_payloads(service_items);
+    let service_items_payload = map_task_service_item_payloads(visible_service_items);
     let task_tags = build_task_tags(&task, &service_items_payload, technician_only);
 
     Ok(TaskSummary {
         id: task.id.unwrap_or_default(),
+        service_item_id: service_item_scope.as_ref().and_then(|item| item.id),
         task_no,
         service_type: primary_service_type,
+        service_status: service_item_scope.and_then(|item| item.service_status),
         service_items_text: service_items_text(&service_items_payload),
         service_items: service_items_payload,
         task_status,
@@ -1497,7 +1772,7 @@ async fn build_task_summary(
             .as_ref()
             .and_then(|item| item.name.clone())
             .unwrap_or_default(),
-        current_technician_id: task.current_technician_id,
+        current_technician_id,
         technician_name: technician.as_ref().and_then(|item| item.name.clone()),
         technician_mobile: technician.as_ref().and_then(|item| item.mobile.clone()),
         progress_percent,
@@ -1839,6 +2114,159 @@ fn ensure_unique_assignment_targets(assignments: &[ResolvedAssignment]) -> Resul
     Ok(())
 }
 
+fn scoped_service_items_for_detail(
+    auth_user: &auth::CurrentAuthUser,
+    service_items: &[TaskServiceItemEntity],
+    query: &TaskDetailQuery,
+) -> Result<Vec<TaskServiceItemEntity>, AppError> {
+    if let Some(service_item_id) = query.service_item_id {
+        let item = service_items
+            .iter()
+            .find(|item| item.id == Some(service_item_id))
+            .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+        ensure_service_item_view_access(auth_user, item)?;
+        return Ok(vec![item.clone()]);
+    }
+
+    if let Some(service_type) = query
+        .service_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let item = service_items
+            .iter()
+            .find(|item| item.service_type.as_deref() == Some(service_type))
+            .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+        ensure_service_item_view_access(auth_user, item)?;
+        return Ok(vec![item.clone()]);
+    }
+
+    if is_technician_only(auth_user) {
+        let scoped = service_items
+            .iter()
+            .filter(|item| item.technician_id == Some(auth_user.user_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !scoped.is_empty() {
+            return Ok(scoped);
+        }
+    }
+
+    Ok(service_items.to_vec())
+}
+
+fn ensure_service_item_view_access(
+    auth_user: &auth::CurrentAuthUser,
+    service_item: &TaskServiceItemEntity,
+) -> Result<(), AppError> {
+    if is_technician_only(auth_user) && service_item.technician_id != Some(auth_user.user_id) {
+        return Err(AppError::Forbidden("您只能查看本人服务环节".to_string()));
+    }
+    Ok(())
+}
+
+async fn resolve_technician_service_item_for_action(
+    state: &AppState,
+    task: &TaskEntity,
+    technician_id: i64,
+    service_item_id: Option<i64>,
+    service_type: Option<&str>,
+    allowed_statuses: &[&str],
+    action_name: &str,
+) -> Result<Option<TaskServiceItemEntity>, AppError> {
+    let task_id = task
+        .id
+        .ok_or_else(|| AppError::Internal(anyhow!("task.id missing")))?;
+    let service_items = load_task_service_item_entities(state, task_id).await?;
+    if service_items.is_empty() {
+        if task.current_technician_id != Some(technician_id) {
+            return Err(AppError::Forbidden("您不是该任务当前执行技师".to_string()));
+        }
+        if !status_allowed(task.task_status.as_deref(), allowed_statuses) {
+            return Err(AppError::Conflict(format!(
+                "当前任务状态不允许{action_name}"
+            )));
+        }
+        return Ok(None);
+    }
+
+    if let Some(service_item_id) = service_item_id {
+        let item = service_items
+            .into_iter()
+            .find(|item| item.id == Some(service_item_id))
+            .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+        validate_technician_service_item_action(
+            &item,
+            technician_id,
+            allowed_statuses,
+            action_name,
+        )?;
+        return Ok(Some(item));
+    }
+
+    if let Some(service_type) = service_type.map(str::trim).filter(|item| !item.is_empty()) {
+        let item = service_items
+            .into_iter()
+            .find(|item| item.service_type.as_deref() == Some(service_type))
+            .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+        validate_technician_service_item_action(
+            &item,
+            technician_id,
+            allowed_statuses,
+            action_name,
+        )?;
+        return Ok(Some(item));
+    }
+
+    let assigned_items = service_items
+        .into_iter()
+        .filter(|item| item.technician_id == Some(technician_id))
+        .collect::<Vec<_>>();
+    if assigned_items.is_empty() {
+        return Err(AppError::Forbidden("您不是该任务当前执行技师".to_string()));
+    }
+    let actionable_items = assigned_items
+        .iter()
+        .filter(|item| status_allowed(item.service_status.as_deref(), allowed_statuses))
+        .cloned()
+        .collect::<Vec<_>>();
+    match actionable_items.as_slice() {
+        [item] => Ok(Some(item.clone())),
+        [] => Err(AppError::Conflict(format!(
+            "当前服务环节状态不允许{action_name}"
+        ))),
+        _ => Err(AppError::BadRequest(
+            "当前任务包含多个服务环节，请传 service_item_id 或 service_type".to_string(),
+        )),
+    }
+}
+
+fn validate_technician_service_item_action(
+    item: &TaskServiceItemEntity,
+    technician_id: i64,
+    allowed_statuses: &[&str],
+    action_name: &str,
+) -> Result<(), AppError> {
+    if item.technician_id != Some(technician_id) {
+        return Err(AppError::Forbidden(
+            "您不是该服务环节当前执行技师".to_string(),
+        ));
+    }
+    if !status_allowed(item.service_status.as_deref(), allowed_statuses) {
+        return Err(AppError::Conflict(format!(
+            "当前服务环节状态不允许{action_name}"
+        )));
+    }
+    Ok(())
+}
+
+fn status_allowed(status: Option<&str>, allowed_statuses: &[&str]) -> bool {
+    status
+        .map(|status| allowed_statuses.iter().any(|allowed| allowed == &status))
+        .unwrap_or(false)
+}
+
 async fn ensure_task_access(
     state: &AppState,
     auth_user: &auth::CurrentAuthUser,
@@ -1850,6 +2278,16 @@ async fn ensure_task_access(
 
     if auth_user.has_role("technician") {
         if task.current_technician_id == Some(auth_user.user_id) {
+            return Ok(());
+        }
+        let task_id = task
+            .id
+            .ok_or_else(|| AppError::Internal(anyhow!("task.id missing")))?;
+        let service_items = load_task_service_item_entities(state, task_id).await?;
+        if service_items
+            .iter()
+            .any(|item| item.technician_id == Some(auth_user.user_id))
+        {
             return Ok(());
         }
         return Err(AppError::Forbidden("您只能查看本人任务".to_string()));
@@ -2621,6 +3059,28 @@ fn primary_role(auth_user: &auth::CurrentAuthUser) -> &str {
         .first()
         .map(|item| item.as_str())
         .unwrap_or("unknown")
+}
+
+async fn send_task_assignment_notice(
+    state: &AppState,
+    technician_id: i64,
+    task_id: i64,
+    service_type: Option<&str>,
+    notice_type: &str,
+) {
+    let title = service_type
+        .map(|service_type| format!("{}任务待执行", service_type_label(Some(service_type))))
+        .unwrap_or_else(|| "新任务待执行".to_string());
+    let content = service_type
+        .map(|service_type| {
+            format!(
+                "您有一条新的{}任务，请及时处理",
+                service_type_label(Some(service_type))
+            )
+        })
+        .unwrap_or_else(|| "您有一条新的待执行任务，请及时处理".to_string());
+    let _ =
+        notify::create_notice(state, technician_id, notice_type, task_id, &title, &content).await;
 }
 
 async fn calculate_technician_average_score(
