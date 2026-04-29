@@ -113,29 +113,11 @@ pub async fn dealer_dashboard(
         .into_iter()
         .filter_map(|item| item.store_id)
         .collect();
-    let tasks = if store_ids.is_empty() {
-        Vec::new()
-    } else {
-        db::select_by_map_compat::<TaskEntity>(
-            state.rb.as_ref(),
-            "task",
-            value! { "store_id": store_ids },
-        )
-        .await
-        .context("failed to query dealer dashboard tasks")
-        .map_err(AppError::Internal)?
-    };
-
-    let filtered_tasks = filter_tasks_by_year_month(tasks, query.year, query.month);
-    let mut dashboard = build_dashboard(
-        filtered_tasks.clone(),
-        Vec::new(),
-        Vec::new(),
-        query.year,
-        query.month,
-    );
-    dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
-    dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
+    let items = load_dealer_dashboard_tasks(&state, store_ids).await?;
+    let filtered_items = filter_technician_tasks_by_year_month(items, query.year, query.month);
+    let mut dashboard = build_technician_dashboard(&filtered_items, query.year, query.month);
+    dashboard.recent_tasks = enrich_technician_recent_tasks(&state, &filtered_items).await?;
+    dashboard.service_group_counts = build_technician_service_group_counts(&filtered_items);
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
@@ -198,6 +180,53 @@ pub async fn hq_dashboard(
     dashboard.service_trends = build_service_trends(filtered_service_items);
     dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
     Ok(Json(ApiResponse::success(dashboard)))
+}
+
+async fn load_dealer_dashboard_tasks(
+    state: &AppState,
+    store_ids: Vec<i64>,
+) -> Result<Vec<TechnicianDashboardTask>, AppError> {
+    if store_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "store_id": store_ids },
+    )
+    .await
+    .context("failed to query dealer dashboard tasks")
+    .map_err(AppError::Internal)?;
+
+    let mut items = Vec::new();
+    for task in tasks {
+        let Some(task_id) = task.id else {
+            continue;
+        };
+        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task_service_item",
+            value! { "task_id": task_id },
+        )
+        .await
+        .context("failed to query dealer dashboard service items")
+        .map_err(AppError::Internal)?;
+        if service_items.is_empty() {
+            items.push(TechnicianDashboardTask {
+                task,
+                service_item: None,
+            });
+            continue;
+        }
+        for service_item in service_items {
+            items.push(TechnicianDashboardTask {
+                task: task.clone(),
+                service_item: Some(service_item),
+            });
+        }
+    }
+
+    Ok(items)
 }
 
 async fn load_technician_dashboard_tasks(

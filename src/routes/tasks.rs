@@ -527,29 +527,57 @@ async fn load_task_summaries(
     if is_technician_only(auth_user) {
         return load_technician_task_summaries(state, auth_user, query).await;
     }
+    if auth_user.has_role("dealer") {
+        return load_dealer_task_summaries(state, auth_user, query).await;
+    }
 
-    let mut tasks = if auth_user.has_role("dealer") {
-        let store_id = dealer_owned_store_id(&state, auth_user.user_id).await?;
-        db::select_by_map_compat::<TaskEntity>(
-            state.rb.as_ref(),
-            "task",
-            value! { "store_id": store_id },
-        )
+    let mut tasks = db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! {})
         .await
-        .context("failed to query dealer tasks")
-        .map_err(AppError::Internal)?
-    } else {
-        db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! {})
-            .await
-            .context("failed to query tasks")
-            .map_err(AppError::Internal)?
-    };
+        .context("failed to query tasks")
+        .map_err(AppError::Internal)?;
 
     tasks.retain(|task| filter_task_item(task, query));
 
     let mut items = Vec::with_capacity(tasks.len());
     for task in tasks {
         items.push(build_task_summary(state, auth_user, task, None).await?);
+    }
+
+    items.retain(|item| filter_task_summary(item, query));
+    Ok(items)
+}
+
+async fn load_dealer_task_summaries(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    query: &TaskListQuery,
+) -> Result<Vec<TaskSummary>, AppError> {
+    let store_id = dealer_owned_store_id(&state, auth_user.user_id).await?;
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "store_id": store_id },
+    )
+    .await
+    .context("failed to query dealer tasks")
+    .map_err(AppError::Internal)?;
+
+    let mut items = Vec::new();
+    for task in tasks {
+        if !filter_task_item_for_scoped_view(&task, query) {
+            continue;
+        }
+        let Some(task_id) = task.id else {
+            continue;
+        };
+        let service_items = load_task_service_item_entities(state, task_id).await?;
+        if service_items.is_empty() {
+            items.push(build_task_summary(state, auth_user, task, None).await?);
+            continue;
+        }
+        for service_item in service_items {
+            items.push(build_task_summary(state, auth_user, task.clone(), Some(service_item)).await?);
+        }
     }
 
     items.retain(|item| filter_task_summary(item, query));
@@ -577,7 +605,7 @@ async fn load_technician_task_summaries(
             continue;
         };
         let task = find_task_by_id(state, task_id).await?;
-        if !filter_task_item_for_technician(&task, query) {
+        if !filter_task_item_for_scoped_view(&task, query) {
             continue;
         }
         task_ids_with_service_items.insert(task_id);
@@ -597,7 +625,7 @@ async fn load_technician_task_summaries(
             continue;
         };
         if task_ids_with_service_items.contains(&task_id)
-            || !filter_task_item_for_technician(&task, query)
+            || !filter_task_item_for_scoped_view(&task, query)
         {
             continue;
         }
@@ -647,20 +675,23 @@ pub async fn get_task_detail(
             .await
             .context("failed to query task evidence")
             .map_err(AppError::Internal)?;
-    let dealer_review: Option<DealerReviewEntity> = db::select_one_by_map_compat(
-        state.rb.as_ref(),
-        "dealer_review",
-        value! { "task_id": task_id },
-    )
-    .await
-    .context("failed to query dealer review for task detail")
-    .map_err(AppError::Internal)?;
     let service_items = load_task_service_item_entities(&state, task_id).await?;
     let visible_service_items =
         scoped_service_items_for_detail(&auth_user, &service_items, &query)?;
-    let task_status = task.task_status.clone().unwrap_or_default();
-    let review_status = task.review_status.clone().unwrap_or_default();
-    let score_status = task.score_status.clone().unwrap_or_default();
+    let dealer_review = find_dealer_review_for_scope(&state, task_id, &visible_service_items).await?;
+    let scoped_service_status = if visible_service_items.len() == 1 {
+        visible_service_items
+            .first()
+            .and_then(|item| item.service_status.as_deref())
+    } else {
+        None
+    };
+    let task_status = scoped_service_status
+        .map(ToString::to_string)
+        .or_else(|| task.task_status.clone())
+        .unwrap_or_default();
+    let review_status = scoped_review_status(task.review_status.as_deref(), scoped_service_status);
+    let score_status = scoped_score_status(task.score_status.as_deref(), scoped_service_status);
     let priority = task
         .priority
         .clone()
@@ -669,7 +700,7 @@ pub async fn get_task_detail(
     let task_remark = task.task_remark.clone();
     let service_time_slot = task.service_time_slot.clone();
     let progress_percent =
-        task_progress_percent(&visible_service_items, task.task_status.as_deref());
+        task_progress_percent(&visible_service_items, Some(task_status.as_str()));
     let progress_tracks = build_progress_tracks(
         &state,
         &task,
@@ -683,6 +714,11 @@ pub async fn get_task_detail(
     let total_step_count = progress_tracks.len() as i32;
     let customer_mobile = customer.mobile.clone().unwrap_or_default();
     let service_items_payload = map_task_service_item_payloads(visible_service_items.clone());
+    let detail_service_type = visible_service_items
+        .first()
+        .and_then(|item| item.service_type.clone())
+        .or_else(|| task.service_type.clone())
+        .unwrap_or_default();
     let technician_only = is_technician_only(&auth_user);
     let task_tags = build_task_tags(&task, &service_items_payload, technician_only);
     let task_status_text = task_status_text_for_viewer(&task_status, technician_only).to_string();
@@ -724,11 +760,11 @@ pub async fn get_task_detail(
     Ok(Json(ApiResponse::success(TaskDetailResponse {
         id: task.id.unwrap_or_default(),
         task_no: task.task_no.unwrap_or_default(),
-        service_type: task.service_type.unwrap_or_default(),
+        service_type: detail_service_type,
         service_items_text: service_items_text(&service_items_payload),
         task_tags,
         service_items: service_items_payload,
-        task_status,
+        task_status: task_status.clone(),
         task_status_text,
         display_status,
         display_status_text,
@@ -778,7 +814,7 @@ pub async fn get_task_detail(
             task.task_status.as_deref(),
             Some("pending_execute") | Some("executing")
         ),
-        can_submit_review: matches!(task.task_status.as_deref(), Some("pending_dealer_review")),
+        can_submit_review: task_status == "pending_dealer_review",
         can_contact_customer,
         review_info: dealer_review.map(|review| ReviewInfoPayload {
             star: review.star.unwrap_or_default(),
@@ -1600,7 +1636,7 @@ fn filter_task_item(task: &TaskEntity, query: &TaskListQuery) -> bool {
     true
 }
 
-fn filter_task_item_for_technician(task: &TaskEntity, query: &TaskListQuery) -> bool {
+fn filter_task_item_for_scoped_view(task: &TaskEntity, query: &TaskListQuery) -> bool {
     if let Some(task_no) = &query.task_no
         && !task
             .task_no
@@ -1704,8 +1740,11 @@ async fn build_task_summary(
         .and_then(|item| item.service_status.clone())
         .or_else(|| task.task_status.clone())
         .unwrap_or_default();
-    let review_status = task.review_status.clone().unwrap_or_default();
-    let score_status = task.score_status.clone().unwrap_or_default();
+    let service_status = service_item_scope
+        .as_ref()
+        .and_then(|item| item.service_status.as_deref());
+    let review_status = scoped_review_status(task.review_status.as_deref(), service_status);
+    let score_status = scoped_score_status(task.score_status.as_deref(), service_status);
     let technician_only = is_technician_only(auth_user);
     let task_status_text_value =
         task_status_text_for_viewer(&task_status, technician_only).to_string();
@@ -2395,6 +2434,53 @@ async fn find_task_by_id(state: &AppState, task_id: i64) -> Result<TaskEntity, A
     Ok(task)
 }
 
+async fn find_dealer_review_for_scope(
+    state: &AppState,
+    task_id: i64,
+    service_items: &[TaskServiceItemEntity],
+) -> Result<Option<DealerReviewEntity>, AppError> {
+    if service_items.len() == 1 {
+        let service_item = &service_items[0];
+        if let Some(service_item_id) = service_item.id {
+            if let Some(review) = db::select_one_by_map_compat::<DealerReviewEntity>(
+                state.rb.as_ref(),
+                "dealer_review",
+                value! { "task_id": task_id, "service_item_id": service_item_id },
+            )
+            .await
+            .context("failed to query dealer review by service item")
+            .map_err(AppError::Internal)?
+            {
+                return Ok(Some(review));
+            }
+        }
+        if let Some(service_type) = service_item.service_type.as_deref() {
+            return db::select_one_by_map_compat(
+                state.rb.as_ref(),
+                "dealer_review",
+                value! { "task_id": task_id, "service_type": service_type },
+            )
+            .await
+            .context("failed to query dealer review by service type")
+            .map_err(AppError::Internal);
+        }
+    }
+
+    let reviews: Vec<DealerReviewEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "dealer_review",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query dealer reviews for task detail")
+    .map_err(AppError::Internal)?;
+    Ok(if reviews.len() == 1 {
+        reviews.into_iter().next()
+    } else {
+        None
+    })
+}
+
 async fn find_task_execution_by_id(
     state: &AppState,
     execution_id: i64,
@@ -2944,6 +3030,22 @@ fn score_status_text(status: &str) -> &'static str {
         "pending" => "待评分",
         "scored" => "已评分",
         _ => "未知状态",
+    }
+}
+
+fn scoped_review_status(task_review_status: Option<&str>, service_status: Option<&str>) -> String {
+    match service_status {
+        Some("pending_dealer_review") => "pending".to_string(),
+        Some("pending_hq_score") | Some("completed") | Some("closed") => "reviewed".to_string(),
+        _ => task_review_status.unwrap_or_default().to_string(),
+    }
+}
+
+fn scoped_score_status(task_score_status: Option<&str>, service_status: Option<&str>) -> String {
+    match service_status {
+        Some("completed") | Some("closed") => "scored".to_string(),
+        Some("pending_hq_score") => "pending".to_string(),
+        _ => task_score_status.unwrap_or_default().to_string(),
     }
 }
 
