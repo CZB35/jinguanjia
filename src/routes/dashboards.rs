@@ -1,14 +1,21 @@
 use anyhow::Context;
-use chrono::{Datelike, Utc};
-use axum::{Json, extract::{Query, State}, http::HeaderMap};
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::HeaderMap,
+};
+use chrono::{Datelike, NaiveDateTime, Utc};
 use rbs::value;
 use serde::Serialize;
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
-    models::{customer::CustomerEntity, customer_address::CustomerAddressEntity, hq_score::HqScoreEntity, hq_score_item::HqScoreItemEntity, task::TaskEntity, task_service_item::TaskServiceItemEntity, user::UserEntity, user_store::UserStoreEntity},
+    models::{
+        customer::CustomerEntity, customer_address::CustomerAddressEntity, hq_score::HqScoreEntity,
+        hq_score_item::HqScoreItemEntity, task::TaskEntity,
+        task_service_item::TaskServiceItemEntity, user::UserEntity, user_store::UserStoreEntity,
+    },
     response::ApiResponse,
     state::AppState,
 };
@@ -32,6 +39,7 @@ pub struct DashboardResponse {
 #[derive(Debug, Serialize)]
 pub struct DashboardTaskItem {
     pub id: i64,
+    pub service_item_id: Option<i64>,
     pub task_no: String,
     pub customer_name: String,
     pub customer_mobile: String,
@@ -39,6 +47,7 @@ pub struct DashboardTaskItem {
     pub service_type: String,
     pub service_items_text: String,
     pub task_status: String,
+    pub service_status: Option<String>,
     pub task_status_text: String,
     pub display_status: String,
     pub display_status_text: String,
@@ -78,6 +87,12 @@ pub struct DashboardQuery {
     pub month: Option<u32>,
 }
 
+#[derive(Clone)]
+struct TechnicianDashboardTask {
+    task: TaskEntity,
+    service_item: Option<TaskServiceItemEntity>,
+}
+
 pub async fn dealer_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -86,22 +101,39 @@ pub async fn dealer_dashboard(
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "super_admin"])?;
 
-    let store_relations: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": auth_user.user_id })
-        .await
-        .context("failed to query dealer store relations")
-        .map_err(AppError::Internal)?;
-    let store_ids: Vec<i64> = store_relations.into_iter().filter_map(|item| item.store_id).collect();
+    let store_relations: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": auth_user.user_id },
+    )
+    .await
+    .context("failed to query dealer store relations")
+    .map_err(AppError::Internal)?;
+    let store_ids: Vec<i64> = store_relations
+        .into_iter()
+        .filter_map(|item| item.store_id)
+        .collect();
     let tasks = if store_ids.is_empty() {
         Vec::new()
     } else {
-        db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids })
-            .await
-            .context("failed to query dealer dashboard tasks")
-            .map_err(AppError::Internal)?
+        db::select_by_map_compat::<TaskEntity>(
+            state.rb.as_ref(),
+            "task",
+            value! { "store_id": store_ids },
+        )
+        .await
+        .context("failed to query dealer dashboard tasks")
+        .map_err(AppError::Internal)?
     };
 
     let filtered_tasks = filter_tasks_by_year_month(tasks, query.year, query.month);
-    let mut dashboard = build_dashboard(filtered_tasks.clone(), Vec::new(), Vec::new(), query.year, query.month);
+    let mut dashboard = build_dashboard(
+        filtered_tasks.clone(),
+        Vec::new(),
+        Vec::new(),
+        query.year,
+        query.month,
+    );
     dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
     dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
     Ok(Json(ApiResponse::success(dashboard)))
@@ -115,15 +147,11 @@ pub async fn technician_dashboard(
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["technician"])?;
 
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "current_technician_id": auth_user.user_id })
-        .await
-        .context("failed to query technician dashboard tasks")
-        .map_err(AppError::Internal)?;
-
-    let filtered_tasks = filter_tasks_by_year_month(tasks, query.year, query.month);
-    let mut dashboard = build_dashboard(filtered_tasks.clone(), Vec::new(), Vec::new(), query.year, query.month);
-    dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
-    dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
+    let items = load_technician_dashboard_tasks(&state, auth_user.user_id).await?;
+    let filtered_items = filter_technician_tasks_by_year_month(items, query.year, query.month);
+    let mut dashboard = build_technician_dashboard(&filtered_items, query.year, query.month);
+    dashboard.recent_tasks = enrich_technician_recent_tasks(&state, &filtered_items).await?;
+    dashboard.service_group_counts = build_technician_service_group_counts(&filtered_items);
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
@@ -139,22 +167,32 @@ pub async fn hq_dashboard(
         .await
         .context("failed to query hq dashboard tasks")
         .map_err(AppError::Internal)?;
-    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! {})
-        .await
-        .context("failed to query hq dashboard scores")
-        .map_err(AppError::Internal)?;
-    let score_items: Vec<HqScoreItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "hq_score_item", value! {})
-        .await
-        .context("failed to query hq dashboard score items")
-        .map_err(AppError::Internal)?;
-    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! {})
-        .await
-        .context("failed to query hq dashboard service items")
-        .map_err(AppError::Internal)?;
+    let scores: Vec<HqScoreEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! {})
+            .await
+            .context("failed to query hq dashboard scores")
+            .map_err(AppError::Internal)?;
+    let score_items: Vec<HqScoreItemEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "hq_score_item", value! {})
+            .await
+            .context("failed to query hq dashboard score items")
+            .map_err(AppError::Internal)?;
+    let service_items: Vec<TaskServiceItemEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! {})
+            .await
+            .context("failed to query hq dashboard service items")
+            .map_err(AppError::Internal)?;
 
     let filtered_tasks = filter_tasks_by_year_month(tasks, query.year, query.month);
-    let filtered_service_items = filter_service_items_by_year_month(service_items, query.year, query.month);
-    let mut dashboard = build_dashboard(filtered_tasks.clone(), scores, filtered_service_items.clone(), query.year, query.month);
+    let filtered_service_items =
+        filter_service_items_by_year_month(service_items, query.year, query.month);
+    let mut dashboard = build_dashboard(
+        filtered_tasks.clone(),
+        scores,
+        filtered_service_items.clone(),
+        query.year,
+        query.month,
+    );
     dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
     dashboard.service_stats = build_service_stats(filtered_service_items.clone(), score_items);
     dashboard.service_trends = build_service_trends(filtered_service_items);
@@ -162,7 +200,125 @@ pub async fn hq_dashboard(
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
-fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_items: Vec<TaskServiceItemEntity>, year: Option<i32>, month: Option<u32>) -> DashboardResponse {
+async fn load_technician_dashboard_tasks(
+    state: &AppState,
+    technician_id: i64,
+) -> Result<Vec<TechnicianDashboardTask>, AppError> {
+    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "technician_id": technician_id },
+    )
+    .await
+    .context("failed to query technician dashboard service items")
+    .map_err(AppError::Internal)?;
+
+    let service_item_task_ids = service_items
+        .iter()
+        .filter_map(|item| item.task_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let tasks_by_id = load_dashboard_tasks_by_ids(
+        state,
+        service_item_task_ids.iter().copied().collect::<Vec<_>>(),
+    )
+    .await?;
+
+    let mut items = Vec::new();
+    for service_item in service_items {
+        let Some(task_id) = service_item.task_id else {
+            continue;
+        };
+        let Some(task) = tasks_by_id.get(&task_id) else {
+            continue;
+        };
+        items.push(TechnicianDashboardTask {
+            task: task.clone(),
+            service_item: Some(service_item),
+        });
+    }
+
+    let legacy_tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "current_technician_id": technician_id },
+    )
+    .await
+    .context("failed to query technician dashboard legacy tasks")
+    .map_err(AppError::Internal)?;
+    let legacy_task_ids = legacy_tasks
+        .iter()
+        .filter_map(|item| item.id)
+        .collect::<Vec<_>>();
+    let task_ids_with_any_service_items =
+        load_task_ids_with_service_items(state, &legacy_task_ids).await?;
+
+    for task in legacy_tasks {
+        let Some(task_id) = task.id else {
+            continue;
+        };
+        if service_item_task_ids.contains(&task_id)
+            || task_ids_with_any_service_items.contains(&task_id)
+        {
+            continue;
+        }
+        items.push(TechnicianDashboardTask {
+            task,
+            service_item: None,
+        });
+    }
+
+    Ok(items)
+}
+
+async fn load_dashboard_tasks_by_ids(
+    state: &AppState,
+    task_ids: Vec<i64>,
+) -> Result<std::collections::BTreeMap<i64, TaskEntity>, AppError> {
+    if task_ids.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "id": task_ids },
+    )
+    .await
+    .context("failed to query technician dashboard item tasks")
+    .map_err(AppError::Internal)?;
+    Ok(tasks
+        .into_iter()
+        .filter_map(|item| item.id.map(|id| (id, item)))
+        .collect())
+}
+
+async fn load_task_ids_with_service_items(
+    state: &AppState,
+    task_ids: &[i64],
+) -> Result<std::collections::BTreeSet<i64>, AppError> {
+    if task_ids.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "task_id": task_ids.to_vec() },
+    )
+    .await
+    .context("failed to query technician dashboard legacy service items")
+    .map_err(AppError::Internal)?;
+    Ok(service_items
+        .into_iter()
+        .filter_map(|item| item.task_id)
+        .collect())
+}
+
+fn build_dashboard(
+    tasks: Vec<TaskEntity>,
+    scores: Vec<HqScoreEntity>,
+    _service_items: Vec<TaskServiceItemEntity>,
+    year: Option<i32>,
+    month: Option<u32>,
+) -> DashboardResponse {
     let now = Utc::now();
     let target_year = year.unwrap_or(now.year());
     let target_month = month.unwrap_or(now.month());
@@ -172,7 +328,10 @@ fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_
         .filter(|item| {
             matches!(
                 item.task_status.as_deref(),
-                Some("pending_assign") | Some("pending_execute") | Some("pending_dealer_review") | Some("pending_hq_score")
+                Some("pending_assign")
+                    | Some("pending_execute")
+                    | Some("pending_dealer_review")
+                    | Some("pending_hq_score")
             )
         })
         .count();
@@ -186,7 +345,12 @@ fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_
         .count();
     let pending_task_count = tasks
         .iter()
-        .filter(|item| matches!(item.task_status.as_deref(), Some("pending_execute") | Some("executing") | Some("pending_dealer_review")))
+        .filter(|item| {
+            matches!(
+                item.task_status.as_deref(),
+                Some("pending_execute") | Some("executing") | Some("pending_dealer_review")
+            )
+        })
         .count();
     let pending_review_task_count = tasks
         .iter()
@@ -196,13 +360,20 @@ fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_
         .iter()
         .filter(|item| {
             item.task_status.as_deref() == Some("completed")
-                && item.updated_at.map(|dt| dt.month() == target_month && dt.year() == target_year).unwrap_or(false)
+                && item
+                    .updated_at
+                    .map(|dt| dt.month() == target_month && dt.year() == target_year)
+                    .unwrap_or(false)
         })
         .count();
     let average_score = if scores.is_empty() {
         0.0
     } else {
-        scores.iter().map(|item| item.total_score.unwrap_or_default() as f64).sum::<f64>() / scores.len() as f64
+        scores
+            .iter()
+            .map(|item| item.total_score.unwrap_or_default() as f64)
+            .sum::<f64>()
+            / scores.len() as f64
     };
 
     DashboardResponse {
@@ -221,27 +392,134 @@ fn build_dashboard(tasks: Vec<TaskEntity>, scores: Vec<HqScoreEntity>, _service_
     }
 }
 
-fn filter_tasks_by_year_month(tasks: Vec<TaskEntity>, year: Option<i32>, month: Option<u32>) -> Vec<TaskEntity> {
-    if year.is_none() && month.is_none() {
-        return tasks;
-    }
+fn build_technician_dashboard(
+    items: &[TechnicianDashboardTask],
+    year: Option<i32>,
+    month: Option<u32>,
+) -> DashboardResponse {
     let now = Utc::now();
     let target_year = year.unwrap_or(now.year());
     let target_month = month.unwrap_or(now.month());
-    tasks.into_iter()
-        .filter(|item| item.appointment_time.map(|dt| dt.year() == target_year && dt.month() == target_month).unwrap_or(false))
-        .collect()
+    let total_tasks = items.len();
+    let pending_tasks = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                technician_task_status(item),
+                Some("pending_assign")
+                    | Some("pending_execute")
+                    | Some("pending_dealer_review")
+                    | Some("pending_hq_score")
+            )
+        })
+        .count();
+    let executing_tasks = items
+        .iter()
+        .filter(|item| technician_task_status(item) == Some("executing"))
+        .count();
+    let completed_tasks = items
+        .iter()
+        .filter(|item| technician_task_status(item) == Some("completed"))
+        .count();
+    let pending_task_count = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                technician_task_status(item),
+                Some("pending_execute") | Some("executing") | Some("pending_dealer_review")
+            )
+        })
+        .count();
+    let pending_review_task_count = items
+        .iter()
+        .filter(|item| technician_task_status(item) == Some("pending_dealer_review"))
+        .count();
+    let month_completed_count = items
+        .iter()
+        .filter(|item| {
+            technician_task_status(item) == Some("completed")
+                && technician_task_completed_at(item)
+                    .map(|dt| dt.month() == target_month && dt.year() == target_year)
+                    .unwrap_or(false)
+        })
+        .count();
+
+    DashboardResponse {
+        pending_task_count,
+        pending_review_task_count,
+        month_completed_count,
+        recent_tasks: Vec::new(),
+        total_tasks,
+        pending_tasks,
+        executing_tasks,
+        completed_tasks,
+        average_score: 0.0,
+        service_stats: Vec::new(),
+        service_trends: Vec::new(),
+        service_group_counts: Vec::new(),
+    }
 }
 
-fn filter_service_items_by_year_month(items: Vec<TaskServiceItemEntity>, year: Option<i32>, month: Option<u32>) -> Vec<TaskServiceItemEntity> {
+fn filter_technician_tasks_by_year_month(
+    items: Vec<TechnicianDashboardTask>,
+    year: Option<i32>,
+    month: Option<u32>,
+) -> Vec<TechnicianDashboardTask> {
     if year.is_none() && month.is_none() {
         return items;
     }
     let now = Utc::now();
     let target_year = year.unwrap_or(now.year());
     let target_month = month.unwrap_or(now.month());
-    items.into_iter()
-        .filter(|item| item.scheduled_time.map(|dt| dt.year() == target_year && dt.month() == target_month).unwrap_or(false))
+    items
+        .into_iter()
+        .filter(|item| {
+            technician_task_scheduled_at(item)
+                .map(|dt| dt.year() == target_year && dt.month() == target_month)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn filter_tasks_by_year_month(
+    tasks: Vec<TaskEntity>,
+    year: Option<i32>,
+    month: Option<u32>,
+) -> Vec<TaskEntity> {
+    if year.is_none() && month.is_none() {
+        return tasks;
+    }
+    let now = Utc::now();
+    let target_year = year.unwrap_or(now.year());
+    let target_month = month.unwrap_or(now.month());
+    tasks
+        .into_iter()
+        .filter(|item| {
+            item.appointment_time
+                .map(|dt| dt.year() == target_year && dt.month() == target_month)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn filter_service_items_by_year_month(
+    items: Vec<TaskServiceItemEntity>,
+    year: Option<i32>,
+    month: Option<u32>,
+) -> Vec<TaskServiceItemEntity> {
+    if year.is_none() && month.is_none() {
+        return items;
+    }
+    let now = Utc::now();
+    let target_year = year.unwrap_or(now.year());
+    let target_month = month.unwrap_or(now.month());
+    items
+        .into_iter()
+        .filter(|item| {
+            item.scheduled_time
+                .map(|dt| dt.year() == target_year && dt.month() == target_month)
+                .unwrap_or(false)
+        })
         .collect()
 }
 
@@ -260,7 +538,12 @@ fn build_service_stats(
             let total_count = items.len();
             let completed_count = items
                 .iter()
-                .filter(|item| matches!(item.service_status.as_deref(), Some("completed") | Some("closed")))
+                .filter(|item| {
+                    matches!(
+                        item.service_status.as_deref(),
+                        Some("completed") | Some("closed")
+                    )
+                })
                 .count();
             let completion_rate = if total_count == 0 {
                 0.0
@@ -277,7 +560,11 @@ fn build_service_stats(
                 if service_scores.is_empty() {
                     0.0
                 } else {
-                    service_scores.iter().map(|item| item.score.unwrap_or_default() as f64).sum::<f64>() / service_scores.len() as f64
+                    service_scores
+                        .iter()
+                        .map(|item| item.score.unwrap_or_default() as f64)
+                        .sum::<f64>()
+                        / service_scores.len() as f64
                 }
             };
 
@@ -326,33 +613,52 @@ fn build_service_trends(service_items: Vec<TaskServiceItemEntity>) -> Vec<Servic
     points
 }
 
-async fn enrich_recent_tasks(state: &AppState, tasks: &[TaskEntity]) -> Result<Vec<DashboardTaskItem>, AppError> {
+async fn enrich_recent_tasks(
+    state: &AppState,
+    tasks: &[TaskEntity],
+) -> Result<Vec<DashboardTaskItem>, AppError> {
     let mut sorted = tasks.to_vec();
     sorted.sort_by_key(|item| item.appointment_time);
     sorted.reverse();
 
     let mut items = Vec::new();
     for task in sorted.into_iter().take(5) {
-        let customer = db::select_one_by_map_compat::<CustomerEntity>(state.rb.as_ref(), "customer", value! { "id": task.customer_id.unwrap_or_default() })
-            .await
-            .context("failed to query dashboard customer")
-            .map_err(AppError::Internal)?
-            .unwrap_or_default();
-        let address = db::select_one_by_map_compat::<CustomerAddressEntity>(state.rb.as_ref(), "customer_address", value! { "id": task.customer_address_id.unwrap_or_default() })
-            .await
-            .context("failed to query dashboard address")
-            .map_err(AppError::Internal)?
-            .unwrap_or_default();
-        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! { "task_id": task.id.unwrap_or_default() })
-            .await
-            .context("failed to query dashboard service items")
-            .map_err(AppError::Internal)?;
+        let customer = db::select_one_by_map_compat::<CustomerEntity>(
+            state.rb.as_ref(),
+            "customer",
+            value! { "id": task.customer_id.unwrap_or_default() },
+        )
+        .await
+        .context("failed to query dashboard customer")
+        .map_err(AppError::Internal)?
+        .unwrap_or_default();
+        let address = db::select_one_by_map_compat::<CustomerAddressEntity>(
+            state.rb.as_ref(),
+            "customer_address",
+            value! { "id": task.customer_address_id.unwrap_or_default() },
+        )
+        .await
+        .context("failed to query dashboard address")
+        .map_err(AppError::Internal)?
+        .unwrap_or_default();
+        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task_service_item",
+            value! { "task_id": task.id.unwrap_or_default() },
+        )
+        .await
+        .context("failed to query dashboard service items")
+        .map_err(AppError::Internal)?;
         let technician_name = if let Some(technician_id) = task.current_technician_id {
-            db::select_one_by_map_compat::<UserEntity>(state.rb.as_ref(), "user", value! { "id": technician_id })
-                .await
-                .context("failed to query dashboard technician")
-                .map_err(AppError::Internal)?
-                .and_then(|item| item.name)
+            db::select_one_by_map_compat::<UserEntity>(
+                state.rb.as_ref(),
+                "user",
+                value! { "id": technician_id },
+            )
+            .await
+            .context("failed to query dashboard technician")
+            .map_err(AppError::Internal)?
+            .and_then(|item| item.name)
         } else {
             None
         };
@@ -362,6 +668,7 @@ async fn enrich_recent_tasks(state: &AppState, tasks: &[TaskEntity]) -> Result<V
         let is_overdue = task_is_overdue(&task);
         items.push(DashboardTaskItem {
             id: task.id.unwrap_or_default(),
+            service_item_id: None,
             task_no: task.task_no.unwrap_or_default(),
             customer_name: customer.name.unwrap_or_default(),
             customer_mobile: customer.mobile.unwrap_or_default(),
@@ -373,9 +680,93 @@ async fn enrich_recent_tasks(state: &AppState, tasks: &[TaskEntity]) -> Result<V
             task_status_text: task_status_text(&task_status).to_string(),
             technician_name,
             task_status,
-            appointment_time: task.appointment_time.map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
+            service_status: None,
+            appointment_time: task
+                .appointment_time
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
             progress_percent,
             is_overdue,
+        });
+    }
+
+    Ok(items)
+}
+
+async fn enrich_technician_recent_tasks(
+    state: &AppState,
+    tasks: &[TechnicianDashboardTask],
+) -> Result<Vec<DashboardTaskItem>, AppError> {
+    let mut sorted = tasks.to_vec();
+    sorted.sort_by_key(technician_task_scheduled_at);
+    sorted.reverse();
+
+    let mut items = Vec::new();
+    for item in sorted.into_iter().take(5) {
+        let task = &item.task;
+        let customer = db::select_one_by_map_compat::<CustomerEntity>(
+            state.rb.as_ref(),
+            "customer",
+            value! { "id": task.customer_id.unwrap_or_default() },
+        )
+        .await
+        .context("failed to query technician dashboard customer")
+        .map_err(AppError::Internal)?
+        .unwrap_or_default();
+        let address = db::select_one_by_map_compat::<CustomerAddressEntity>(
+            state.rb.as_ref(),
+            "customer_address",
+            value! { "id": task.customer_address_id.unwrap_or_default() },
+        )
+        .await
+        .context("failed to query technician dashboard address")
+        .map_err(AppError::Internal)?
+        .unwrap_or_default();
+        let technician_id = item
+            .service_item
+            .as_ref()
+            .and_then(|service_item| service_item.technician_id)
+            .or(task.current_technician_id);
+        let technician_name = if let Some(technician_id) = technician_id {
+            db::select_one_by_map_compat::<UserEntity>(
+                state.rb.as_ref(),
+                "user",
+                value! { "id": technician_id },
+            )
+            .await
+            .context("failed to query technician dashboard technician")
+            .map_err(AppError::Internal)?
+            .and_then(|item| item.name)
+        } else {
+            None
+        };
+        let task_status = technician_task_status(&item).unwrap_or_default().to_string();
+        let service_type = technician_task_service_type(&item)
+            .unwrap_or_default()
+            .to_string();
+        let service_items_text = service_type_label(&service_type).to_string();
+
+        items.push(DashboardTaskItem {
+            id: task.id.unwrap_or_default(),
+            service_item_id: item.service_item.as_ref().and_then(|service_item| service_item.id),
+            task_no: task.task_no.clone().unwrap_or_default(),
+            customer_name: customer.name.unwrap_or_default(),
+            customer_mobile: customer.mobile.unwrap_or_default(),
+            address: address.address.unwrap_or_default(),
+            service_type,
+            service_items_text,
+            display_status: display_status(&task_status).to_string(),
+            display_status_text: display_status_text(&task_status).to_string(),
+            task_status_text: task_status_text(&task_status).to_string(),
+            technician_name,
+            task_status,
+            service_status: item
+                .service_item
+                .as_ref()
+                .and_then(|service_item| service_item.service_status.clone()),
+            appointment_time: technician_task_scheduled_at(&item)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
+            progress_percent: technician_task_progress_percent(&item),
+            is_overdue: technician_task_is_overdue(&item),
         });
     }
 
@@ -390,8 +781,73 @@ fn build_service_group_counts(tasks: &[TaskEntity]) -> Vec<ServiceGroupCount> {
         }
     }
     map.into_iter()
-        .map(|(service_type, count)| ServiceGroupCount { service_type, count })
+        .map(|(service_type, count)| ServiceGroupCount {
+            service_type,
+            count,
+        })
         .collect()
+}
+
+fn build_technician_service_group_counts(
+    items: &[TechnicianDashboardTask],
+) -> Vec<ServiceGroupCount> {
+    let mut map = std::collections::BTreeMap::<String, usize>::new();
+    for item in items {
+        if let Some(service_type) = technician_task_service_type(item) {
+            *map.entry(service_type.to_string()).or_default() += 1;
+        }
+    }
+    map.into_iter()
+        .map(|(service_type, count)| ServiceGroupCount {
+            service_type,
+            count,
+        })
+        .collect()
+}
+
+fn technician_task_status(item: &TechnicianDashboardTask) -> Option<&str> {
+    item.service_item
+        .as_ref()
+        .and_then(|service_item| service_item.service_status.as_deref())
+        .or(item.task.task_status.as_deref())
+}
+
+fn technician_task_service_type(item: &TechnicianDashboardTask) -> Option<&str> {
+    item.service_item
+        .as_ref()
+        .and_then(|service_item| service_item.service_type.as_deref())
+        .or(item.task.service_type.as_deref())
+}
+
+fn technician_task_scheduled_at(item: &TechnicianDashboardTask) -> Option<NaiveDateTime> {
+    item.service_item
+        .as_ref()
+        .and_then(|service_item| service_item.scheduled_time)
+        .or(item.task.appointment_time)
+}
+
+fn technician_task_completed_at(item: &TechnicianDashboardTask) -> Option<NaiveDateTime> {
+    item.service_item
+        .as_ref()
+        .and_then(|service_item| service_item.completed_at)
+        .or(item.task.updated_at)
+}
+
+fn technician_task_progress_percent(item: &TechnicianDashboardTask) -> i32 {
+    item.service_item
+        .as_ref()
+        .and_then(|service_item| service_item.progress_percent)
+        .unwrap_or_else(|| progress_percent_for_status(technician_task_status(item)))
+}
+
+fn technician_task_is_overdue(item: &TechnicianDashboardTask) -> bool {
+    if matches!(technician_task_status(item), Some("completed") | Some("closed")) {
+        return false;
+    }
+    item.task.is_overdue == Some(1)
+        || technician_task_scheduled_at(item)
+            .map(|dt| dt < Utc::now().naive_utc())
+            .unwrap_or(false)
 }
 
 fn progress_percent_for_status(status: Option<&str>) -> i32 {
@@ -408,7 +864,8 @@ fn progress_percent_for_status(status: Option<&str>) -> i32 {
 }
 
 fn service_items_text(items: &[TaskServiceItemEntity]) -> String {
-    items.iter()
+    items
+        .iter()
         .filter_map(|item| item.service_type.as_deref())
         .map(service_type_label)
         .map(ToString::to_string)
@@ -461,6 +918,12 @@ fn display_status_text(status: &str) -> &'static str {
 
 fn task_is_overdue(task: &TaskEntity) -> bool {
     task.is_overdue == Some(1)
-        || (task.appointment_time.map(|dt| dt < Utc::now().naive_utc()).unwrap_or(false)
-            && !matches!(task.task_status.as_deref(), Some("completed") | Some("closed")))
+        || (task
+            .appointment_time
+            .map(|dt| dt < Utc::now().naive_utc())
+            .unwrap_or(false)
+            && !matches!(
+                task.task_status.as_deref(),
+                Some("completed") | Some("closed")
+            ))
 }
