@@ -206,9 +206,22 @@ pub struct TaskDetailResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ProgressTrackItem {
+    pub key: String,
     pub title: String,
     pub finished: bool,
     pub time: Option<String>,
+    pub expected_time: Option<String>,
+    pub service_type: Option<String>,
+    pub technician_id: Option<i64>,
+    pub technician_name: Option<String>,
+    pub images: Vec<ProgressTrackImage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProgressTrackImage {
+    pub id: i64,
+    pub file_name: String,
+    pub file_url: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -596,14 +609,17 @@ pub async fn get_task_detail(
     let task_remark = task.task_remark.clone();
     let service_time_slot = task.service_time_slot.clone();
     let progress_percent = task_progress_percent(&service_items, task.task_status.as_deref());
-    let completed_step_count = completed_step_count(&service_items, task.task_status.as_deref());
     let progress_tracks = build_progress_tracks(
+        &state,
         &task,
         &service_items,
         &assignments,
         &executions,
-        evidences.len(),
-    );
+        &evidences,
+    )
+    .await?;
+    let completed_step_count = progress_tracks.iter().filter(|item| item.finished).count() as i32;
+    let total_step_count = progress_tracks.len() as i32;
     let customer_mobile = customer.mobile.clone().unwrap_or_default();
     let service_items_payload = map_task_service_item_payloads(service_items);
     let technician_only = is_technician_only(&auth_user);
@@ -685,7 +701,7 @@ pub async fn get_task_detail(
         }),
         progress_percent,
         completed_step_count,
-        total_step_count: 3,
+        total_step_count,
         progress_tracks,
         can_assign: matches!(task.task_status.as_deref(), Some("pending_assign")),
         can_reassign: matches!(
@@ -2055,106 +2071,150 @@ fn progress_percent_for_status(status: Option<&str>) -> i32 {
     }
 }
 
-fn completed_step_count(service_items: &[TaskServiceItemEntity], status: Option<&str>) -> i32 {
-    if !service_items.is_empty() {
-        return service_items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.service_status.as_deref(),
-                    Some("pending_dealer_review")
-                        | Some("pending_hq_score")
-                        | Some("completed")
-                        | Some("closed")
-                )
-            })
-            .count() as i32;
-    }
-
-    match status {
-        Some("pending_assign") | Some("pending_execute") => 0,
-        Some("executing") => 1,
-        Some("pending_dealer_review") | Some("pending_hq_score") => 2,
-        Some("completed") | Some("closed") => 3,
-        _ => 0,
-    }
-}
-
-fn build_progress_tracks(
+async fn build_progress_tracks(
+    state: &AppState,
     task: &TaskEntity,
     service_items: &[TaskServiceItemEntity],
     assignments: &[TaskAssignmentEntity],
     executions: &[TaskExecutionEntity],
-    evidence_count: usize,
-) -> Vec<ProgressTrackItem> {
+    evidences: &[EvidenceEntity],
+) -> Result<Vec<ProgressTrackItem>, AppError> {
+    let latest_assignment = assignments
+        .iter()
+        .max_by_key(|item| item.id.unwrap_or_default());
+    let mut assigned_technician_ids = assignments
+        .iter()
+        .filter_map(|item| item.to_technician_id)
+        .collect::<Vec<_>>();
+    assigned_technician_ids.sort_unstable();
+    assigned_technician_ids.dedup();
+    let assigned_technician_id = if assigned_technician_ids.len() == 1 {
+        assigned_technician_ids.first().copied()
+    } else {
+        latest_assignment.and_then(|item| item.to_technician_id)
+    };
+    let assigned_technician_name = if assigned_technician_ids.len() == 1 {
+        if let Some(technician_id) = assigned_technician_id {
+            find_user_by_id(state, Some(technician_id))
+                .await
+                .ok()
+                .and_then(|item| item.name)
+        } else {
+            None
+        }
+    } else if assigned_technician_ids.len() > 1 {
+        Some("多个师傅".to_string())
+    } else {
+        None
+    };
+
     let assigned_at = assignments
         .iter()
         .filter_map(|item| item.assigned_at)
         .min()
         .map(format_datetime);
-    let started_at = executions
+    let image_evidences = evidences
         .iter()
-        .filter_map(|item| item.started_at)
+        .filter(|item| item.evidence_type.as_deref() == Some("image"))
+        .collect::<Vec<_>>();
+    let shot_at = image_evidences
+        .iter()
+        .filter_map(|item| item.shot_at.or(item.created_at))
         .min()
         .map(format_datetime);
-    let shot_at = executions
-        .iter()
-        .filter_map(|item| item.started_at)
-        .min()
-        .map(format_datetime);
+    let images = image_evidences
+        .into_iter()
+        .map(|item| ProgressTrackImage {
+            id: item.id.unwrap_or_default(),
+            file_name: item.file_name.clone().unwrap_or_default(),
+            file_url: crate::storage::public_url(&item.file_url.clone().unwrap_or_default()),
+        })
+        .collect::<Vec<_>>();
 
-    vec![
+    let service_type = service_items
+        .first()
+        .and_then(|item| item.service_type.clone())
+        .or(task.service_type.clone());
+    let scheduled_at = service_items
+        .first()
+        .and_then(|item| item.scheduled_time)
+        .or(task.appointment_time);
+    let completed_at = service_items
+        .iter()
+        .filter_map(|item| item.completed_at)
+        .max()
+        .or_else(|| executions.iter().filter_map(|item| item.submitted_at).max());
+    let completion_finished = if !service_items.is_empty() {
+        service_items.iter().all(|item| {
+            matches!(
+                item.service_status.as_deref(),
+                Some("pending_dealer_review")
+                    | Some("pending_hq_score")
+                    | Some("completed")
+                    | Some("closed")
+            )
+        })
+    } else {
+        matches!(
+            task.task_status.as_deref(),
+            Some("pending_dealer_review")
+                | Some("pending_hq_score")
+                | Some("completed")
+                | Some("closed")
+        )
+    };
+
+    let tracks = vec![
         ProgressTrackItem {
-            title: "任务已分派".to_string(),
+            key: "created".to_string(),
+            title: "任务创建".to_string(),
+            finished: true,
+            time: task.created_at.map(format_datetime),
+            expected_time: None,
+            service_type: None,
+            technician_id: None,
+            technician_name: None,
+            images: Vec::new(),
+        },
+        ProgressTrackItem {
+            key: "assigned".to_string(),
+            title: assigned_technician_name
+                .as_ref()
+                .map(|name| format!("已分派给{name}"))
+                .unwrap_or_else(|| "已分派师傅".to_string()),
             finished: assigned_at.is_some(),
             time: assigned_at,
+            expected_time: None,
+            service_type: service_type.clone(),
+            technician_id: assigned_technician_id,
+            technician_name: assigned_technician_name,
+            images: Vec::new(),
         },
         ProgressTrackItem {
-            title: "到达现场".to_string(),
-            finished: started_at.is_some(),
-            time: started_at,
-        },
-        ProgressTrackItem {
+            key: "photos".to_string(),
             title: "现场照片".to_string(),
-            finished: evidence_count > 0,
+            finished: !images.is_empty(),
             time: shot_at,
+            expected_time: None,
+            service_type: service_type.clone(),
+            technician_id: assigned_technician_id,
+            technician_name: None,
+            images,
         },
         ProgressTrackItem {
-            title: format!(
-                "完成{}",
-                service_type_label(
-                    service_items
-                        .first()
-                        .and_then(|item| item.service_type.as_deref())
-                        .or(task.service_type.as_deref())
-                )
-            ),
-            finished: if !service_items.is_empty() {
-                service_items.iter().all(|item| {
-                    matches!(
-                        item.service_status.as_deref(),
-                        Some("pending_dealer_review")
-                            | Some("pending_hq_score")
-                            | Some("completed")
-                            | Some("closed")
-                    )
-                })
-            } else {
-                matches!(
-                    task.task_status.as_deref(),
-                    Some("pending_dealer_review")
-                        | Some("pending_hq_score")
-                        | Some("completed")
-                        | Some("closed")
-                )
-            },
-            time: executions
-                .iter()
-                .filter_map(|item| item.submitted_at)
-                .max()
-                .map(format_datetime),
+            key: "completed".to_string(),
+            title: format!("完成{}", service_type_label(service_type.as_deref())),
+            finished: completion_finished,
+            time: completed_at.map(format_datetime),
+            expected_time: scheduled_at.map(format_datetime),
+            service_type,
+            technician_id: assigned_technician_id,
+            technician_name: None,
+            images: Vec::new(),
         },
-    ]
+    ];
+
+    Ok(tracks)
 }
 
 fn task_progress_percent(service_items: &[TaskServiceItemEntity], status: Option<&str>) -> i32 {
