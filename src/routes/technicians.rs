@@ -13,7 +13,8 @@ use crate::{
     auth, db,
     error::AppError,
     models::{
-        hq_score::HqScoreEntity, role::RoleEntity, task::TaskEntity,
+        hq_score_item::HqScoreItemEntity, role::RoleEntity, task::TaskEntity,
+        task_service_item::TaskServiceItemEntity,
         technician_skill::TechnicianSkillEntity, user::UserEntity, user_role::UserRoleEntity,
         user_store::UserStoreEntity,
     },
@@ -171,6 +172,23 @@ pub struct TechnicianTrendPoint {
     pub completed_tasks: usize,
 }
 
+#[derive(Clone)]
+struct TechnicianTaskScope {
+    task: TaskEntity,
+    service_item: Option<TaskServiceItemEntity>,
+}
+
+struct TechnicianAggregateStats {
+    average_score: f64,
+    score_count: usize,
+    completed_count: usize,
+    pending_count: usize,
+    current_task_no: Option<String>,
+    current_task_status: Option<String>,
+    work_status: String,
+    recent_tasks: Vec<TechnicianTaskItem>,
+}
+
 pub async fn list_technicians(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -261,32 +279,7 @@ pub async fn list_technicians(
             .filter_map(|item| item.store_name)
             .collect::<Vec<_>>()
         };
-        let tasks: Vec<TaskEntity> = db::select_by_map_compat(
-            state.rb.as_ref(),
-            "task",
-            value! { "current_technician_id": user_id },
-        )
-        .await
-        .context("failed to query technician tasks")
-        .map_err(AppError::Internal)?;
-        let average_score = calculate_technician_average_score(&state, user_id).await?;
-        let completed_order_count = tasks
-            .iter()
-            .filter(|item| item.task_status.as_deref() == Some("completed"))
-            .count();
-        let pending_order_count = tasks
-            .iter()
-            .filter(|item| {
-                item.task_status.as_deref() != Some("completed")
-                    && item.task_status.as_deref() != Some("closed")
-            })
-            .count();
-        let current_task = tasks.iter().find(|item| {
-            matches!(
-                item.task_status.as_deref(),
-                Some("pending_execute") | Some("executing")
-            )
-        });
+        let stats = build_technician_aggregate_stats(&state, user_id).await?;
 
         items.push(TechnicianItem {
             id: user_id,
@@ -298,18 +291,14 @@ pub async fn list_technicians(
             status: user.status.unwrap_or_else(|| "enabled".to_string()),
             role_names,
             store_names,
-            work_status: if current_task.is_some() {
-                "busy".to_string()
-            } else {
-                "idle".to_string()
-            },
+            work_status: stats.work_status,
             service_types,
-            average_score,
-            completed_order_count,
-            pending_order_count,
-            current_task_no: current_task.and_then(|item| item.task_no.clone()),
-            current_task_status: current_task.and_then(|item| item.task_status.clone()),
-            score_count: completed_order_count,
+            average_score: stats.average_score,
+            completed_order_count: stats.completed_count,
+            pending_order_count: stats.pending_count,
+            current_task_no: stats.current_task_no,
+            current_task_status: stats.current_task_status,
+            score_count: stats.score_count,
         });
     }
 
@@ -613,41 +602,14 @@ pub async fn get_technician_performance(
     ensure_technician_access(&state, &auth_user, technician_id).await?;
 
     let _ = find_user(&state, technician_id).await?;
-    let tasks: Vec<crate::models::task::TaskEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "task",
-        value! { "current_technician_id": technician_id },
-    )
-    .await
-    .context("failed to query technician tasks")
-    .map_err(AppError::Internal)?;
-    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "hq_score",
-        value! { "scorer_id": technician_id },
-    )
-    .await
-    .context("failed to query technician scores")
-    .map_err(AppError::Internal)?;
-    let completed_tasks = tasks
-        .iter()
-        .filter(|item| item.task_status.as_deref() == Some("completed"))
-        .count();
-    let average_score = if scores.is_empty() {
-        0.0
-    } else {
-        scores
-            .iter()
-            .map(|item| item.total_score.unwrap_or_default() as f64)
-            .sum::<f64>()
-            / scores.len() as f64
-    };
+    let task_scopes = load_technician_task_scopes(&state, technician_id).await?;
+    let stats = build_technician_aggregate_stats(&state, technician_id).await?;
 
     Ok(Json(ApiResponse::success(TechnicianPerformanceResponse {
         technician_id,
-        total_tasks: tasks.len(),
-        completed_tasks,
-        average_score,
+        total_tasks: task_scopes.len(),
+        completed_tasks: stats.completed_count,
+        average_score: stats.average_score,
     })))
 }
 
@@ -842,15 +804,7 @@ async fn get_technician_detail_inner(
     .await
     .context("failed to query technician skills")
     .map_err(AppError::Internal)?;
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "task",
-        value! { "current_technician_id": technician_id },
-    )
-    .await
-    .context("failed to query technician task counts")
-    .map_err(AppError::Internal)?;
-    let average_score = calculate_technician_average_score(state, technician_id).await?;
+    let stats = build_technician_aggregate_stats(state, technician_id).await?;
     let role_names = find_role_names(state, technician_id).await?;
     let store_ids: Vec<i64> = stores.iter().filter_map(|item| item.store_id).collect();
     let store_names = if store_ids.is_empty() {
@@ -868,32 +822,8 @@ async fn get_technician_detail_inner(
         .filter_map(|item| item.store_name)
         .collect::<Vec<_>>()
     };
-    let current_task = tasks.iter().find(|item| {
-        matches!(
-            item.task_status.as_deref(),
-            Some("pending_execute") | Some("executing")
-        )
-    });
-    let work_status = if current_task.is_some() {
-        "busy".to_string()
-    } else {
-        "idle".to_string()
-    };
-    let recent_tasks = tasks
-        .iter()
-        .take(10)
-        .map(|item| TechnicianTaskItem {
-            task_id: item.id.unwrap_or_default(),
-            task_no: item.task_no.clone().unwrap_or_default(),
-            service_type: item.service_type.clone().unwrap_or_default(),
-            task_status: item.task_status.clone().unwrap_or_default(),
-            customer_id: item.customer_id.unwrap_or_default(),
-            appointment_time: item
-                .appointment_time
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-        })
-        .collect::<Vec<_>>();
-    let monthly_trends = build_monthly_trends(&tasks);
+    let task_scopes = load_technician_task_scopes(state, technician_id).await?;
+    let monthly_trends = build_monthly_trends(&task_scopes);
 
     Ok(Json(ApiResponse::success(TechnicianDetailResponse {
         id: user.id.unwrap_or_default(),
@@ -914,22 +844,13 @@ async fn get_technician_detail_inner(
             .into_iter()
             .filter_map(|item| item.service_type)
             .collect(),
-        work_status,
-        average_score,
-        pending_task_count: tasks
-            .iter()
-            .filter(|item| {
-                item.task_status.as_deref() != Some("completed")
-                    && item.task_status.as_deref() != Some("closed")
-            })
-            .count(),
-        completed_task_count: tasks
-            .iter()
-            .filter(|item| item.task_status.as_deref() == Some("completed"))
-            .count(),
-        current_task_no: current_task.and_then(|item| item.task_no.clone()),
-        current_task_status: current_task.and_then(|item| item.task_status.clone()),
-        recent_tasks,
+        work_status: stats.work_status,
+        average_score: stats.average_score,
+        pending_task_count: stats.pending_count,
+        completed_task_count: stats.completed_count,
+        current_task_no: stats.current_task_no,
+        current_task_status: stats.current_task_status,
+        recent_tasks: stats.recent_tasks,
         monthly_trends,
     })))
 }
@@ -974,40 +895,256 @@ async fn find_role_names(state: &AppState, user_id: i64) -> Result<Vec<String>, 
         .collect())
 }
 
-async fn calculate_technician_average_score(
+async fn build_technician_aggregate_stats(
     state: &AppState,
     technician_id: i64,
-) -> Result<f64, AppError> {
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+) -> Result<TechnicianAggregateStats, AppError> {
+    let task_scopes = load_technician_task_scopes(state, technician_id).await?;
+    let score_items = load_technician_score_items(state, &task_scopes).await?;
+    let average_score = if score_items.is_empty() {
+        0.0
+    } else {
+        score_items
+            .iter()
+            .map(|item| item.score.unwrap_or_default() as f64)
+            .sum::<f64>()
+            / score_items.len() as f64
+    };
+
+    let completed_count = task_scopes
+        .iter()
+        .filter(|item| technician_scope_is_completed(technician_scope_status(item)))
+        .count();
+    let pending_count = task_scopes
+        .iter()
+        .filter(|item| technician_scope_is_pending(technician_scope_status(item)))
+        .count();
+
+    let mut recent_scopes = task_scopes.clone();
+    recent_scopes.sort_by_key(technician_scope_appointment_time);
+    recent_scopes.reverse();
+    let current_task = recent_scopes.iter().find(|item| technician_scope_is_active(technician_scope_status(item)));
+
+    Ok(TechnicianAggregateStats {
+        average_score,
+        score_count: score_items.len(),
+        completed_count,
+        pending_count,
+        current_task_no: current_task.and_then(|item| item.task.task_no.clone()),
+        current_task_status: current_task
+            .and_then(|item| technician_scope_status(item).map(ToString::to_string)),
+        work_status: if current_task.is_some() {
+            "busy".to_string()
+        } else {
+            "idle".to_string()
+        },
+        recent_tasks: recent_scopes
+            .into_iter()
+            .take(10)
+            .map(|item| TechnicianTaskItem {
+                task_id: item.task.id.unwrap_or_default(),
+                task_no: item.task.task_no.clone().unwrap_or_default(),
+                service_type: technician_scope_service_type(&item).unwrap_or_default().to_string(),
+                task_status: technician_scope_status(&item).unwrap_or_default().to_string(),
+                customer_id: item.task.customer_id.unwrap_or_default(),
+                appointment_time: technician_scope_appointment_time(&item)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+            })
+            .collect(),
+    })
+}
+
+async fn load_technician_task_scopes(
+    state: &AppState,
+    technician_id: i64,
+) -> Result<Vec<TechnicianTaskScope>, AppError> {
+    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "technician_id": technician_id },
+    )
+    .await
+    .context("failed to query technician service items")
+    .map_err(AppError::Internal)?;
+
+    let task_ids_with_service_items = service_items
+        .iter()
+        .filter_map(|item| item.task_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let tasks_by_id = load_tasks_by_ids(
+        state,
+        task_ids_with_service_items.iter().copied().collect::<Vec<_>>(),
+    )
+    .await?;
+
+    let mut scopes = Vec::new();
+    for service_item in service_items {
+        let Some(task_id) = service_item.task_id else {
+            continue;
+        };
+        let Some(task) = tasks_by_id.get(&task_id) else {
+            continue;
+        };
+        scopes.push(TechnicianTaskScope {
+            task: task.clone(),
+            service_item: Some(service_item),
+        });
+    }
+
+    let legacy_tasks: Vec<TaskEntity> = db::select_by_map_compat(
         state.rb.as_ref(),
         "task",
         value! { "current_technician_id": technician_id },
     )
     .await
-    .context("failed to query technician tasks for score calc")
+    .context("failed to query legacy technician tasks")
     .map_err(AppError::Internal)?;
-    let task_ids: Vec<i64> = tasks.into_iter().filter_map(|item| item.id).collect();
-    if task_ids.is_empty() {
-        return Ok(0.0);
+    let legacy_task_ids = legacy_tasks
+        .iter()
+        .filter_map(|item| item.id)
+        .collect::<Vec<_>>();
+    let task_ids_with_any_service_items = load_task_ids_with_service_items(state, &legacy_task_ids).await?;
+
+    for task in legacy_tasks {
+        let Some(task_id) = task.id else {
+            continue;
+        };
+        if task_ids_with_service_items.contains(&task_id)
+            || task_ids_with_any_service_items.contains(&task_id)
+        {
+            continue;
+        }
+        scopes.push(TechnicianTaskScope {
+            task,
+            service_item: None,
+        });
     }
 
-    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(
+    Ok(scopes)
+}
+
+async fn load_tasks_by_ids(
+    state: &AppState,
+    task_ids: Vec<i64>,
+) -> Result<std::collections::BTreeMap<i64, TaskEntity>, AppError> {
+    if task_ids.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
         state.rb.as_ref(),
-        "hq_score",
+        "task",
+        value! { "id": task_ids },
+    )
+    .await
+    .context("failed to query technician tasks by ids")
+    .map_err(AppError::Internal)?;
+    Ok(tasks
+        .into_iter()
+        .filter_map(|item| item.id.map(|id| (id, item)))
+        .collect())
+}
+
+async fn load_task_ids_with_service_items(
+    state: &AppState,
+    task_ids: &[i64],
+) -> Result<std::collections::BTreeSet<i64>, AppError> {
+    if task_ids.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "task_id": task_ids.to_vec() },
+    )
+    .await
+    .context("failed to query technician legacy task service items")
+    .map_err(AppError::Internal)?;
+    Ok(service_items
+        .into_iter()
+        .filter_map(|item| item.task_id)
+        .collect())
+}
+
+async fn load_technician_score_items(
+    state: &AppState,
+    task_scopes: &[TechnicianTaskScope],
+) -> Result<Vec<HqScoreItemEntity>, AppError> {
+    let task_ids = task_scopes
+        .iter()
+        .filter_map(|item| item.task.id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let score_items: Vec<HqScoreItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "hq_score_item",
         value! { "task_id": task_ids },
     )
     .await
-    .context("failed to query hq scores for technician score calc")
+    .context("failed to query technician score items")
     .map_err(AppError::Internal)?;
-    if scores.is_empty() {
-        return Ok(0.0);
-    }
-
-    Ok(scores
+    let scope_keys = task_scopes
         .iter()
-        .map(|item| item.total_score.unwrap_or_default() as f64)
-        .sum::<f64>()
-        / scores.len() as f64)
+        .filter_map(|item| {
+            Some((
+                item.task.id?,
+                technician_scope_service_type(item)?.to_string(),
+            ))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    Ok(score_items
+        .into_iter()
+        .filter(|item| {
+            item.task_id
+                .zip(item.service_type.clone())
+                .map(|key| scope_keys.contains(&key))
+                .unwrap_or(false)
+        })
+        .collect())
+}
+
+fn technician_scope_status(scope: &TechnicianTaskScope) -> Option<&str> {
+    scope
+        .service_item
+        .as_ref()
+        .and_then(|item| item.service_status.as_deref())
+        .or(scope.task.task_status.as_deref())
+}
+
+fn technician_scope_service_type(scope: &TechnicianTaskScope) -> Option<&str> {
+    scope
+        .service_item
+        .as_ref()
+        .and_then(|item| item.service_type.as_deref())
+        .or(scope.task.service_type.as_deref())
+}
+
+fn technician_scope_appointment_time(scope: &TechnicianTaskScope) -> Option<chrono::NaiveDateTime> {
+    scope
+        .service_item
+        .as_ref()
+        .and_then(|item| item.scheduled_time)
+        .or(scope.task.appointment_time)
+}
+
+fn technician_scope_is_completed(status: Option<&str>) -> bool {
+    matches!(status, Some("completed") | Some("closed"))
+}
+
+fn technician_scope_is_pending(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("pending_assign") | Some("pending_execute") | Some("executing") | Some("pending_dealer_review")
+    )
+}
+
+fn technician_scope_is_active(status: Option<&str>) -> bool {
+    matches!(status, Some("pending_execute") | Some("executing"))
 }
 
 async fn ensure_technician_access(
@@ -1143,7 +1280,7 @@ fn normalize_service_types(
     Ok(result)
 }
 
-fn build_monthly_trends(tasks: &[TaskEntity]) -> Vec<TechnicianTrendPoint> {
+fn build_monthly_trends(tasks: &[TechnicianTaskScope]) -> Vec<TechnicianTrendPoint> {
     let now = Utc::now();
     let mut points = Vec::new();
     for offset in (0..6).rev() {
@@ -1151,7 +1288,7 @@ fn build_monthly_trends(tasks: &[TaskEntity]) -> Vec<TechnicianTrendPoint> {
         let total_tasks = tasks
             .iter()
             .filter(|item| {
-                item.appointment_time
+                technician_scope_appointment_time(item)
                     .map(|dt| dt.year() == month.year() && dt.month() == month.month())
                     .unwrap_or(false)
             })
@@ -1159,11 +1296,11 @@ fn build_monthly_trends(tasks: &[TaskEntity]) -> Vec<TechnicianTrendPoint> {
         let completed_tasks = tasks
             .iter()
             .filter(|item| {
-                item.appointment_time
+                technician_scope_appointment_time(item)
                     .map(|dt| dt.year() == month.year() && dt.month() == month.month())
                     .unwrap_or(false)
             })
-            .filter(|item| item.task_status.as_deref() == Some("completed"))
+            .filter(|item| technician_scope_is_completed(technician_scope_status(item)))
             .count();
         points.push(TechnicianTrendPoint {
             period: format!("{}-{:02}", month.year(), month.month()),
