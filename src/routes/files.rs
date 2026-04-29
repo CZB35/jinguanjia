@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
-use chrono::Utc;
+use chrono::{Local, Utc};
 use rbs::value;
 use serde::Serialize;
 use tokio::fs;
@@ -422,7 +422,7 @@ async fn upload_evidence(
             watermark_text: Some(format!("task:{} time:{}", task_id, Utc::now().timestamp())),
             longitude: None,
             latitude: None,
-            shot_at: Some(Utc::now().naive_utc()),
+            shot_at: Some(Local::now().naive_local()),
             created_at: None,
         },
     )

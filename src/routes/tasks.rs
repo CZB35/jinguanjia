@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
-use chrono::{NaiveDateTime, Utc};
+use chrono::{Local, NaiveDateTime, Utc};
 use rbs::value;
 use serde::{Deserialize, Serialize};
 
@@ -880,7 +880,7 @@ pub async fn assign_task(
             assign_type: Some("assign".to_string()),
             assign_reason: payload.assign_reason.clone(),
             assigned_by: Some(auth_user.user_id),
-            assigned_at: Some(Utc::now().naive_utc()),
+                    assigned_at: Some(local_now()),
         };
         TaskAssignmentEntity::insert(state.rb.as_ref(), &assignment)
             .await
@@ -974,7 +974,7 @@ pub async fn assign_task(
                 assign_type: Some("assign".to_string()),
                 assign_reason: payload.assign_reason.clone(),
                 assigned_by: Some(auth_user.user_id),
-                assigned_at: Some(Utc::now().naive_utc()),
+                assigned_at: Some(local_now()),
             },
         )
         .await
@@ -1099,7 +1099,7 @@ pub async fn start_task(
         service_item_id,
         service_type: service_type.clone(),
         technician_id: Some(auth_user.user_id),
-        started_at: Some(Utc::now().naive_utc()),
+        started_at: Some(local_now()),
         submitted_at: None,
         submit_remark: None,
         execution_status: Some("executing".to_string()),
@@ -1129,7 +1129,7 @@ pub async fn start_task(
             state.rb.as_ref(),
             &TaskServiceItemEntity {
                 service_status: Some("executing".to_string()),
-                started_at: Some(Utc::now().naive_utc()),
+                started_at: Some(local_now()),
                 progress_percent: Some(60),
                 ..Default::default()
             },
@@ -1249,7 +1249,7 @@ pub async fn submit_task(
     TaskExecutionEntity::update_by_map(
         state.rb.as_ref(),
         &TaskExecutionEntity {
-            submitted_at: Some(Utc::now().naive_utc()),
+            submitted_at: Some(local_now()),
             submit_remark: payload.submit_remark.clone(),
             execution_status: Some("submitted".to_string()),
             ..Default::default()
@@ -1265,7 +1265,7 @@ pub async fn submit_task(
             state.rb.as_ref(),
             &TaskServiceItemEntity {
                 service_status: Some("pending_dealer_review".to_string()),
-                completed_at: Some(Utc::now().naive_utc()),
+                completed_at: Some(local_now()),
                 progress_percent: Some(90),
                 ..Default::default()
             },
@@ -1385,7 +1385,7 @@ pub async fn reassign_task(
             assign_type: Some("reassign".to_string()),
             assign_reason: Some(payload.assign_reason.clone()),
             assigned_by: Some(auth_user.user_id),
-            assigned_at: Some(Utc::now().naive_utc()),
+            assigned_at: Some(local_now()),
         },
     )
     .await
@@ -2603,42 +2603,75 @@ async fn build_progress_tracks(
     executions: &[TaskExecutionEntity],
     evidences: &[EvidenceEntity],
 ) -> Result<Vec<ProgressTrackItem>, AppError> {
-    let latest_assignment = assignments
+    let scoped_service_item = if service_items.len() == 1 {
+        service_items.first()
+    } else {
+        None
+    };
+    let scoped_technician_id = scoped_service_item.and_then(|item| item.technician_id);
+    let scoped_assignments = scoped_technician_id
+        .map(|technician_id| {
+            assignments
+                .iter()
+                .filter(|item| item.to_technician_id == Some(technician_id))
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| assignments.iter().collect::<Vec<_>>());
+    let latest_assignment = scoped_assignments
         .iter()
+        .copied()
         .max_by_key(|item| item.id.unwrap_or_default());
-    let mut assigned_technician_ids = assignments
+    let mut assigned_technician_ids = scoped_assignments
         .iter()
         .filter_map(|item| item.to_technician_id)
         .collect::<Vec<_>>();
     assigned_technician_ids.sort_unstable();
     assigned_technician_ids.dedup();
-    let assigned_technician_id = if assigned_technician_ids.len() == 1 {
-        assigned_technician_ids.first().copied()
-    } else {
-        latest_assignment.and_then(|item| item.to_technician_id)
-    };
-    let assigned_technician_name = if assigned_technician_ids.len() == 1 {
-        if let Some(technician_id) = assigned_technician_id {
-            find_user_by_id(state, Some(technician_id))
-                .await
-                .ok()
-                .and_then(|item| item.name)
+    let assigned_technician_id = scoped_technician_id.or_else(|| {
+        if assigned_technician_ids.len() == 1 {
+            assigned_technician_ids.first().copied()
         } else {
-            None
+            latest_assignment.and_then(|item| item.to_technician_id)
         }
+    });
+    let assigned_technician_name = if let Some(technician_id) = assigned_technician_id {
+        find_user_by_id(state, Some(technician_id))
+            .await
+            .ok()
+            .and_then(|item| item.name)
     } else if assigned_technician_ids.len() > 1 {
         Some("多个师傅".to_string())
     } else {
         None
     };
 
-    let assigned_at = assignments
+    let assigned_at = scoped_assignments
         .iter()
         .filter_map(|item| item.assigned_at)
         .min()
         .map(format_datetime);
+    let scoped_execution_ids = scoped_service_item
+        .map(|service_item| {
+            executions
+                .iter()
+                .filter(|item| {
+                    item.service_item_id == service_item.id
+                        || (item.service_item_id.is_none()
+                            && item.service_type == service_item.service_type)
+                })
+                .filter_map(|item| item.id)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .filter(|ids| !ids.is_empty());
     let image_evidences = evidences
         .iter()
+        .filter(|item| {
+            scoped_execution_ids
+                .as_ref()
+                .map(|ids| item.execution_id.map(|id| ids.contains(&id)).unwrap_or(false))
+                .unwrap_or(true)
+        })
         .filter(|item| item.evidence_type.as_deref() == Some("image"))
         .collect::<Vec<_>>();
     let shot_at = image_evidences
@@ -2667,7 +2700,18 @@ async fn build_progress_tracks(
         .iter()
         .filter_map(|item| item.completed_at)
         .max()
-        .or_else(|| executions.iter().filter_map(|item| item.submitted_at).max());
+        .or_else(|| {
+            executions
+                .iter()
+                .filter(|item| {
+                    scoped_execution_ids
+                        .as_ref()
+                        .map(|ids| item.id.map(|id| ids.contains(&id)).unwrap_or(false))
+                        .unwrap_or(true)
+                })
+                .filter_map(|item| item.submitted_at)
+                .max()
+        });
     let completion_finished = if !service_items.is_empty() {
         service_items.iter().all(|item| {
             matches!(
@@ -2899,7 +2943,7 @@ async fn sync_task_service_items_on_start(
                 &TaskServiceItemEntity {
                     technician_id: Some(technician_id),
                     service_status: Some("executing".to_string()),
-                    started_at: Some(Utc::now().naive_utc()),
+                    started_at: Some(local_now()),
                     progress_percent: Some(60),
                     ..Default::default()
                 },
@@ -2921,7 +2965,7 @@ async fn sync_task_service_items_on_submit(state: &AppState, task_id: i64) -> Re
                 state.rb.as_ref(),
                 &TaskServiceItemEntity {
                     service_status: Some("pending_dealer_review".to_string()),
-                    completed_at: Some(Utc::now().naive_utc()),
+                    completed_at: Some(local_now()),
                     progress_percent: Some(90),
                     ..Default::default()
                 },
@@ -2950,7 +2994,7 @@ async fn sync_task_service_items_status(
                     service_status: Some(service_status.to_string()),
                     progress_percent: Some(progress_percent),
                     completed_at: if progress_percent >= 100 {
-                        Some(Utc::now().naive_utc())
+                        Some(local_now())
                     } else {
                         None
                     },
@@ -3033,6 +3077,10 @@ fn score_status_text(status: &str) -> &'static str {
     }
 }
 
+fn local_now() -> NaiveDateTime {
+    Local::now().naive_local()
+}
+
 fn scoped_review_status(task_review_status: Option<&str>, service_status: Option<&str>) -> String {
     match service_status {
         Some("pending_dealer_review") => "pending".to_string(),
@@ -3064,7 +3112,7 @@ fn task_is_overdue(task: &TaskEntity) -> bool {
     }
     let overdue_by_time = task
         .appointment_time
-        .map(|dt| dt < Utc::now().naive_utc())
+        .map(|dt| dt < local_now())
         .unwrap_or(false);
     overdue_by_time
         && !matches!(
@@ -3075,7 +3123,7 @@ fn task_is_overdue(task: &TaskEntity) -> bool {
 
 fn service_item_is_overdue(item: &TaskServiceItemEntity) -> bool {
     item.scheduled_time
-        .map(|dt| dt < Utc::now().naive_utc())
+        .map(|dt| dt < local_now())
         .unwrap_or(false)
         && !matches!(
             item.service_status.as_deref(),

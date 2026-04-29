@@ -4,7 +4,7 @@ use axum::{
     extract::{Query, State},
     http::HeaderMap,
 };
-use chrono::{Datelike, NaiveDateTime, Utc};
+use chrono::{Datelike, Local, NaiveDateTime, Utc};
 use rbs::value;
 use serde::Serialize;
 
@@ -875,7 +875,7 @@ fn technician_task_is_overdue(item: &TechnicianDashboardTask) -> bool {
     }
     item.task.is_overdue == Some(1)
         || technician_task_scheduled_at(item)
-            .map(|dt| dt < Utc::now().naive_utc())
+            .map(|dt| dt < Local::now().naive_local())
             .unwrap_or(false)
 }
 
@@ -949,7 +949,7 @@ fn task_is_overdue(task: &TaskEntity) -> bool {
     task.is_overdue == Some(1)
         || (task
             .appointment_time
-            .map(|dt| dt < Utc::now().naive_utc())
+            .map(|dt| dt < Local::now().naive_local())
             .unwrap_or(false)
             && !matches!(
                 task.task_status.as_deref(),

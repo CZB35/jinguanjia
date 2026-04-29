@@ -16,17 +16,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
     models::{
-        hq_score::HqScoreEntity,
-        hq_score_item::HqScoreItemEntity,
-        role::RoleEntity,
-        task::TaskEntity,
-        user::UserEntity,
-        user_role::UserRoleEntity,
-        user_store::UserStoreEntity,
+        hq_score::HqScoreEntity, hq_score_item::HqScoreItemEntity, role::RoleEntity,
+        task::TaskEntity, user::UserEntity, user_role::UserRoleEntity, user_store::UserStoreEntity,
     },
     response::ApiResponse,
     state::AppState,
@@ -34,7 +28,11 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct BatchDeleteUsersRequest {
-    #[serde(default, alias = "ids", deserialize_with = "deserialize_vec_i64_from_mixed")]
+    #[serde(
+        default,
+        alias = "ids",
+        deserialize_with = "deserialize_vec_i64_from_mixed"
+    )]
     pub user_ids: Vec<i64>,
 }
 
@@ -83,7 +81,9 @@ pub async fn batch_delete_users(
         .map_err(AppError::Internal)?;
     }
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 pub async fn delete_user(
@@ -104,7 +104,9 @@ pub async fn delete_user(
     .context("failed to soft delete user")
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 pub async fn export_users(
@@ -148,16 +150,22 @@ pub async fn download_user_import_template(
     let (file_name, content) = if normalized_role_code.as_deref() == Some("dealer") {
         (
             "dealers-import-template.csv",
-            "name,mobile,password,store_id,status\n示例经销商,13800009999,123456,1,enabled\n",
+            build_csv_template(
+                &["姓名", "手机号", "密码", "所属门店ID", "状态"],
+                &["示例经销商", "13800009999", "123456", "1", "enabled"],
+            ),
         )
     } else {
         (
             "users-import-template.csv",
-            "name,mobile,password,role_codes,store_ids,status\n示例用户,13800009999,123456,dealer,1,enabled\n",
+            build_csv_template(
+                &["姓名", "手机号", "密码", "角色编码", "所属门店ID", "状态"],
+                &["示例用户", "13800009999", "123456", "dealer", "1", "enabled"],
+            ),
         )
     };
 
-    let mut response = Response::new(Body::from(content.as_bytes().to_vec()));
+    let mut response = Response::new(Body::from(content.into_bytes()));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -188,8 +196,15 @@ pub async fn import_users(
         if row.role_codes.is_empty() {
             row.role_codes = default_role_codes.clone();
         }
-        row.role_codes = row.role_codes.into_iter().map(|item| normalize_role_code_alias(&item)).collect();
-        if row.name.trim().is_empty() || row.mobile.trim().is_empty() || row.password.trim().is_empty() {
+        row.role_codes = row
+            .role_codes
+            .into_iter()
+            .map(|item| normalize_role_code_alias(&item))
+            .collect();
+        if row.name.trim().is_empty()
+            || row.mobile.trim().is_empty()
+            || row.password.trim().is_empty()
+        {
             failed_count += 1;
             errors.push(format!("第{}行必填字段缺失", index + 2));
             continue;
@@ -220,10 +235,14 @@ pub async fn import_users(
             continue;
         }
 
-        let exists: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": row.mobile.as_str() })
-            .await
-            .context("failed to check existing import user")
-            .map_err(AppError::Internal)?;
+        let exists: Vec<UserEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "user",
+            value! { "mobile": row.mobile.as_str() },
+        )
+        .await
+        .context("failed to check existing import user")
+        .map_err(AppError::Internal)?;
         if !exists.is_empty() {
             failed_count += 1;
             errors.push(format!("第{}行手机号已存在: {}", index + 2, row.mobile));
@@ -265,11 +284,15 @@ pub async fn import_users(
         .context("failed to insert imported user")
         .map_err(AppError::Internal)?;
 
-        let user: UserEntity = db::select_one_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": row.mobile.as_str() })
-            .await
-            .context("failed to fetch imported user")
-            .map_err(AppError::Internal)?
-            .ok_or_else(|| AppError::Internal(anyhow!("imported user fetch failed")))?;
+        let user: UserEntity = db::select_one_by_map_compat(
+            state.rb.as_ref(),
+            "user",
+            value! { "mobile": row.mobile.as_str() },
+        )
+        .await
+        .context("failed to fetch imported user")
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::Internal(anyhow!("imported user fetch failed")))?;
         let user_id = user.id.unwrap_or_default();
 
         for role_id in resolved_role_ids {
@@ -336,10 +359,14 @@ pub async fn import_scores(
     let mut errors = Vec::new();
 
     for (index, row) in rows.into_iter().enumerate() {
-        let task = db::select_one_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "id": row.task_id })
-            .await
-            .context("failed to query task during score import")
-            .map_err(AppError::Internal)?;
+        let task = db::select_one_by_map_compat::<TaskEntity>(
+            state.rb.as_ref(),
+            "task",
+            value! { "id": row.task_id },
+        )
+        .await
+        .context("failed to query task during score import")
+        .map_err(AppError::Internal)?;
         let Some(task) = task else {
             failed_count += 1;
             errors.push(format!("第{}行任务不存在: {}", index + 2, row.task_id));
@@ -349,19 +376,32 @@ pub async fn import_scores(
         let service_types = load_task_service_types(&state, &task).await?;
         if !service_types.iter().any(|item| item == &row.service_type) {
             failed_count += 1;
-            errors.push(format!("第{}行服务环节与任务不匹配: {} / {}", index + 2, row.task_id, row.service_type));
+            errors.push(format!(
+                "第{}行服务环节与任务不匹配: {} / {}",
+                index + 2,
+                row.task_id,
+                row.service_type
+            ));
             continue;
         }
         if task.task_status.as_deref() != Some("pending_hq_score") {
             failed_count += 1;
-            errors.push(format!("第{}行任务状态不允许评分: {}", index + 2, row.task_id));
+            errors.push(format!(
+                "第{}行任务状态不允许评分: {}",
+                index + 2,
+                row.task_id
+            ));
             continue;
         }
 
-        let exists: Vec<HqScoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! { "task_id": row.task_id })
-            .await
-            .context("failed to query existing score during import")
-            .map_err(AppError::Internal)?;
+        let exists: Vec<HqScoreEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "hq_score",
+            value! { "task_id": row.task_id },
+        )
+        .await
+        .context("failed to query existing score during import")
+        .map_err(AppError::Internal)?;
         if !exists.is_empty() {
             failed_count += 1;
             errors.push(format!("第{}行任务已评分: {}", index + 2, row.task_id));
@@ -385,11 +425,15 @@ pub async fn import_scores(
         .context("failed to insert imported score")
         .map_err(AppError::Internal)?;
 
-        let hq_score: HqScoreEntity = db::select_one_by_map_compat(state.rb.as_ref(), "hq_score", value! { "task_id": row.task_id })
-            .await
-            .context("failed to fetch imported hq score")
-            .map_err(AppError::Internal)?
-            .ok_or_else(|| AppError::Internal(anyhow!("imported hq score fetch failed")))?;
+        let hq_score: HqScoreEntity = db::select_one_by_map_compat(
+            state.rb.as_ref(),
+            "hq_score",
+            value! { "task_id": row.task_id },
+        )
+        .await
+        .context("failed to fetch imported hq score")
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::Internal(anyhow!("imported hq score fetch failed")))?;
 
         HqScoreItemEntity::insert(
             state.rb.as_ref(),
@@ -500,13 +544,22 @@ fn parse_import_rows(upload: &UploadField) -> Result<Vec<ImportedUserRow>, AppEr
         return parse_user_excel(&upload.file_name, &upload.bytes);
     }
 
-    Err(AppError::BadRequest("用户导入仅支持 csv/xls/xlsx 文件".to_string()))
+    Err(AppError::BadRequest(
+        "用户导入仅支持 csv/xls/xlsx 文件".to_string(),
+    ))
 }
 
 fn parse_user_csv(bytes: &[u8]) -> Result<Vec<ImportedUserRow>, AppError> {
-    let content = String::from_utf8(bytes.to_vec())
+    let content = String::from_utf8(strip_utf8_bom(bytes).to_vec())
         .map_err(|_| AppError::BadRequest("用户导入CSV文件必须为UTF-8编码".to_string()))?;
-    let mut lines = content.lines();
+    let mut lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .peekable();
+    if matches!(lines.peek(), Some(line) if line.eq_ignore_ascii_case("sep=,")) {
+        let _ = lines.next();
+    }
     let headers = lines
         .next()
         .ok_or_else(|| AppError::BadRequest("导入文件不能为空".to_string()))?
@@ -519,7 +572,10 @@ fn parse_user_csv(bytes: &[u8]) -> Result<Vec<ImportedUserRow>, AppError> {
         if line.trim().is_empty() {
             continue;
         }
-        let cols = line.split(',').map(|item| item.trim().to_string()).collect::<Vec<_>>();
+        let cols = line
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .collect::<Vec<_>>();
         rows.push(parse_import_row_values(&header_map, &cols));
     }
     Ok(rows)
@@ -580,12 +636,35 @@ fn build_header_index_map(headers: &[String]) -> HashMap<String, usize> {
     header_map
 }
 
-fn parse_import_row_values(header_map: &HashMap<String, usize>, cols: &[String]) -> ImportedUserRow {
+fn build_csv_template(headers: &[&str], sample: &[&str]) -> String {
+    format!(
+        "\u{feff}sep=,\n{}\n{}\n",
+        headers.join(","),
+        sample.join(",")
+    )
+}
+
+fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
+}
+
+fn parse_import_row_values(
+    header_map: &HashMap<String, usize>,
+    cols: &[String],
+) -> ImportedUserRow {
     let name = value_by_keys(header_map, cols, &["name", "姓名"]);
     let mobile = value_by_keys(header_map, cols, &["mobile", "手机号", "电话"]);
     let password = value_by_keys(header_map, cols, &["password", "密码"]);
-    let role_code = value_by_keys(header_map, cols, &["role_code", "role_codes", "角色编码", "角色"]);
-    let store_value = value_by_keys(header_map, cols, &["store_id", "store_ids", "门店id", "所属门店", "门店"]);
+    let role_code = value_by_keys(
+        header_map,
+        cols,
+        &["role_code", "role_codes", "角色编码", "角色"],
+    );
+    let store_value = value_by_keys(
+        header_map,
+        cols,
+        &["store_id", "store_ids", "门店id", "所属门店", "门店"],
+    );
     let status = value_by_keys(header_map, cols, &["status", "状态"]);
 
     ImportedUserRow {
@@ -594,14 +673,23 @@ fn parse_import_row_values(header_map: &HashMap<String, usize>, cols: &[String])
         password,
         role_codes: split_multi_values(&role_code),
         store_ids: split_multi_i64_values(&store_value),
-        status: if status.trim().is_empty() { "enabled".to_string() } else { status },
+        status: if status.trim().is_empty() {
+            "enabled".to_string()
+        } else {
+            status
+        },
     }
 }
 
 fn value_by_keys(header_map: &HashMap<String, usize>, cols: &[String], keys: &[&str]) -> String {
     for key in keys {
         if let Some(index) = header_map.get(&key.to_ascii_lowercase()) {
-            return cols.get(*index).cloned().unwrap_or_default().trim().to_string();
+            return cols
+                .get(*index)
+                .cloned()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
         }
     }
     String::new()
@@ -629,7 +717,11 @@ fn resolve_default_role_codes(fields: &HashMap<String, String>) -> Vec<String> {
     fields
         .get("role_code")
         .map(|item| split_multi_values(item))
-        .or_else(|| fields.get("role_codes").map(|item| split_multi_values(item)))
+        .or_else(|| {
+            fields
+                .get("role_codes")
+                .map(|item| split_multi_values(item))
+        })
         .unwrap_or_default()
 }
 
@@ -644,7 +736,9 @@ fn normalize_role_code_alias(role_code: &str) -> String {
 }
 
 fn validate_import_store_binding(role_codes: &[String], store_ids: &[i64]) -> Result<(), String> {
-    let requires_single_store = role_codes.iter().any(|role| role == "dealer" || role == "technician");
+    let requires_single_store = role_codes
+        .iter()
+        .any(|role| role == "dealer" || role == "technician");
     if requires_single_store && store_ids.len() != 1 {
         return Err("经销商和师傅账号必须且只能绑定一个门店".to_string());
     }
@@ -652,10 +746,17 @@ fn validate_import_store_binding(role_codes: &[String], store_ids: &[i64]) -> Re
 }
 
 fn normalize_user_status(value: Option<&str>) -> Result<String, AppError> {
-    match value.unwrap_or("enabled").trim().to_ascii_lowercase().as_str() {
+    match value
+        .unwrap_or("enabled")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "enabled" | "active" => Ok("enabled".to_string()),
         "disabled" | "inactive" => Ok("disabled".to_string()),
-        _ => Err(AppError::BadRequest("用户状态只能为enabled/disabled或active/inactive".to_string())),
+        _ => Err(AppError::BadRequest(
+            "用户状态只能为enabled/disabled或active/inactive".to_string(),
+        )),
     }
 }
 
@@ -671,12 +772,30 @@ fn parse_score_csv(bytes: &[u8]) -> Result<Vec<ScoreImportRow>, AppError> {
         if cols.len() < 3 {
             continue;
         }
-        let task_id = cols[0].trim().parse().map_err(|_| AppError::BadRequest("评分导入task_id格式错误".to_string()))?;
+        let task_id = cols[0]
+            .trim()
+            .parse()
+            .map_err(|_| AppError::BadRequest("评分导入task_id格式错误".to_string()))?;
         let service_type = cols[1].trim().to_string();
-        let score = cols[2].trim().parse().map_err(|_| AppError::BadRequest("评分导入score格式错误".to_string()))?;
-        let deduction_reason = cols.get(3).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let score_remark = cols.get(4).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        rows.push(ScoreImportRow { task_id, service_type, score, deduction_reason, score_remark });
+        let score = cols[2]
+            .trim()
+            .parse()
+            .map_err(|_| AppError::BadRequest("评分导入score格式错误".to_string()))?;
+        let deduction_reason = cols
+            .get(3)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let score_remark = cols
+            .get(4)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        rows.push(ScoreImportRow {
+            task_id,
+            service_type,
+            score,
+            deduction_reason,
+            score_remark,
+        });
     }
     Ok(rows)
 }
@@ -712,21 +831,40 @@ fn parse_score_excel_file(path: &Path) -> Result<Vec<ScoreImportRow>, AppError> 
         if row.len() < 3 {
             continue;
         }
-        let task_id = row[0].to_string().parse().map_err(|_| AppError::BadRequest("评分导入task_id格式错误".to_string()))?;
+        let task_id = row[0]
+            .to_string()
+            .parse()
+            .map_err(|_| AppError::BadRequest("评分导入task_id格式错误".to_string()))?;
         let service_type = row[1].to_string();
-        let score = row[2].to_string().parse().map_err(|_| AppError::BadRequest("评分导入score格式错误".to_string()))?;
-        let deduction_reason = row.get(3).map(|item| item.to_string()).filter(|s| !s.is_empty());
-        let score_remark = row.get(4).map(|item| item.to_string()).filter(|s| !s.is_empty());
-        rows.push(ScoreImportRow { task_id, service_type, score, deduction_reason, score_remark });
+        let score = row[2]
+            .to_string()
+            .parse()
+            .map_err(|_| AppError::BadRequest("评分导入score格式错误".to_string()))?;
+        let deduction_reason = row
+            .get(3)
+            .map(|item| item.to_string())
+            .filter(|s| !s.is_empty());
+        let score_remark = row
+            .get(4)
+            .map(|item| item.to_string())
+            .filter(|s| !s.is_empty());
+        rows.push(ScoreImportRow {
+            task_id,
+            service_type,
+            score,
+            deduction_reason,
+            score_remark,
+        });
     }
     Ok(rows)
 }
 
 async fn find_role_id_by_code(state: &AppState, role_code: &str) -> Result<Option<i64>, AppError> {
-    let role: Option<RoleEntity> = db::select_one_by_map_compat(state.rb.as_ref(), "role", value! { "role_code": role_code })
-        .await
-        .context("failed to query role during import")
-        .map_err(AppError::Internal)?;
+    let role: Option<RoleEntity> =
+        db::select_one_by_map_compat(state.rb.as_ref(), "role", value! { "role_code": role_code })
+            .await
+            .context("failed to query role during import")
+            .map_err(AppError::Internal)?;
     Ok(role.and_then(|item| item.id))
 }
 
@@ -744,22 +882,29 @@ fn ensure_admin_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppE
     auth_user.require_any_role(&["super_admin", "hq_reviewer"])
 }
 
-async fn load_task_service_types(state: &AppState, task: &TaskEntity) -> Result<Vec<String>, AppError> {
+async fn load_task_service_types(
+    state: &AppState,
+    task: &TaskEntity,
+) -> Result<Vec<String>, AppError> {
     let task_id = task.id.unwrap_or_default();
-    let items = db::select_by_map_compat::<crate::models::task_service_item::TaskServiceItemEntity>(
-        state.rb.as_ref(),
-        "task_service_item",
-        value! { "task_id": task_id },
-    )
-    .await
-    .context("failed to query task service items during score import")
-    .map_err(AppError::Internal)?;
+    let items =
+        db::select_by_map_compat::<crate::models::task_service_item::TaskServiceItemEntity>(
+            state.rb.as_ref(),
+            "task_service_item",
+            value! { "task_id": task_id },
+        )
+        .await
+        .context("failed to query task service items during score import")
+        .map_err(AppError::Internal)?;
 
     if items.is_empty() {
         return Ok(task.service_type.iter().cloned().collect());
     }
 
-    Ok(items.into_iter().filter_map(|item| item.service_type).collect())
+    Ok(items
+        .into_iter()
+        .filter_map(|item| item.service_type)
+        .collect())
 }
 
 fn deserialize_vec_i64_from_mixed<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>

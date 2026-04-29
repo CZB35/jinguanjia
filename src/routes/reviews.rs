@@ -4,6 +4,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
+use chrono::Local;
 use rbs::value;
 use serde::{Deserialize, Serialize};
 
@@ -273,7 +274,7 @@ pub async fn hq_score(
                 &TaskServiceItemEntity {
                     service_status: Some("completed".to_string()),
                     progress_percent: Some(100),
-                    completed_at: Some(chrono::Utc::now().naive_utc()),
+                    completed_at: Some(Local::now().naive_local()),
                     ..Default::default()
                 },
                 value! { "id": id },
