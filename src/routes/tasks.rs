@@ -1104,6 +1104,39 @@ pub async fn start_task(
 
     let task = find_task_by_id(&state, task_id).await?;
     let before_task = task.clone();
+    if task.task_status.as_deref() == Some("executing") {
+        let executing_service_item = resolve_technician_service_item_for_action(
+            &state,
+            &task,
+            auth_user.user_id,
+            payload.service_item_id,
+            payload.service_type.as_deref(),
+            &["executing"],
+            "开始执行",
+        )
+        .await?;
+        let service_item_id = executing_service_item.as_ref().and_then(|item| item.id);
+        let service_type = executing_service_item
+            .as_ref()
+            .and_then(|item| item.service_type.clone())
+            .or_else(|| task.service_type.clone());
+        let execution_id = find_active_execution_id(
+            &state,
+            task_id,
+            auth_user.user_id,
+            service_item_id,
+            service_type.as_deref(),
+        )
+        .await?;
+
+        return Ok(Json(ApiResponse::success(TaskActionResponse {
+            task_id,
+            task_status: "executing".to_string(),
+            service_item_id,
+            service_type,
+            execution_id: Some(execution_id),
+        })));
+    }
     let service_item = resolve_technician_service_item_for_action(
         &state,
         &task,
@@ -2525,6 +2558,41 @@ async fn find_task_execution_by_id(
         .into_iter()
         .next()
         .ok_or_else(|| AppError::NotFound("执行记录不存在".to_string()))
+}
+
+async fn find_active_execution_id(
+    state: &AppState,
+    task_id: i64,
+    technician_id: i64,
+    service_item_id: Option<i64>,
+    service_type: Option<&str>,
+) -> Result<i64, AppError> {
+    let executions: Vec<TaskExecutionEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_execution",
+        value! { "task_id": task_id, "technician_id": technician_id },
+    )
+    .await
+    .context("failed to query active execution")
+    .map_err(AppError::Internal)?;
+
+    let execution = executions
+        .into_iter()
+        .filter(|item| item.execution_status.as_deref() == Some("executing"))
+        .filter(|item| match service_item_id {
+            Some(id) => item.service_item_id == Some(id),
+            None => true,
+        })
+        .filter(|item| match service_type {
+            Some(service_type) => item.service_type.as_deref() == Some(service_type),
+            None => true,
+        })
+        .max_by_key(|item| item.id.unwrap_or_default())
+        .ok_or_else(|| AppError::Conflict("任务尚未生成执行记录".to_string()))?;
+
+    execution
+        .id
+        .ok_or_else(|| AppError::Internal(anyhow!("execution.id missing")))
 }
 
 async fn find_customer_by_id(
