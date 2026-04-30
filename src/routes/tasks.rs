@@ -2655,13 +2655,15 @@ async fn build_progress_tracks(
         .collect::<Vec<_>>();
     assigned_technician_ids.sort_unstable();
     assigned_technician_ids.dedup();
-    let assigned_technician_id = scoped_technician_id.or_else(|| {
-        if assigned_technician_ids.len() == 1 {
-            assigned_technician_ids.first().copied()
-        } else {
-            latest_assignment.and_then(|item| item.to_technician_id)
-        }
-    });
+    let assigned_technician_id = scoped_technician_id
+        .or(task.current_technician_id)
+        .or_else(|| {
+            if assigned_technician_ids.len() == 1 {
+                assigned_technician_ids.first().copied()
+            } else {
+                latest_assignment.and_then(|item| item.to_technician_id)
+            }
+        });
     let assigned_technician_name = if let Some(technician_id) = assigned_technician_id {
         find_user_by_id(state, Some(technician_id))
             .await
