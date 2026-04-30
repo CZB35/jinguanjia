@@ -1,7 +1,7 @@
 use anyhow::Context;
 use axum::{
-    body::Body,
     Json,
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
@@ -11,18 +11,12 @@ use rbs::value;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
     models::{
-        customer::CustomerEntity,
-        evidence::EvidenceEntity,
-        hq_score_item::HqScoreItemEntity,
-        notice::NoticeEntity,
-        store::StoreEntity,
-        task::TaskEntity,
-        task_service_item::TaskServiceItemEntity,
-        user::UserEntity,
+        customer::CustomerEntity, evidence::EvidenceEntity, hq_score_item::HqScoreItemEntity,
+        notice::NoticeEntity, store::StoreEntity, task::TaskEntity,
+        task_service_item::TaskServiceItemEntity, user::UserEntity,
     },
     response::ApiResponse,
     state::AppState,
@@ -110,7 +104,10 @@ pub async fn list_review_tasks(
     let items = load_review_tasks(&state, &query).await?;
     let total = items.len();
 
-    Ok(Json(ApiResponse::success(ReviewTaskListResponse { items, total })))
+    Ok(Json(ApiResponse::success(ReviewTaskListResponse {
+        items,
+        total,
+    })))
 }
 
 pub async fn export_review_tasks(
@@ -142,7 +139,9 @@ pub async fn export_review_tasks(
             csv_cell(&item.customer_name),
             csv_cell(&item.customer_mobile),
             csv_cell(&item.appointment_time.unwrap_or_default()),
-            item.technician_score.map(|score| score.to_string()).unwrap_or_default(),
+            item.technician_score
+                .map(|score| score.to_string())
+                .unwrap_or_default(),
         ));
     }
 
@@ -159,7 +158,10 @@ pub async fn export_review_tasks(
     Ok(response)
 }
 
-async fn load_review_tasks(state: &AppState, query: &ReviewTaskQuery) -> Result<Vec<ReviewTaskItem>, AppError> {
+async fn load_review_tasks(
+    state: &AppState,
+    query: &ReviewTaskQuery,
+) -> Result<Vec<ReviewTaskItem>, AppError> {
     let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! {})
         .await
         .context("failed to query review tasks")
@@ -177,10 +179,14 @@ async fn load_review_tasks(state: &AppState, query: &ReviewTaskQuery) -> Result<
             continue;
         }
         let task_id = task.id.unwrap_or_default();
-        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! { "task_id": task_id })
-            .await
-            .context("failed to query task service items for review list")
-            .map_err(AppError::Internal)?;
+        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task_service_item",
+            value! { "task_id": task_id },
+        )
+        .await
+        .context("failed to query task service items for review list")
+        .map_err(AppError::Internal)?;
         for service_item in service_items {
             if let Some(service_type) = &query.service_type
                 && service_item.service_type.as_deref() != Some(service_type.as_str())
@@ -200,14 +206,19 @@ pub async fn get_review_task_detail(
 ) -> Result<Json<ApiResponse<ReviewTaskDetailResponse>>, AppError> {
     ensure_hq_access(&state, &headers)?;
     let task = find_task(&state, task_id).await?;
-    let evidences: Vec<EvidenceEntity> = db::select_by_map_compat(state.rb.as_ref(), "evidence", value! { "task_id": task_id })
-        .await
-        .context("failed to query task evidences for review detail")
-        .map_err(AppError::Internal)?;
-    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! { "task_id": task_id })
-        .await
-        .context("failed to query review detail service items")
-        .map_err(AppError::Internal)?;
+    let evidences: Vec<EvidenceEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "evidence", value! { "task_id": task_id })
+            .await
+            .context("failed to query task evidences for review detail")
+            .map_err(AppError::Internal)?;
+    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query review detail service items")
+    .map_err(AppError::Internal)?;
     let customer = load_customer(&state, task.customer_id.unwrap_or_default()).await?;
     let dealer = load_user(&state, task.dealer_user_id.unwrap_or_default()).await?;
     let technician = if let Some(technician_id) = task.current_technician_id {
@@ -216,7 +227,8 @@ pub async fn get_review_task_detail(
         None
     };
     let store = load_store(&state, task.store_id.unwrap_or_default()).await?;
-    let address = load_customer_address_text(&state, task.customer_address_id.unwrap_or_default()).await?;
+    let address =
+        load_customer_address_text(&state, task.customer_address_id.unwrap_or_default()).await?;
 
     Ok(Json(ApiResponse::success(ReviewTaskDetailResponse {
         id: task.id.unwrap_or_default(),
@@ -228,8 +240,14 @@ pub async fn get_review_task_detail(
         score_status: task.score_status.unwrap_or_default(),
         store_name: store.store_name.unwrap_or_default(),
         dealer_name: dealer.name.unwrap_or_default(),
-        technician_name: technician.as_ref().and_then(|item| item.name.clone()).unwrap_or_default(),
-        technician_mobile: technician.as_ref().and_then(|item| item.mobile.clone()).unwrap_or_default(),
+        technician_name: technician
+            .as_ref()
+            .and_then(|item| item.name.clone())
+            .unwrap_or_default(),
+        technician_mobile: technician
+            .as_ref()
+            .and_then(|item| item.mobile.clone())
+            .unwrap_or_default(),
         customer_name: customer.name.unwrap_or_default(),
         customer_mobile: customer.mobile.unwrap_or_default(),
         customer_address: address,
@@ -247,25 +265,36 @@ pub async fn list_review_reminders(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<ReviewTaskListResponse>>, AppError> {
     ensure_hq_access(&state, &headers)?;
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "task_status": "pending_dealer_review" })
-        .await
-        .context("failed to query review reminder tasks")
-        .map_err(AppError::Internal)?;
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "task_status": "pending_dealer_review" },
+    )
+    .await
+    .context("failed to query review reminder tasks")
+    .map_err(AppError::Internal)?;
 
     let mut items = Vec::new();
     for task in tasks {
         let task_id = task.id.unwrap_or_default();
-        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! { "task_id": task_id })
-            .await
-            .context("failed to query reminder task service items")
-            .map_err(AppError::Internal)?;
+        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task_service_item",
+            value! { "task_id": task_id },
+        )
+        .await
+        .context("failed to query reminder task service items")
+        .map_err(AppError::Internal)?;
         for service_item in service_items {
             items.push(build_review_task_item(&state, &task, &service_item).await?);
         }
     }
     let total = items.len();
 
-    Ok(Json(ApiResponse::success(ReviewTaskListResponse { items, total })))
+    Ok(Json(ApiResponse::success(ReviewTaskListResponse {
+        items,
+        total,
+    })))
 }
 
 pub async fn send_review_remind(
@@ -298,7 +327,9 @@ pub async fn send_review_remind(
     .context("failed to create review reminder notice")
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 fn ensure_hq_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
@@ -322,11 +353,12 @@ async fn build_review_task_item(
     let dealer = load_user(state, task.dealer_user_id.unwrap_or_default()).await?;
     let customer = load_customer(state, task.customer_id.unwrap_or_default()).await?;
     let store = load_store(state, task.store_id.unwrap_or_default()).await?;
-    let technician = if let Some(technician_id) = service_item.technician_id.or(task.current_technician_id) {
-        Some(load_user(state, technician_id).await?)
-    } else {
-        None
-    };
+    let technician =
+        if let Some(technician_id) = service_item.technician_id.or(task.current_technician_id) {
+            Some(load_user(state, technician_id).await?)
+        } else {
+            None
+        };
     let score_item: Option<HqScoreItemEntity> = db::select_one_by_map_compat(
         state.rb.as_ref(),
         "hq_score_item",
@@ -337,7 +369,7 @@ async fn build_review_task_item(
     .map_err(AppError::Internal)?;
 
     Ok(ReviewTaskItem {
-        id: service_item.id.unwrap_or_default(),
+        id: task.id.unwrap_or_default(),
         task_id: task.id.unwrap_or_default(),
         task_no: task.task_no.clone().unwrap_or_default(),
         task_type: task.task_type.clone().unwrap_or_default(),
@@ -348,11 +380,20 @@ async fn build_review_task_item(
         score_status: task.score_status.clone().unwrap_or_default(),
         store_name: store.store_name.unwrap_or_default(),
         dealer_name: dealer.name.unwrap_or_default(),
-        technician_name: technician.as_ref().and_then(|item| item.name.clone()).unwrap_or_default(),
-        technician_mobile: technician.as_ref().and_then(|item| item.mobile.clone()).unwrap_or_default(),
+        technician_name: technician
+            .as_ref()
+            .and_then(|item| item.name.clone())
+            .unwrap_or_default(),
+        technician_mobile: technician
+            .as_ref()
+            .and_then(|item| item.mobile.clone())
+            .unwrap_or_default(),
         customer_name: customer.name.unwrap_or_default(),
         customer_mobile: customer.mobile.unwrap_or_default(),
-        appointment_time: service_item.scheduled_time.or(task.appointment_time).map(format_datetime),
+        appointment_time: service_item
+            .scheduled_time
+            .or(task.appointment_time)
+            .map(format_datetime),
         technician_score: score_item.and_then(|item| item.score),
     })
 }
@@ -420,11 +461,20 @@ async fn load_store(state: &AppState, store_id: i64) -> Result<StoreEntity, AppE
 }
 
 async fn load_customer_address_text(state: &AppState, address_id: i64) -> Result<String, AppError> {
-    let addresses: Vec<crate::models::customer_address::CustomerAddressEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer_address", value! { "id": address_id })
+    let addresses: Vec<crate::models::customer_address::CustomerAddressEntity> =
+        db::select_by_map_compat(
+            state.rb.as_ref(),
+            "customer_address",
+            value! { "id": address_id },
+        )
         .await
         .context("failed to query customer address in hq review")
         .map_err(AppError::Internal)?;
-    Ok(addresses.into_iter().next().and_then(|item| item.address).unwrap_or_default())
+    Ok(addresses
+        .into_iter()
+        .next()
+        .and_then(|item| item.address)
+        .unwrap_or_default())
 }
 
 fn format_datetime(input: chrono::NaiveDateTime) -> String {
@@ -443,6 +493,8 @@ fn normalized_task_type_filter(value: Option<&str>) -> Result<Option<&'static st
     match value.trim().to_ascii_lowercase().as_str() {
         "三专" | "3" | "three_special" | "three-special" => Ok(Some("three_special")),
         "四专" | "4" | "four_special" | "four-special" => Ok(Some("four_special")),
-        _ => Err(AppError::BadRequest("task_type只能为三专/四专或three_special/four_special".to_string())),
+        _ => Err(AppError::BadRequest(
+            "task_type只能为三专/四专或three_special/four_special".to_string(),
+        )),
     }
 }
