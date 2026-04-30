@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
-use chrono::{Local, NaiveDateTime, Utc};
+use chrono::{Local, NaiveDateTime};
 use rbs::value;
 use serde::{Deserialize, Serialize};
 
@@ -91,10 +91,17 @@ pub struct ServiceAssignmentRequest {
 
 #[derive(Debug)]
 struct ResolvedAssignment {
+    task_id: i64,
     service_item_id: Option<i64>,
     service_type: String,
     technician_id: i64,
     from_technician_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct AssignableTaskScope {
+    task: TaskEntity,
+    service_items: Vec<TaskServiceItemEntity>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +391,7 @@ pub async fn create_task(
 
     let appointment_time = parse_datetime(&payload.appointment_time)?;
     let service_types = resolved_service_types(&payload)?;
+    let task_group_no = generate_task_group_no();
     let mut created_items = Vec::with_capacity(service_types.len());
     for service_type in service_types {
         let task_no = generate_task_no();
@@ -396,6 +404,7 @@ pub async fn create_task(
             dealer_user_id: Some(dealer_user_id),
             current_technician_id: None,
             service_type: Some(service_type.clone()),
+            task_group_no: Some(task_group_no.clone()),
             task_type: None,
             priority: Some(
                 payload
@@ -979,14 +988,18 @@ pub async fn assign_task(
         })));
     }
 
-    let service_items = load_task_service_item_entities(&state, task_id).await?;
-    let assignments = resolve_assignment_targets(&payload, &task, &service_items)?;
+    let grouped_tasks = load_grouped_assignable_tasks(&state, &task).await?;
+    let assignments = resolve_assignment_targets(&payload, &grouped_tasks)?;
     ensure_unique_assignment_targets(&assignments)?;
 
     for assignment in &assignments {
+        let assignment_task = grouped_tasks
+            .iter()
+            .find(|item| item.task.id == Some(assignment.task_id))
+            .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
         ensure_technician_assignable_for_service(
             &state,
-            &task,
+            &assignment_task.task,
             assignment.technician_id,
             &assignment.service_type,
         )
@@ -995,7 +1008,7 @@ pub async fn assign_task(
             state.rb.as_ref(),
             &TaskAssignmentEntity {
                 id: None,
-                task_id: Some(task_id),
+                task_id: Some(assignment.task_id),
                 from_technician_id: assignment.from_technician_id,
                 to_technician_id: Some(assignment.technician_id),
                 assign_type: Some("assign".to_string()),
@@ -1025,43 +1038,53 @@ pub async fn assign_task(
         }
     }
 
-    let latest_assignment = latest_task_assignment(&state, task_id).await?;
-    let updated_service_items = load_task_service_item_entities(&state, task_id).await?;
-    let all_service_items_assigned = updated_service_items.is_empty()
-        || updated_service_items
-            .iter()
-            .all(|item| item.technician_id.is_some());
-    let task_status = if all_service_items_assigned {
-        "pending_execute".to_string()
-    } else {
-        task.task_status
-            .clone()
-            .unwrap_or_else(|| "pending_assign".to_string())
-    };
-    let primary_technician_id = assignments
-        .first()
-        .map(|item| item.technician_id)
-        .ok_or_else(|| AppError::BadRequest("请选择技师".to_string()))?;
-    TaskEntity::update_by_map(
-        state.rb.as_ref(),
-        &TaskEntity {
-            current_technician_id: Some(primary_technician_id),
-            task_status: Some(task_status.clone()),
-            latest_assignment_id: latest_assignment.id,
-            ..Default::default()
-        },
-        value! { "id": task_id },
-    )
-    .await
-    .context("failed to update task assignment state")
-    .map_err(AppError::Internal)?;
+    for grouped_task in &grouped_tasks {
+        let grouped_task_id = grouped_task.task.id.unwrap_or_default();
+        let latest_assignment = latest_task_assignment(&state, grouped_task_id).await?;
+        let updated_service_items = load_task_service_item_entities(&state, grouped_task_id).await?;
+        let all_service_items_assigned = updated_service_items.is_empty()
+            || updated_service_items
+                .iter()
+                .all(|item| item.technician_id.is_some());
+        let grouped_task_status = if all_service_items_assigned {
+            "pending_execute".to_string()
+        } else {
+            grouped_task
+                .task
+                .task_status
+                .clone()
+                .unwrap_or_else(|| "pending_assign".to_string())
+        };
+        let primary_technician_id = updated_service_items
+            .first()
+            .and_then(|item| item.technician_id)
+            .or_else(|| {
+                assignments
+                    .iter()
+                    .find(|item| item.task_id == grouped_task_id)
+                    .map(|item| item.technician_id)
+            });
+        TaskEntity::update_by_map(
+            state.rb.as_ref(),
+            &TaskEntity {
+                current_technician_id: primary_technician_id,
+                task_status: Some(grouped_task_status),
+                latest_assignment_id: latest_assignment.id,
+                ..Default::default()
+            },
+            value! { "id": grouped_task_id },
+        )
+        .await
+        .context("failed to update grouped task assignment state")
+        .map_err(AppError::Internal)?;
+    }
 
     let after_task = find_task_by_id(&state, task_id).await?;
     for assignment in &assignments {
         send_task_assignment_notice(
             &state,
             assignment.technician_id,
-            task_id,
+            assignment.task_id,
             Some(assignment.service_type.as_str()),
             "task_assign",
         )
@@ -1082,7 +1105,7 @@ pub async fn assign_task(
 
     Ok(Json(ApiResponse::success(TaskActionResponse {
         task_id,
-        task_status,
+        task_status: "pending_execute".to_string(),
         service_item_id: None,
         service_type: None,
         execution_id: None,
@@ -2110,8 +2133,7 @@ fn is_legacy_whole_task_assignment(payload: &AssignTaskRequest) -> bool {
 
 fn resolve_assignment_targets(
     payload: &AssignTaskRequest,
-    task: &TaskEntity,
-    service_items: &[TaskServiceItemEntity],
+    task_scopes: &[AssignableTaskScope],
 ) -> Result<Vec<ResolvedAssignment>, AppError> {
     let mut assignments = Vec::new();
     if let Some(items) = &payload.assignments {
@@ -2122,8 +2144,7 @@ fn resolve_assignment_targets(
         }
         for item in items {
             assignments.push(resolve_assignment_target(
-                task,
-                service_items,
+                task_scopes,
                 item.service_item_id,
                 item.service_type.as_deref(),
                 item.technician_id,
@@ -2136,8 +2157,7 @@ fn resolve_assignment_targets(
         .technician_id
         .ok_or_else(|| AppError::BadRequest("请选择技师".to_string()))?;
     assignments.push(resolve_assignment_target(
-        task,
-        service_items,
+        task_scopes,
         payload.service_item_id,
         payload.service_type.as_deref(),
         technician_id,
@@ -2146,18 +2166,28 @@ fn resolve_assignment_targets(
 }
 
 fn resolve_assignment_target(
-    task: &TaskEntity,
-    service_items: &[TaskServiceItemEntity],
+    task_scopes: &[AssignableTaskScope],
     service_item_id: Option<i64>,
     service_type: Option<&str>,
     technician_id: i64,
 ) -> Result<ResolvedAssignment, AppError> {
     if let Some(service_item_id) = service_item_id {
-        let item = service_items
+        let scope = task_scopes
+            .iter()
+            .find(|scope| {
+                scope
+                    .service_items
+                    .iter()
+                    .any(|item| item.id == Some(service_item_id))
+            })
+            .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+        let item = scope
+            .service_items
             .iter()
             .find(|item| item.id == Some(service_item_id))
             .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
         return Ok(ResolvedAssignment {
+            task_id: scope.task.id.unwrap_or_default(),
             service_item_id: Some(service_item_id),
             service_type: item.service_type.clone().ok_or_else(|| {
                 AppError::Internal(anyhow!("task_service_item.service_type missing"))
@@ -2172,27 +2202,31 @@ fn resolve_assignment_target(
         .filter(|item| !item.is_empty())
         .ok_or_else(|| AppError::BadRequest("请选择服务环节".to_string()))?;
 
-    if service_items.is_empty() {
-        if task.service_type.as_deref() != Some(service_type) {
-            return Err(AppError::BadRequest("服务环节不属于当前任务".to_string()));
-        }
-        return Ok(ResolvedAssignment {
-            service_item_id: None,
-            service_type: service_type.to_string(),
-            technician_id,
-            from_technician_id: task.current_technician_id,
-        });
-    }
-
-    let item = service_items
+    let scope = task_scopes
         .iter()
-        .find(|item| item.service_type.as_deref() == Some(service_type))
+        .find(|scope| {
+            if scope.service_items.is_empty() {
+                scope.task.service_type.as_deref() == Some(service_type)
+            } else {
+                scope
+                    .service_items
+                    .iter()
+                    .any(|item| item.service_type.as_deref() == Some(service_type))
+            }
+        })
         .ok_or_else(|| AppError::BadRequest("服务环节不属于当前任务".to_string()))?;
+    let item = scope
+        .service_items
+        .iter()
+        .find(|item| item.service_type.as_deref() == Some(service_type));
     Ok(ResolvedAssignment {
-        service_item_id: item.id,
+        task_id: scope.task.id.unwrap_or_default(),
+        service_item_id: item.and_then(|item| item.id),
         service_type: service_type.to_string(),
         technician_id,
-        from_technician_id: item.technician_id,
+        from_technician_id: item
+            .and_then(|item| item.technician_id)
+            .or(scope.task.current_technician_id),
     })
 }
 
@@ -2200,6 +2234,10 @@ fn ensure_unique_assignment_targets(assignments: &[ResolvedAssignment]) -> Resul
     let mut seen = Vec::new();
     for assignment in assignments {
         let key = assignment
+            .task_id
+            .to_string()
+            + ":"
+            + &assignment
             .service_item_id
             .map(|id| format!("id:{id}"))
             .unwrap_or_else(|| format!("type:{}", assignment.service_type));
@@ -2477,6 +2515,42 @@ async fn find_task_by_task_no(state: &AppState, task_no: &str) -> Result<TaskEnt
         .ok_or_else(|| AppError::Internal(anyhow!("task create succeeded but fetch failed")))
 }
 
+async fn load_grouped_assignable_tasks(
+    state: &AppState,
+    task: &TaskEntity,
+) -> Result<Vec<AssignableTaskScope>, AppError> {
+    let tasks = if let Some(task_group_no) = task.task_group_no.as_deref() {
+        let grouped: Vec<TaskEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task",
+            value! { "task_group_no": task_group_no },
+        )
+        .await
+        .context("failed to query grouped tasks")
+        .map_err(AppError::Internal)?;
+        if grouped.is_empty() {
+            vec![task.clone()]
+        } else {
+            grouped
+        }
+    } else {
+        vec![task.clone()]
+    };
+
+    let mut scopes = Vec::with_capacity(tasks.len());
+    for item in tasks {
+        let task_id = item
+            .id
+            .ok_or_else(|| AppError::Internal(anyhow!("task.id missing")))?;
+        let service_items = load_task_service_item_entities(state, task_id).await?;
+        scopes.push(AssignableTaskScope {
+            task: item,
+            service_items,
+        });
+    }
+    Ok(scopes)
+}
+
 async fn find_task_by_id(state: &AppState, task_id: i64) -> Result<TaskEntity, AppError> {
     let tasks: Vec<TaskEntity> =
         db::select_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
@@ -2674,7 +2748,11 @@ fn format_datetime(input: NaiveDateTime) -> String {
 }
 
 fn generate_task_no() -> String {
-    format!("RW{}", Utc::now().format("%Y%m%d%H%M%S%6f"))
+    format!("RW{}", Local::now().format("%Y%m%d%H%M%S%6f"))
+}
+
+fn generate_task_group_no() -> String {
+    format!("TG{}", Local::now().format("%Y%m%d%H%M%S%6f"))
 }
 
 fn progress_percent_for_status(status: Option<&str>) -> i32 {
