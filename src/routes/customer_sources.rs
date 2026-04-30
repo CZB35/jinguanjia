@@ -8,12 +8,8 @@ use rbs::value;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth,
-    db,
-    error::AppError,
-    models::customer_source::CustomerSourceEntity,
-    response::ApiResponse,
-    state::AppState,
+    auth, db, error::AppError, models::customer_source::CustomerSourceEntity,
+    response::ApiResponse, state::AppState,
 };
 
 #[derive(Debug, Deserialize)]
@@ -71,10 +67,11 @@ pub async fn list_customer_sources(
     ensure_manage_access(&state, &headers)?;
 
     let status_filter = normalize_status_filter(query.status.as_deref())?;
-    let mut items: Vec<CustomerSourceEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer_source", value! {})
-        .await
-        .context("failed to query customer sources")
-        .map_err(AppError::Internal)?;
+    let mut items: Vec<CustomerSourceEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "customer_source", value! {})
+            .await
+            .context("failed to query customer sources")
+            .map_err(AppError::Internal)?;
 
     items.retain(|item| {
         if let Some(name) = &query.name
@@ -94,7 +91,12 @@ pub async fn list_customer_sources(
         }
         true
     });
-    items.sort_by_key(|item| (item.sort_no.unwrap_or_default(), item.id.unwrap_or_default()));
+    items.sort_by_key(|item| {
+        (
+            item.sort_no.unwrap_or_default(),
+            item.id.unwrap_or_default(),
+        )
+    });
 
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
@@ -169,7 +171,11 @@ pub async fn create_customer_source(
     .await
     .context("failed to fetch created customer source")
     .map_err(AppError::Internal)?
-    .ok_or_else(|| AppError::Internal(anyhow::anyhow!("customer source create succeeded but fetch failed")))?;
+    .ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "customer source create succeeded but fetch failed"
+        ))
+    })?;
 
     Ok(Json(ApiResponse::success(map_customer_source_item(item))))
 }
@@ -234,15 +240,24 @@ pub async fn delete_customer_source(
         .context("failed to delete customer source")
         .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
-async fn find_customer_source(state: &AppState, source_id: i64) -> Result<CustomerSourceEntity, AppError> {
-    db::select_one_by_map_compat(state.rb.as_ref(), "customer_source", value! { "id": source_id })
-        .await
-        .context("failed to query customer source by id")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::NotFound("客户来源不存在".to_string()))
+async fn find_customer_source(
+    state: &AppState,
+    source_id: i64,
+) -> Result<CustomerSourceEntity, AppError> {
+    db::select_one_by_map_compat(
+        state.rb.as_ref(),
+        "customer_source",
+        value! { "id": source_id },
+    )
+    .await
+    .context("failed to query customer source by id")
+    .map_err(AppError::Internal)?
+    .ok_or_else(|| AppError::NotFound("客户来源不存在".to_string()))
 }
 
 async fn ensure_customer_source_name_unique(
@@ -289,7 +304,7 @@ async fn ensure_customer_source_code_unique(
 
 fn ensure_manage_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let auth_user = auth::authenticate(state, headers)?;
-    auth_user.require_any_role(&["super_admin", "hq_reviewer"])
+    auth_user.require_any_role(&["dealer", "super_admin", "hq_reviewer"])
 }
 
 fn map_customer_source_item(item: CustomerSourceEntity) -> CustomerSourceItem {
@@ -319,10 +334,17 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
 }
 
 fn normalize_status(raw: Option<&str>) -> Result<String, AppError> {
-    match raw.unwrap_or("enabled").trim().to_ascii_lowercase().as_str() {
+    match raw
+        .unwrap_or("enabled")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "enabled" | "active" => Ok("enabled".to_string()),
         "disabled" | "inactive" => Ok("disabled".to_string()),
-        _ => Err(AppError::BadRequest("status只能为enabled/disabled或active/inactive".to_string())),
+        _ => Err(AppError::BadRequest(
+            "status只能为enabled/disabled或active/inactive".to_string(),
+        )),
     }
 }
 
