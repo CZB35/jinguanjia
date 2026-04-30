@@ -41,6 +41,7 @@ pub fn router() -> Router<AppState> {
             "/me/profile",
             get(me::get_profile).patch(me::update_profile),
         )
+        .route("/me/avatar", post(me::upload_avatar))
         .route("/me/password", patch(me::update_password))
         .route("/me/permissions", get(me::get_permissions))
         .route(

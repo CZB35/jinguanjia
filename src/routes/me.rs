@@ -1,5 +1,9 @@
 use anyhow::Context;
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{
+    Json,
+    extract::{Multipart, State},
+    http::HeaderMap,
+};
 use bcrypt::hash;
 use chrono::Datelike;
 use rbs::value;
@@ -15,6 +19,7 @@ use crate::{
     },
     response::ApiResponse,
     state::AppState,
+    storage,
 };
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +78,14 @@ pub struct MessageSettingsResponse {
     pub review_reminder_enabled: bool,
     pub sms_enabled: bool,
     pub wechat_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AvatarUploadResponse {
+    pub file_name: String,
+    pub file_url: String,
+    pub file_size: i64,
+    pub mime_type: String,
 }
 
 pub async fn get_message_settings(
@@ -208,6 +221,33 @@ pub async fn update_password(
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "ok": true }),
     )))
+}
+
+pub async fn upload_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Json<ApiResponse<AvatarUploadResponse>>, AppError> {
+    let _auth_user = auth::authenticate(&state, &headers)?;
+    let upload = read_single_multipart(multipart).await?;
+    validate_avatar_upload(&upload.file_name, upload.content_type.as_deref())?;
+
+    let stored = storage::save_bytes(
+        &state,
+        "avatars",
+        &upload.file_name,
+        upload.content_type.as_deref(),
+        &upload.bytes,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(ApiResponse::success(AvatarUploadResponse {
+        file_name: stored.original_name,
+        file_url: storage::public_url(&stored.relative_path),
+        file_size: stored.file_size,
+        mime_type: stored.mime_type,
+    })))
 }
 
 pub async fn get_permissions(
@@ -366,6 +406,55 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
+}
+
+#[derive(Debug)]
+struct UploadField {
+    file_name: String,
+    content_type: Option<String>,
+    bytes: Vec<u8>,
+}
+
+async fn read_single_multipart(mut multipart: Multipart) -> Result<UploadField, AppError> {
+    let field = multipart
+        .next_field()
+        .await
+        .context("failed to read avatar multipart field")
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::BadRequest("请上传文件".to_string()))?;
+
+    let file_name = field
+        .file_name()
+        .map(ToString::to_string)
+        .ok_or_else(|| AppError::BadRequest("上传文件名不能为空".to_string()))?;
+    let content_type = field.content_type().map(ToString::to_string);
+    let bytes = field
+        .bytes()
+        .await
+        .context("failed to read avatar upload bytes")
+        .map_err(AppError::Internal)?
+        .to_vec();
+
+    Ok(UploadField {
+        file_name,
+        content_type,
+        bytes,
+    })
+}
+
+fn validate_avatar_upload(file_name: &str, content_type: Option<&str>) -> Result<(), AppError> {
+    let ext = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content_type = content_type.unwrap_or("");
+    let ok = ["jpg", "jpeg", "png", "webp"].contains(&ext.as_str())
+        || content_type.starts_with("image/");
+    if !ok {
+        return Err(AppError::BadRequest("当前文件格式不支持上传".to_string()));
+    }
+    Ok(())
 }
 
 async fn find_user(state: &AppState, user_id: i64) -> Result<UserEntity, AppError> {
