@@ -1,9 +1,5 @@
 use anyhow::{Context, anyhow};
-use axum::{
-    Json,
-    extract::State,
-    http::HeaderMap,
-};
+use axum::{Json, extract::State, http::HeaderMap};
 use bcrypt::verify;
 use chrono::Utc;
 use rbs::value;
@@ -61,6 +57,7 @@ pub struct CurrentUserPayload {
     pub id: i64,
     pub name: String,
     pub mobile: String,
+    pub avatar_url: Option<String>,
     pub roles: Vec<String>,
     pub current_role: String,
     pub switchable: bool,
@@ -90,7 +87,9 @@ pub async fn login_by_password(
 
     let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
     if roles.is_empty() {
-        return Err(AppError::Forbidden("账号未分配角色，请联系管理员".to_string()));
+        return Err(AppError::Forbidden(
+            "账号未分配角色，请联系管理员".to_string(),
+        ));
     }
 
     let current_role = resolve_current_role(&roles, payload.role_code.as_deref())?;
@@ -153,7 +152,9 @@ pub async fn send_login_code(
         return Err(AppError::BadRequest("请输入手机号".to_string()));
     }
 
-    let user = find_user_by_mobile(&state, &payload.mobile).await.map_err(|_| AppError::BadRequest("账号不存在，请联系管理员创建账号".to_string()))?;
+    let user = find_user_by_mobile(&state, &payload.mobile)
+        .await
+        .map_err(|_| AppError::BadRequest("账号不存在，请联系管理员创建账号".to_string()))?;
     ensure_user_loginable(&user)?;
 
     let now = Utc::now().timestamp();
@@ -161,7 +162,9 @@ pub async fn send_login_code(
     if let Some(existing) = store.get(&payload.mobile)
         && now - existing.sent_at < 60
     {
-        return Err(AppError::BadRequest("验证码发送过于频繁，请稍后重试".to_string()));
+        return Err(AppError::BadRequest(
+            "验证码发送过于频繁，请稍后重试".to_string(),
+        ));
     }
 
     let code = format!("{:06}", (now.rem_euclid(1_000_000)));
@@ -210,7 +213,9 @@ pub async fn login_by_code(
 
     let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
     if roles.is_empty() {
-        return Err(AppError::Forbidden("账号未分配角色，请联系管理员".to_string()));
+        return Err(AppError::Forbidden(
+            "账号未分配角色，请联系管理员".to_string(),
+        ));
     }
     let current_role = resolve_current_role(&roles, payload.role_code.as_deref())?;
     let token_pair = auth::issue_token_pair(
@@ -253,6 +258,7 @@ pub async fn current_user(
         id: user.id.unwrap_or_default(),
         name: user.name.unwrap_or_default(),
         mobile: user.mobile.unwrap_or_default(),
+        avatar_url: user.avatar_url.clone(),
         switchable: roles.len() > 1,
         roles,
         current_role,
@@ -306,12 +312,17 @@ fn ensure_user_loginable(user: &UserEntity) -> Result<(), AppError> {
         return Err(AppError::NotFound("用户不存在或已删除".to_string()));
     }
     if user.status.as_deref() == Some("disabled") {
-        return Err(AppError::Forbidden("账号已被禁用，请联系管理员".to_string()));
+        return Err(AppError::Forbidden(
+            "账号已被禁用，请联系管理员".to_string(),
+        ));
     }
     Ok(())
 }
 
-fn resolve_current_role(roles: &[String], requested_role: Option<&str>) -> Result<String, AppError> {
+fn resolve_current_role(
+    roles: &[String],
+    requested_role: Option<&str>,
+) -> Result<String, AppError> {
     if let Some(role) = requested_role {
         if roles.iter().any(|item| item == role) {
             return Ok(role.to_string());
@@ -346,6 +357,7 @@ fn build_login_response(
                 .mobile
                 .clone()
                 .ok_or_else(|| AppError::Internal(anyhow!("user.mobile is missing")))?,
+            avatar_url: user.avatar_url.clone(),
             switchable: roles.len() > 1,
             roles,
             current_role,
@@ -355,10 +367,11 @@ fn build_login_response(
 }
 
 async fn find_user_by_mobile(state: &AppState, mobile: &str) -> Result<UserEntity, AppError> {
-    let users: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": mobile })
-        .await
-        .context("failed to query user by mobile")
-        .map_err(AppError::Internal)?;
+    let users: Vec<UserEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": mobile })
+            .await
+            .context("failed to query user by mobile")
+            .map_err(AppError::Internal)?;
 
     users
         .into_iter()
@@ -367,10 +380,11 @@ async fn find_user_by_mobile(state: &AppState, mobile: &str) -> Result<UserEntit
 }
 
 async fn find_user_by_id(state: &AppState, user_id: i64) -> Result<UserEntity, AppError> {
-    let users: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "id": user_id })
-        .await
-        .context("failed to query user by id")
-        .map_err(AppError::Internal)?;
+    let users: Vec<UserEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "user", value! { "id": user_id })
+            .await
+            .context("failed to query user by id")
+            .map_err(AppError::Internal)?;
 
     users
         .into_iter()
@@ -380,22 +394,33 @@ async fn find_user_by_id(state: &AppState, user_id: i64) -> Result<UserEntity, A
 
 async fn find_role_codes(state: &AppState, user_id: Option<i64>) -> Result<Vec<String>, AppError> {
     let user_id = user_id.ok_or_else(|| AppError::Internal(anyhow!("user.id is missing")))?;
-    let user_roles: Vec<UserRoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_role", value! { "user_id": user_id })
-        .await
-        .context("failed to query user roles")
-        .map_err(AppError::Internal)?;
+    let user_roles: Vec<UserRoleEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_role",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query user roles")
+    .map_err(AppError::Internal)?;
 
-    let role_ids: Vec<i64> = user_roles.into_iter().filter_map(|item| item.role_id).collect();
+    let role_ids: Vec<i64> = user_roles
+        .into_iter()
+        .filter_map(|item| item.role_id)
+        .collect();
     if role_ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let roles: Vec<RoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "role", value! { "id": role_ids })
-        .await
-        .context("failed to query roles")
-        .map_err(AppError::Internal)?;
+    let roles: Vec<RoleEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "role", value! { "id": role_ids })
+            .await
+            .context("failed to query roles")
+            .map_err(AppError::Internal)?;
 
-    Ok(roles.into_iter().filter_map(|item| item.role_code).collect())
+    Ok(roles
+        .into_iter()
+        .filter_map(|item| item.role_code)
+        .collect())
 }
 
 fn sort_roles_by_priority(mut roles: Vec<String>) -> Vec<String> {
