@@ -40,6 +40,7 @@ SET `permission_name` = CASE `permission_code`
   WHEN 'settings:permissions:delete' THEN '删除'
   WHEN 'settings:privacy-policy' THEN '隐私协议'
   WHEN 'settings:user-agreement' THEN '用户协议'
+  WHEN 'settings:project-settings' THEN '项目设置'
   WHEN 'master-data' THEN '基础资料'
   WHEN 'master-data:stores' THEN '门店信息'
   WHEN 'master-data:stores:create' THEN '新增'
@@ -61,7 +62,7 @@ WHERE `permission_code` IN (
   'users:staff', 'users:staff:create', 'users:staff:update', 'users:staff:delete',
   'settings', 'settings:roles', 'settings:roles:create', 'settings:roles:update', 'settings:roles:delete',
   'settings:permissions', 'settings:permissions:create', 'settings:permissions:update', 'settings:permissions:delete',
-  'settings:privacy-policy', 'settings:user-agreement',
+  'settings:privacy-policy', 'settings:user-agreement', 'settings:project-settings',
   'master-data', 'master-data:stores', 'master-data:stores:create', 'master-data:stores:update', 'master-data:stores:delete',
   'master-data:sources', 'master-data:sources:create', 'master-data:sources:update', 'master-data:sources:delete'
 );

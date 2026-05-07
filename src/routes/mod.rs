@@ -217,6 +217,10 @@ pub fn router() -> Router<AppState> {
             get(system::get_configs).patch(system::update_configs),
         )
         .route(
+            "/system/project-settings",
+            get(system::get_project_settings).patch(system::save_project_settings),
+        )
+        .route(
             "/system/agreements/user",
             get(system::get_user_agreement).patch(system::save_user_agreement),
         )
