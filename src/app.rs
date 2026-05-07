@@ -6,12 +6,14 @@ use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{config::AppConfig, db, routes, state::AppState};
+use crate::{config::AppConfig, db, routes, state::AppState, storage};
 
 pub async fn bootstrap() -> Result<()> {
     init_tracing();
 
     let config = AppConfig::from_env()?;
+    let upload_root = storage::resolve_upload_root(&config.storage.upload_dir);
+    std::fs::create_dir_all(&upload_root)?;
     let rb = db::init_rbatis(&config.database.url).await?;
     let addr = config.server.socket_addr()?;
     let state = AppState::new(config.clone(), rb);
@@ -38,7 +40,7 @@ fn init_tracing() {
 }
 
 fn build_router(state: AppState) -> Router {
-    let upload_service = ServeDir::new(state.config.storage.upload_dir.clone());
+    let upload_service = ServeDir::new(storage::resolve_upload_root(&state.config.storage.upload_dir));
     Router::new()
         .nest("/api", routes::router())
         .nest_service("/uploads", upload_service)
@@ -49,7 +51,11 @@ fn build_router(state: AppState) -> Router {
 }
 
 async fn force_utf8_json(mut response: Response) -> Response {
-    if let Some(content_type) = response.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
+    if let Some(content_type) = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
         if content_type.starts_with("application/json") && !content_type.contains("charset=") {
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
