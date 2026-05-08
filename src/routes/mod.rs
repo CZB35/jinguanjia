@@ -42,6 +42,8 @@ pub fn router() -> Router<AppState> {
             get(me::get_profile).patch(me::update_profile),
         )
         .route("/me/avatar", post(me::upload_avatar))
+        .route("/me/wechat-bind-url", get(me::get_wechat_bind_url))
+        .route("/me/wechat-binding", get(me::get_wechat_binding_status))
         .route("/me/password", patch(me::update_password))
         .route("/me/permissions", get(me::get_permissions))
         .route(
@@ -255,6 +257,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/agreements/user", get(system::get_user_agreement))
         .route("/agreements/privacy", get(system::get_privacy_policy))
+        .route(
+            "/wechat/service-account/callback",
+            get(me::wechat_service_account_callback),
+        )
         .route(
             "/standards/{serviceType}",
             get(standards::get_standard_by_service_type),

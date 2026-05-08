@@ -1,9 +1,5 @@
 use anyhow::Context;
-use axum::{
-    Json,
-    extract::{Multipart, State},
-    http::HeaderMap,
-};
+use axum::{Json, extract::{Multipart, Query, State}, http::HeaderMap};
 use bcrypt::hash;
 use chrono::Datelike;
 use rbs::value;
@@ -20,6 +16,7 @@ use crate::{
     response::ApiResponse,
     state::AppState,
     storage,
+    wechat,
 };
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +83,17 @@ pub struct AvatarUploadResponse {
     pub file_url: String,
     pub file_size: i64,
     pub mime_type: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WechatBindUrlResponse {
+    pub bind_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WechatServiceAccountCallbackQuery {
+    pub code: String,
+    pub state: String,
 }
 
 pub async fn get_message_settings(
@@ -221,6 +229,46 @@ pub async fn update_password(
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "ok": true }),
     )))
+}
+
+pub async fn get_wechat_bind_url(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<WechatBindUrlResponse>>, AppError> {
+    let auth_user = auth::authenticate(&state, &headers)?;
+    let bind_url = wechat::build_service_account_bind_url(&state, auth_user.user_id).await?;
+    Ok(Json(ApiResponse::success(WechatBindUrlResponse { bind_url })))
+}
+
+pub async fn get_wechat_binding_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<wechat::WechatBindStatus>>, AppError> {
+    let auth_user = auth::authenticate(&state, &headers)?;
+    Ok(Json(ApiResponse::success(
+        wechat::get_bind_status(&state, auth_user.user_id).await?,
+    )))
+}
+
+pub async fn wechat_service_account_callback(
+    State(state): State<AppState>,
+    Query(query): Query<WechatServiceAccountCallbackQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let claims = wechat::decode_bind_state_token(&state.config, &query.state)
+        .map_err(AppError::Internal)?;
+    let oauth = wechat::exchange_service_account_oauth_code(&state, &query.code).await?;
+    let openid = oauth
+        .openid
+        .as_deref()
+        .ok_or_else(|| AppError::Conflict("微信服务号授权返回缺少openid".to_string()))?;
+    wechat::bind_service_account_user(&state, claims.sub, openid, oauth.unionid.as_deref()).await?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "ok": true,
+        "user_id": claims.sub,
+        "wechat_bound": true,
+        "wechat_openid": openid,
+    }))))
 }
 
 pub async fn upload_avatar(

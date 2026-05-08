@@ -1,7 +1,8 @@
 use anyhow::Context;
 use chrono::Utc;
+use rbs::value;
 
-use crate::{error::AppError, models::notice::NoticeEntity, state::AppState};
+use crate::{error::AppError, models::notice::NoticeEntity, state::AppState, wechat};
 
 pub async fn create_notice(
     state: &AppState,
@@ -31,5 +32,17 @@ pub async fn create_notice(
     .await
     .context("failed to create notice")
     .map_err(AppError::Internal)?;
+
+    let notice = crate::db::select_one_by_map_compat::<NoticeEntity>(
+        state.rb.as_ref(),
+        "notice",
+        value! { "receiver_id": receiver_id, "biz_type": biz_type, "biz_id": biz_id, "title": title },
+    )
+    .await
+    .context("failed to fetch created notice")
+    .map_err(AppError::Internal)?;
+    if let Some(notice) = notice {
+        let _ = wechat::enqueue_wechat_notice(state, &notice).await;
+    }
     Ok(())
 }

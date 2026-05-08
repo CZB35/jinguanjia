@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{config::AppConfig, db, routes, state::AppState, storage};
+use crate::{config::AppConfig, db, routes, state::AppState, storage, wechat};
 
 pub async fn bootstrap() -> Result<()> {
     init_tracing();
@@ -17,6 +17,7 @@ pub async fn bootstrap() -> Result<()> {
     let rb = db::init_rbatis(&config.database.url).await?;
     let addr = config.server.socket_addr()?;
     let state = AppState::new(config.clone(), rb);
+    wechat::start_notice_delivery_worker(state.clone()).await;
     let app = build_router(state);
 
     tracing::info!(

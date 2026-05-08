@@ -8,8 +8,9 @@ mod models;
 mod notify;
 mod response;
 mod routes;
-mod storage;
 mod state;
+mod storage;
+mod wechat;
 
 use anyhow::Result;
 
