@@ -11,7 +11,8 @@ use crate::{
     auth, db,
     error::AppError,
     models::{
-        customer::CustomerEntity, customer_address::CustomerAddressEntity, task::TaskEntity,
+        customer::CustomerEntity, customer_address::CustomerAddressEntity,
+        customer_source::CustomerSourceEntity, task::TaskEntity,
         task_service_item::TaskServiceItemEntity, user::UserEntity,
     },
     response::ApiResponse,
@@ -34,9 +35,11 @@ pub struct CreateCustomerRequest {
     pub name: String,
     pub mobile: String,
     pub source: Option<String>,
+    pub source_id: Option<i64>,
+    pub customer_source_id: Option<i64>,
     pub remark: Option<String>,
-    #[serde(default, alias = "store_id")]
     pub primary_store_id: Option<i64>,
+    pub store_id: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_optional_address_payload")]
     pub address: Option<AddressPayload>,
 }
@@ -45,9 +48,11 @@ pub struct CreateCustomerRequest {
 pub struct UpdateCustomerRequest {
     pub name: Option<String>,
     pub source: Option<String>,
+    pub source_id: Option<i64>,
+    pub customer_source_id: Option<i64>,
     pub remark: Option<String>,
-    #[serde(default, alias = "store_id")]
     pub primary_store_id: Option<i64>,
+    pub store_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -310,8 +315,18 @@ pub async fn create_customer(
         return Err(AppError::Conflict("该手机号客户已存在".to_string()));
     }
 
-    let primary_store_id =
-        resolve_customer_store_id(&state, &auth_user, payload.primary_store_id).await?;
+    let primary_store_id = resolve_customer_store_id(
+        &state,
+        &auth_user,
+        payload.primary_store_id.or(payload.store_id),
+    )
+    .await?;
+    let source = resolve_customer_source_value(
+        &state,
+        payload.source,
+        payload.source_id.or(payload.customer_source_id),
+    )
+    .await?;
 
     CustomerEntity::insert(
         state.rb.as_ref(),
@@ -319,10 +334,7 @@ pub async fn create_customer(
             id: None,
             name: Some(payload.name.clone()),
             mobile: Some(payload.mobile.clone()),
-            source: payload
-                .source
-                .clone()
-                .or_else(|| Some("manual".to_string())),
+            source: source.or_else(|| Some("manual".to_string())),
             remark: payload.remark.clone(),
             primary_store_id,
             created_by: Some(auth_user.user_id),
@@ -376,17 +388,28 @@ pub async fn update_customer(
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
     let existing_customer = find_customer(&state, customer_id).await?;
-    let primary_store_id = if payload.primary_store_id.is_some() {
-        resolve_customer_store_id(&state, &auth_user, payload.primary_store_id).await?
+    let requested_store_id = payload.primary_store_id.or(payload.store_id);
+    let primary_store_id = if requested_store_id.is_some() {
+        resolve_customer_store_id(&state, &auth_user, requested_store_id).await?
     } else {
         existing_customer.primary_store_id
+    };
+    let source = if payload.source.is_some() || payload.source_id.is_some() || payload.customer_source_id.is_some() {
+        resolve_customer_source_value(
+            &state,
+            payload.source.clone(),
+            payload.source_id.or(payload.customer_source_id),
+        )
+        .await?
+    } else {
+        existing_customer.source.clone()
     };
 
     CustomerEntity::update_by_map(
         state.rb.as_ref(),
         &CustomerEntity {
             name: payload.name.clone(),
-            source: payload.source.clone(),
+            source,
             remark: payload.remark.clone(),
             primary_store_id,
             ..Default::default()
@@ -699,6 +722,34 @@ async fn load_user_name(state: &AppState, user_id: i64) -> Result<String, AppErr
     .context("failed to query user name for customer history")
     .map_err(AppError::Internal)?;
     Ok(user.and_then(|item| item.name).unwrap_or_default())
+}
+
+async fn resolve_customer_source_value(
+    state: &AppState,
+    source: Option<String>,
+    source_id: Option<i64>,
+) -> Result<Option<String>, AppError> {
+    if let Some(source) = source
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+    {
+        return Ok(Some(source));
+    }
+    let Some(source_id) = source_id else {
+        return Ok(None);
+    };
+
+    let customer_source = db::select_one_by_map_compat::<CustomerSourceEntity>(
+        state.rb.as_ref(),
+        "customer_source",
+        value! { "id": source_id },
+    )
+    .await
+    .context("failed to query customer source by id")
+    .map_err(AppError::Internal)?
+    .ok_or_else(|| AppError::BadRequest("客户来源不存在".to_string()))?;
+
+    Ok(customer_source.code.or(customer_source.name))
 }
 
 async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>, AppError> {
