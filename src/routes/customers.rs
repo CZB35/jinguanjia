@@ -47,12 +47,18 @@ pub struct CreateCustomerRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateCustomerRequest {
     pub name: Option<String>,
+    pub mobile: Option<String>,
     pub source: Option<String>,
     pub source_id: Option<i64>,
     pub customer_source_id: Option<i64>,
     pub remark: Option<String>,
     pub primary_store_id: Option<i64>,
     pub store_id: Option<i64>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_address_payload")]
+    pub address: Option<AddressPayload>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -395,6 +401,27 @@ pub async fn update_customer(
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
     let existing_customer = find_customer(&state, customer_id).await?;
+    let next_mobile = match payload.mobile.as_deref() {
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(AppError::BadRequest("请输入客户手机号".to_string()));
+            }
+            let exists: Vec<CustomerEntity> = db::select_by_map_compat(
+                state.rb.as_ref(),
+                "customer",
+                value! { "mobile": value },
+            )
+            .await
+            .context("failed to query existing customer mobile during update")
+            .map_err(AppError::Internal)?;
+            if exists.into_iter().any(|item| item.id != Some(customer_id)) {
+                return Err(AppError::Conflict("该手机号客户已存在".to_string()));
+            }
+            Some(value.to_string())
+        }
+        None => existing_customer.mobile.clone(),
+    };
     let requested_store_id = payload.primary_store_id.or(payload.store_id);
     let primary_store_id = if requested_store_id.is_some() {
         resolve_customer_store_id(&state, &auth_user, requested_store_id).await?
@@ -411,21 +438,83 @@ pub async fn update_customer(
     } else {
         existing_customer.source.clone()
     };
+    let has_address_update = payload.address.is_some()
+        || payload.province.as_deref().map(str::trim).filter(|item| !item.is_empty()).is_some()
+        || payload.city.as_deref().map(str::trim).filter(|item| !item.is_empty()).is_some()
+        || payload.district.as_deref().map(str::trim).filter(|item| !item.is_empty()).is_some();
 
     CustomerEntity::update_by_map(
         state.rb.as_ref(),
         &CustomerEntity {
             name: payload.name.clone(),
+            mobile: next_mobile,
             source,
             remark: payload.remark.clone(),
             primary_store_id,
             ..Default::default()
         },
-        value! { "id": customer_id, "column": ["name", "source", "remark", "primary_store_id"] },
+        value! { "id": customer_id, "column": ["name", "mobile", "source", "remark", "primary_store_id"] },
     )
     .await
     .context("failed to update customer")
     .map_err(AppError::Internal)?;
+
+    if has_address_update {
+        let address_payload = payload.address.unwrap_or_else(|| AddressPayload {
+            province: payload.province.clone(),
+            city: payload.city.clone(),
+            district: payload.district.clone(),
+            detail: String::new(),
+        });
+        let detail = address_payload.detail.trim().to_string();
+        if detail.is_empty() {
+            return Err(AppError::BadRequest("请输入详细地址".to_string()));
+        }
+
+        let existing_addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "customer_address",
+            value! { "customer_id": customer_id },
+        )
+        .await
+        .context("failed to query customer addresses during update")
+        .map_err(AppError::Internal)?;
+
+        if let Some(default_address) = existing_addresses.iter().find(|item| item.is_default == Some(1)).or_else(|| existing_addresses.first()) {
+            CustomerAddressEntity::update_by_map(
+                state.rb.as_ref(),
+                &CustomerAddressEntity {
+                    province: address_payload.province.clone(),
+                    city: address_payload.city.clone(),
+                    district: address_payload.district.clone(),
+                    address: Some(detail),
+                    is_default: Some(1),
+                    ..Default::default()
+                },
+                value! { "id": default_address.id.unwrap_or_default(), "column": ["province", "city", "district", "address", "is_default"] },
+            )
+            .await
+            .context("failed to update customer address")
+            .map_err(AppError::Internal)?;
+        } else {
+            CustomerAddressEntity::insert(
+                state.rb.as_ref(),
+                &CustomerAddressEntity {
+                    id: None,
+                    customer_id: Some(customer_id),
+                    province: address_payload.province.clone(),
+                    city: address_payload.city.clone(),
+                    district: address_payload.district.clone(),
+                    address: Some(detail),
+                    is_default: Some(1),
+                    created_at: None,
+                },
+            )
+            .await
+            .context("failed to insert customer address during update")
+            .map_err(AppError::Internal)?;
+        }
+    }
 
     get_customer_detail_inner(&state, customer_id).await
 }
