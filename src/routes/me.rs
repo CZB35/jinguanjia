@@ -680,6 +680,13 @@ async fn build_profile_response(
     } else {
         (completed_count as f64 / task_count as f64) * 100.0
     };
+    let job_no = user.job_no.clone().unwrap_or_else(|| {
+        if is_technician_only {
+            format!("SF{:08}", user_id)
+        } else {
+            format!("DL-{:08}", user_id)
+        }
+    });
 
     Ok(ProfileResponse {
         id: user_id,
@@ -689,7 +696,7 @@ async fn build_profile_response(
         email: user.email,
         avatar_url: user.avatar_url,
         status: user.status.unwrap_or_else(|| "enabled".to_string()),
-        job_no: format!("DL-{:08}", user_id),
+        job_no,
         role_names,
         store_id: primary_store_id,
         store_ids,
