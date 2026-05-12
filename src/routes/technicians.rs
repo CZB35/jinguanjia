@@ -90,6 +90,7 @@ pub struct TechnicianItem {
     pub avatar_url: Option<String>,
     pub job_no: Option<String>,
     pub status: String,
+    pub status_text: String,
     pub role_names: Vec<String>,
     pub store_names: Vec<String>,
     pub work_status: String,
@@ -133,6 +134,7 @@ pub struct TechnicianDetailResponse {
     pub emergency_contact_name: Option<String>,
     pub emergency_contact_mobile: Option<String>,
     pub status: String,
+    pub status_text: String,
     pub store_ids: Vec<i64>,
     pub store_names: Vec<String>,
     pub role_names: Vec<String>,
@@ -288,7 +290,8 @@ pub async fn list_technicians(
             mobile: user.mobile.unwrap_or_default(),
             avatar_url: user.avatar_url.clone(),
             job_no: user.job_no.clone(),
-            status: user.status.unwrap_or_else(|| "enabled".to_string()),
+            status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+            status_text: technician_status_text(user.status.as_deref()).to_string(),
             role_names,
             store_names,
             work_status: stats.work_status,
@@ -399,6 +402,11 @@ pub async fn create_technician(
             created_at: None,
             updated_at: None,
             deleted_at: None,
+            wechat_openid: None,
+            wechat_unionid: None,
+            wechat_subscribe: Some(0),
+            wechat_bind_at: None,
+            wechat_subscribe_updated_at: None,
         },
     )
     .await
@@ -706,7 +714,8 @@ async fn available_technicians_for_service(
             mobile: user.mobile.unwrap_or_default(),
             avatar_url: user.avatar_url.clone(),
             job_no: user.job_no.clone(),
-            status: user.status.unwrap_or_else(|| "enabled".to_string()),
+            status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+            status_text: technician_status_text(user.status.as_deref()).to_string(),
             role_names: vec!["技师".to_string()],
             store_names: vec![store_name.to_string()],
             work_status: "idle".to_string(),
@@ -783,6 +792,14 @@ fn service_type_label(service_type: &str) -> &'static str {
     }
 }
 
+fn technician_status_text(status: Option<&str>) -> &'static str {
+    match status.unwrap_or("enabled") {
+        "enabled" | "active" => "已启用",
+        "disabled" | "inactive" => "已禁用",
+        _ => "未知状态",
+    }
+}
+
 async fn get_technician_detail_inner(
     state: &AppState,
     technician_id: i64,
@@ -836,7 +853,8 @@ async fn get_technician_detail_inner(
         id_card: user.id_card,
         emergency_contact_name: user.emergency_contact_name,
         emergency_contact_mobile: user.emergency_contact_mobile,
-        status: user.status.unwrap_or_else(|| "enabled".to_string()),
+        status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+        status_text: technician_status_text(user.status.as_deref()).to_string(),
         store_ids,
         store_names,
         role_names,

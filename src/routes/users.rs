@@ -9,10 +9,12 @@ use rbs::value;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
-    models::{role::RoleEntity, store::StoreEntity, task::TaskEntity, user::UserEntity, user_role::UserRoleEntity, user_store::UserStoreEntity},
+    models::{
+        role::RoleEntity, store::StoreEntity, task::TaskEntity, user::UserEntity,
+        user_role::UserRoleEntity, user_store::UserStoreEntity,
+    },
     response::ApiResponse,
     state::AppState,
 };
@@ -60,6 +62,7 @@ pub struct UserItem {
     pub name: String,
     pub mobile: String,
     pub status: String,
+    pub status_text: String,
     pub roles: Vec<String>,
     pub store_names: Vec<String>,
     pub technician_count: usize,
@@ -81,6 +84,7 @@ pub struct UserDetailResponse {
     pub email: Option<String>,
     pub avatar_url: Option<String>,
     pub status: String,
+    pub status_text: String,
     pub roles: Vec<String>,
     pub store_ids: Vec<i64>,
     pub store_names: Vec<String>,
@@ -124,32 +128,46 @@ pub async fn list_users(
         let user_id = user.id.unwrap_or_default();
         let roles = find_role_codes(&state, user_id).await?;
         if let Some(role_code) = &query.role_code
-            && !roles.iter().any(|role| role == &normalize_role_code_alias(role_code))
+            && !roles
+                .iter()
+                .any(|role| role == &normalize_role_code_alias(role_code))
         {
             continue;
         }
-        let user_stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
-            .await
-            .context("failed to query user stores in list_users")
-            .map_err(AppError::Internal)?;
-        let store_ids: Vec<i64> = user_stores.into_iter().filter_map(|item| item.store_id).collect();
+        let user_stores: Vec<UserStoreEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "user_store",
+            value! { "user_id": user_id },
+        )
+        .await
+        .context("failed to query user stores in list_users")
+        .map_err(AppError::Internal)?;
+        let store_ids: Vec<i64> = user_stores
+            .into_iter()
+            .filter_map(|item| item.store_id)
+            .collect();
         let store_names = if store_ids.is_empty() {
             Vec::new()
         } else {
-            db::select_by_map_compat::<StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
-                .await
-                .context("failed to query store names in list_users")
-                .map_err(AppError::Internal)?
-                .into_iter()
-                .filter_map(|item| item.store_name)
-                .collect::<Vec<_>>()
+            db::select_by_map_compat::<StoreEntity>(
+                state.rb.as_ref(),
+                "store",
+                value! { "id": store_ids.clone() },
+            )
+            .await
+            .context("failed to query store names in list_users")
+            .map_err(AppError::Internal)?
+            .into_iter()
+            .filter_map(|item| item.store_name)
+            .collect::<Vec<_>>()
         };
         let stats = aggregate_store_scope_stats(&state, &store_ids).await?;
         items.push(UserItem {
             id: user_id,
             name: user.name.unwrap_or_default(),
             mobile: user.mobile.unwrap_or_default(),
-            status: user.status.unwrap_or_else(|| "enabled".to_string()),
+            status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+            status_text: user_status_text(user.status.as_deref()).to_string(),
             roles,
             store_names,
             technician_count: stats.technician_count,
@@ -159,7 +177,10 @@ pub async fn list_users(
     }
     let total = items.len();
 
-    Ok(Json(ApiResponse::success(UserListResponse { items, total })))
+    Ok(Json(ApiResponse::success(UserListResponse {
+        items,
+        total,
+    })))
 }
 
 pub async fn get_user_detail(
@@ -191,13 +212,24 @@ pub async fn create_user(
         return Err(AppError::BadRequest("请至少分配一个角色".to_string()));
     }
 
-    let normalized_role_codes = payload.role_codes.iter().map(|item| normalize_role_code_alias(item)).collect::<Vec<_>>();
-    let store_ids = validate_user_store_binding(&normalized_role_codes, payload.store_ids.clone().unwrap_or_default())?;
+    let normalized_role_codes = payload
+        .role_codes
+        .iter()
+        .map(|item| normalize_role_code_alias(item))
+        .collect::<Vec<_>>();
+    let store_ids = validate_user_store_binding(
+        &normalized_role_codes,
+        payload.store_ids.clone().unwrap_or_default(),
+    )?;
 
-    let exists: Vec<UserEntity> = db::select_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": payload.mobile.as_str() })
-        .await
-        .context("failed to query existing user by mobile")
-        .map_err(AppError::Internal)?;
+    let exists: Vec<UserEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user",
+        value! { "mobile": payload.mobile.as_str() },
+    )
+    .await
+    .context("failed to query existing user by mobile")
+    .map_err(AppError::Internal)?;
     if !exists.is_empty() {
         return Err(AppError::Conflict("该手机号账号已存在".to_string()));
     }
@@ -225,17 +257,26 @@ pub async fn create_user(
             created_at: None,
             updated_at: None,
             deleted_at: None,
+            wechat_openid: None,
+            wechat_unionid: None,
+            wechat_subscribe: Some(0),
+            wechat_bind_at: None,
+            wechat_subscribe_updated_at: None,
         },
     )
     .await
     .context("failed to create user")
     .map_err(AppError::Internal)?;
 
-    let user: UserEntity = db::select_one_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": payload.mobile.as_str() })
-        .await
-        .context("failed to fetch created user")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::Internal(anyhow!("user create succeeded but fetch failed")))?;
+    let user: UserEntity = db::select_one_by_map_compat(
+        state.rb.as_ref(),
+        "user",
+        value! { "mobile": payload.mobile.as_str() },
+    )
+    .await
+    .context("failed to fetch created user")
+    .map_err(AppError::Internal)?
+    .ok_or_else(|| AppError::Internal(anyhow!("user create succeeded but fetch failed")))?;
     let user_id = user.id.unwrap_or_default();
 
     replace_user_roles(&state, user_id, normalized_role_codes).await?;
@@ -257,7 +298,12 @@ pub async fn update_user(
     let next_role_codes = payload
         .role_codes
         .clone()
-        .map(|codes| codes.into_iter().map(|item| normalize_role_code_alias(&item)).collect())
+        .map(|codes| {
+            codes
+                .into_iter()
+                .map(|item| normalize_role_code_alias(&item))
+                .collect()
+        })
         .unwrap_or(current_role_codes);
     let next_store_ids = validate_user_store_binding(
         &next_role_codes,
@@ -282,7 +328,8 @@ pub async fn update_user(
         let role_codes = next_role_codes.clone();
         replace_user_roles(&state, user_id, role_codes).await?;
     }
-    if payload.store_ids.is_some() || next_store_ids != load_user_store_ids(&state, user_id).await? {
+    if payload.store_ids.is_some() || next_store_ids != load_user_store_ids(&state, user_id).await?
+    {
         replace_user_stores(&state, user_id, next_store_ids).await?;
     }
 
@@ -297,7 +344,9 @@ pub async fn update_user_status(
 ) -> Result<Json<ApiResponse<UserDetailResponse>>, AppError> {
     ensure_admin_access(&state, &headers)?;
     if payload.status != "enabled" && payload.status != "disabled" {
-        return Err(AppError::BadRequest("status只能为enabled或disabled".to_string()));
+        return Err(AppError::BadRequest(
+            "status只能为enabled或disabled".to_string(),
+        ));
     }
 
     UserEntity::update_by_map(
@@ -341,7 +390,9 @@ pub async fn reset_user_password(
     .context("failed to reset user password")
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 async fn get_user_detail_inner(
@@ -350,21 +401,32 @@ async fn get_user_detail_inner(
 ) -> Result<Json<ApiResponse<UserDetailResponse>>, AppError> {
     let user = find_user(state, user_id).await?;
     let roles = find_role_codes(state, user_id).await?;
-    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
-        .await
-        .context("failed to query user stores")
-        .map_err(AppError::Internal)?;
-    let store_ids = stores.iter().filter_map(|item| item.store_id).collect::<Vec<_>>();
+    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query user stores")
+    .map_err(AppError::Internal)?;
+    let store_ids = stores
+        .iter()
+        .filter_map(|item| item.store_id)
+        .collect::<Vec<_>>();
     let store_names = if store_ids.is_empty() {
         Vec::new()
     } else {
-        db::select_by_map_compat::<StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
-            .await
-            .context("failed to query user detail store names")
-            .map_err(AppError::Internal)?
-            .into_iter()
-            .filter_map(|item| item.store_name)
-            .collect::<Vec<_>>()
+        db::select_by_map_compat::<StoreEntity>(
+            state.rb.as_ref(),
+            "store",
+            value! { "id": store_ids.clone() },
+        )
+        .await
+        .context("failed to query user detail store names")
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .filter_map(|item| item.store_name)
+        .collect::<Vec<_>>()
     };
     let stats = aggregate_store_scope_stats(state, &store_ids).await?;
 
@@ -374,7 +436,8 @@ async fn get_user_detail_inner(
         mobile: user.mobile.unwrap_or_default(),
         email: user.email,
         avatar_url: user.avatar_url,
-        status: user.status.unwrap_or_else(|| "enabled".to_string()),
+        status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+        status_text: user_status_text(user.status.as_deref()).to_string(),
         roles,
         store_ids,
         store_names,
@@ -390,7 +453,10 @@ struct StoreScopeStats {
     completed_task_count: usize,
 }
 
-async fn aggregate_store_scope_stats(state: &AppState, store_ids: &[i64]) -> Result<StoreScopeStats, AppError> {
+async fn aggregate_store_scope_stats(
+    state: &AppState,
+    store_ids: &[i64],
+) -> Result<StoreScopeStats, AppError> {
     if store_ids.is_empty() {
         return Ok(StoreScopeStats {
             technician_count: 0,
@@ -399,14 +465,22 @@ async fn aggregate_store_scope_stats(state: &AppState, store_ids: &[i64]) -> Res
         });
     }
 
-    let related_tasks = db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids.to_vec() })
-        .await
-        .context("failed to query related tasks in store scope")
-        .map_err(AppError::Internal)?;
-    let store_relations = db::select_by_map_compat::<UserStoreEntity>(state.rb.as_ref(), "user_store", value! { "store_id": store_ids.to_vec() })
-        .await
-        .context("failed to query store user relations in store scope")
-        .map_err(AppError::Internal)?;
+    let related_tasks = db::select_by_map_compat::<TaskEntity>(
+        state.rb.as_ref(),
+        "task",
+        value! { "store_id": store_ids.to_vec() },
+    )
+    .await
+    .context("failed to query related tasks in store scope")
+    .map_err(AppError::Internal)?;
+    let store_relations = db::select_by_map_compat::<UserStoreEntity>(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "store_id": store_ids.to_vec() },
+    )
+    .await
+    .context("failed to query store user relations in store scope")
+    .map_err(AppError::Internal)?;
     let user_ids = store_relations
         .into_iter()
         .filter_map(|item| item.user_id)
@@ -453,11 +527,19 @@ async fn count_technician_users(state: &AppState, user_ids: &[i64]) -> Result<us
         .len())
 }
 
-async fn replace_user_roles(state: &AppState, user_id: i64, role_codes: Vec<String>) -> Result<(), AppError> {
-    let existing: Vec<UserRoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_role", value! { "user_id": user_id })
-        .await
-        .context("failed to query existing user roles")
-        .map_err(AppError::Internal)?;
+async fn replace_user_roles(
+    state: &AppState,
+    user_id: i64,
+    role_codes: Vec<String>,
+) -> Result<(), AppError> {
+    let existing: Vec<UserRoleEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_role",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query existing user roles")
+    .map_err(AppError::Internal)?;
     for item in existing {
         if let Some(id) = item.id {
             UserRoleEntity::delete_by_map(state.rb.as_ref(), value! { "id": id })
@@ -485,11 +567,19 @@ async fn replace_user_roles(state: &AppState, user_id: i64, role_codes: Vec<Stri
     Ok(())
 }
 
-async fn replace_user_stores(state: &AppState, user_id: i64, store_ids: Vec<i64>) -> Result<(), AppError> {
-    let existing: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
-        .await
-        .context("failed to query existing user stores")
-        .map_err(AppError::Internal)?;
+async fn replace_user_stores(
+    state: &AppState,
+    user_id: i64,
+    store_ids: Vec<i64>,
+) -> Result<(), AppError> {
+    let existing: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query existing user stores")
+    .map_err(AppError::Internal)?;
     for item in existing {
         if let Some(id) = item.id {
             UserStoreEntity::delete_by_map(state.rb.as_ref(), value! { "id": id })
@@ -517,23 +607,37 @@ async fn replace_user_stores(state: &AppState, user_id: i64, store_ids: Vec<i64>
 }
 
 async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>, AppError> {
-    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_store", value! { "user_id": user_id })
-        .await
-        .context("failed to query user stores")
-        .map_err(AppError::Internal)?;
+    let stores: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query user stores")
+    .map_err(AppError::Internal)?;
 
-    Ok(stores.into_iter().filter_map(|item| item.store_id).collect())
+    Ok(stores
+        .into_iter()
+        .filter_map(|item| item.store_id)
+        .collect())
 }
 
-fn validate_user_store_binding(role_codes: &[String], store_ids: Vec<i64>) -> Result<Vec<i64>, AppError> {
-    let requires_single_store = role_codes.iter().any(|role| role == "dealer" || role == "technician");
+fn validate_user_store_binding(
+    role_codes: &[String],
+    store_ids: Vec<i64>,
+) -> Result<Vec<i64>, AppError> {
+    let requires_single_store = role_codes
+        .iter()
+        .any(|role| role == "dealer" || role == "technician");
 
     if !requires_single_store {
         return Ok(store_ids);
     }
 
     if store_ids.len() != 1 {
-        return Err(AppError::BadRequest("经销商和师傅账号必须且只能绑定一个门店".to_string()));
+        return Err(AppError::BadRequest(
+            "经销商和师傅账号必须且只能绑定一个门店".to_string(),
+        ));
     }
 
     Ok(store_ids)
@@ -550,29 +654,44 @@ fn normalize_role_code_alias(role_code: &str) -> String {
 }
 
 async fn find_role_codes(state: &AppState, user_id: i64) -> Result<Vec<String>, AppError> {
-    let relations: Vec<UserRoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "user_role", value! { "user_id": user_id })
-        .await
-        .context("failed to query user role relations")
-        .map_err(AppError::Internal)?;
-    let role_ids: Vec<i64> = relations.into_iter().filter_map(|item| item.role_id).collect();
+    let relations: Vec<UserRoleEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_role",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query user role relations")
+    .map_err(AppError::Internal)?;
+    let role_ids: Vec<i64> = relations
+        .into_iter()
+        .filter_map(|item| item.role_id)
+        .collect();
     if role_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let roles: Vec<RoleEntity> = db::select_by_map_compat(state.rb.as_ref(), "role", value! { "id": role_ids })
-        .await
-        .context("failed to query roles by ids")
-        .map_err(AppError::Internal)?;
+    let roles: Vec<RoleEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "role", value! { "id": role_ids })
+            .await
+            .context("failed to query roles by ids")
+            .map_err(AppError::Internal)?;
 
-    Ok(roles.into_iter().filter_map(|item| item.role_code).collect())
+    Ok(roles
+        .into_iter()
+        .filter_map(|item| item.role_code)
+        .collect())
 }
 
 async fn find_role_id_by_code(state: &AppState, role_code: &str) -> Result<i64, AppError> {
-    db::select_one_by_map_compat::<RoleEntity>(state.rb.as_ref(), "role", value! { "role_code": role_code })
-        .await
-        .context("failed to query role by code")
-        .map_err(AppError::Internal)?
-        .and_then(|item| item.id)
-        .ok_or_else(|| AppError::Internal(anyhow!("role not found: {role_code}")))
+    db::select_one_by_map_compat::<RoleEntity>(
+        state.rb.as_ref(),
+        "role",
+        value! { "role_code": role_code },
+    )
+    .await
+    .context("failed to query role by code")
+    .map_err(AppError::Internal)?
+    .and_then(|item| item.id)
+    .ok_or_else(|| AppError::Internal(anyhow!("role not found: {role_code}")))
 }
 
 async fn find_user(state: &AppState, user_id: i64) -> Result<UserEntity, AppError> {
@@ -581,6 +700,14 @@ async fn find_user(state: &AppState, user_id: i64) -> Result<UserEntity, AppErro
         .context("failed to query user by id")
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))
+}
+
+fn user_status_text(status: Option<&str>) -> &'static str {
+    match status.unwrap_or("enabled") {
+        "enabled" | "active" => "已启用",
+        "disabled" | "inactive" => "已禁用",
+        _ => "未知状态",
+    }
 }
 
 fn ensure_admin_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
