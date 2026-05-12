@@ -8,7 +8,9 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
-use chrono::{Local, Utc};
+use chrono::Local;
+use font8x8::{BASIC_FONTS, UnicodeFonts};
+use image::{ImageFormat, Rgba};
 use rbs::value;
 use serde::Serialize;
 use tokio::fs;
@@ -397,12 +399,21 @@ async fn upload_evidence(
     } else {
         "evidences/videos"
     };
+    let watermark_text = build_evidence_watermark_text(task_id);
+    let file_bytes = if evidence_type == "image" {
+        match apply_visible_watermark(&upload.bytes, &watermark_text) {
+            Ok(bytes) => bytes,
+            Err(_) => upload.bytes.clone(),
+        }
+    } else {
+        upload.bytes.clone()
+    };
     let stored = storage::save_bytes(
         &state,
         sub_dir,
         &upload.file_name,
         upload.content_type.as_deref(),
-        &upload.bytes,
+        &file_bytes,
     )
     .await
     .map_err(AppError::Internal)?;
@@ -419,7 +430,7 @@ async fn upload_evidence(
             file_url: Some(stored.relative_path.clone()),
             file_size: Some(stored.file_size),
             mime_type: Some(stored.mime_type.clone()),
-            watermark_text: Some(format!("task:{} time:{}", task_id, Utc::now().timestamp())),
+            watermark_text: Some(watermark_text),
             longitude: None,
             latitude: None,
             shot_at: Some(Local::now().naive_local()),
@@ -515,6 +526,104 @@ fn validate_upload(
         _ => {}
     }
     Ok(())
+}
+
+fn build_evidence_watermark_text(task_id: i64) -> String {
+    format!(
+        "任务:{} {} 金管家",
+        task_id,
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    )
+}
+
+fn apply_visible_watermark(bytes: &[u8], text: &str) -> Result<Vec<u8>, anyhow::Error> {
+    let format = image::guess_format(bytes).context("failed to guess image format")?;
+    let mut image = image::load_from_memory(bytes)
+        .context("failed to decode image for watermark")?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+
+    let scale = (width.max(height) / 320).max(1);
+    let char_w = 8 * scale;
+    let char_h = 8 * scale;
+    let padding = 12 * scale;
+    let line_height = char_h + 4 * scale;
+    let max_chars = ((width.saturating_sub(padding * 2)) / char_w).max(1) as usize;
+    let lines = wrap_text(text, max_chars);
+    let overlay_height = (lines.len() as u32 * line_height) + padding;
+    let overlay_y = height.saturating_sub(overlay_height + padding / 2);
+
+    for y in overlay_y..height {
+        for x in 0..width {
+            let pixel = image.get_pixel_mut(x, y);
+            let alpha = 80u16;
+            let bg = [0u8, 0u8, 0u8, 255u8];
+            let blended = [
+                (((pixel[0] as u16 * (255 - alpha)) + (bg[0] as u16 * alpha)) / 255) as u8,
+                (((pixel[1] as u16 * (255 - alpha)) + (bg[1] as u16 * alpha)) / 255) as u8,
+                (((pixel[2] as u16 * (255 - alpha)) + (bg[2] as u16 * alpha)) / 255) as u8,
+                255,
+            ];
+            *pixel = Rgba(blended);
+        }
+    }
+
+    for (index, line) in lines.iter().enumerate() {
+        let y = overlay_y + padding / 2 + index as u32 * line_height;
+        draw_text_bitmap(&mut image, padding, y, line, scale, Rgba([255, 255, 255, 255]));
+    }
+
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image).write_to(&mut out, image_output_format(format))?;
+    Ok(out.into_inner())
+}
+
+fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
+    let chars = text.chars().collect::<Vec<_>>();
+    chars
+        .chunks(max_chars.max(1))
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>()
+}
+
+fn draw_text_bitmap(
+    image: &mut image::RgbaImage,
+    start_x: u32,
+    start_y: u32,
+    text: &str,
+    scale: u32,
+    color: Rgba<u8>,
+) {
+    let mut cursor_x = start_x;
+    for ch in text.chars() {
+        if let Some(glyph) = BASIC_FONTS.get(ch) {
+            for (row, bits) in glyph.iter().enumerate() {
+                for col in 0..8u32 {
+                    if (bits >> col) & 1 == 1 {
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                let x = cursor_x + (7 - col) * scale + sx;
+                                let y = start_y + row as u32 * scale + sy;
+                                if x < image.width() && y < image.height() {
+                                    image.put_pixel(x, y, color);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cursor_x += 8 * scale;
+    }
+}
+
+fn image_output_format(format: ImageFormat) -> image::ImageFormat {
+    match format {
+        ImageFormat::Png => ImageFormat::Png,
+        ImageFormat::Jpeg => ImageFormat::Jpeg,
+        ImageFormat::WebP => ImageFormat::WebP,
+        _ => ImageFormat::Png,
+    }
 }
 
 async fn resolve_evidence_execution(

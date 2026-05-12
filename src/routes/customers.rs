@@ -27,6 +27,7 @@ pub struct CustomerListQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct CustomerSearchByMobileQuery {
+    #[serde(alias = "phone", alias = "contact_phone", alias = "keyword")]
     pub mobile: String,
 }
 
@@ -105,6 +106,10 @@ pub struct CustomerItem {
     pub store_ids: Vec<i64>,
     pub address_count: usize,
     pub default_address: Option<String>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
+    pub address: Option<String>,
     pub order_count: usize,
     pub service_count: usize,
     pub latest_service_date: Option<String>,
@@ -272,6 +277,11 @@ pub async fn list_customers(
             .primary_store_id
             .or_else(|| store_ids.first().copied());
         let primary_store_name = load_store_name(&state, primary_store_id).await?;
+        let default_address_entity = addresses
+            .iter()
+            .find(|item| item.is_default == Some(1))
+            .cloned()
+            .or_else(|| addresses.first().cloned());
         items.push(CustomerItem {
             id: customer_id,
             name: customer.name.unwrap_or_default(),
@@ -281,11 +291,13 @@ pub async fn list_customers(
             primary_store_name,
             store_ids: store_ids.clone(),
             address_count: addresses.len(),
-            default_address: addresses
-                .iter()
-                .find(|item| item.is_default == Some(1))
-                .and_then(|item| item.address.clone())
-                .or_else(|| addresses.first().and_then(|item| item.address.clone())),
+            default_address: default_address_entity
+                .as_ref()
+                .and_then(|item| item.address.clone()),
+            province: default_address_entity.as_ref().and_then(|item| item.province.clone()),
+            city: default_address_entity.as_ref().and_then(|item| item.city.clone()),
+            district: default_address_entity.as_ref().and_then(|item| item.district.clone()),
+            address: default_address_entity.as_ref().and_then(|item| item.address.clone()),
             order_count: tasks.len(),
             service_count: tasks.len(),
             latest_service_date,
@@ -568,12 +580,12 @@ pub async fn get_customer_service_history(
         items.push(CustomerServiceHistoryItem {
             task_id,
             task_no: item.task_no.unwrap_or_default(),
-            service_type: item.service_type.unwrap_or_default(),
+            service_type: customer_service_type_text(item.service_type.as_deref()).to_string(),
             task_status: item.task_status.unwrap_or_default(),
             service_items: service_items
                 .into_iter()
                 .map(|service_item| CustomerServiceItemPayload {
-                    service_type: service_item.service_type.unwrap_or_default(),
+                    service_type: customer_service_type_text(service_item.service_type.as_deref()).to_string(),
                     service_status: service_item.service_status.unwrap_or_default(),
                 })
                 .collect(),
@@ -681,6 +693,11 @@ pub async fn search_customer_by_mobile(
         };
         let primary_store_id = item.primary_store_id.or_else(|| store_ids.first().copied());
         let primary_store_name = load_store_name(&state, primary_store_id).await?;
+        let default_address_entity = addresses
+            .iter()
+            .find(|addr| addr.is_default == Some(1))
+            .cloned()
+            .or_else(|| addresses.first().cloned());
         result.push(CustomerItem {
             id: customer_id,
             name: item.name.unwrap_or_default(),
@@ -690,11 +707,13 @@ pub async fn search_customer_by_mobile(
             primary_store_name,
             store_ids: store_ids.clone(),
             address_count: addresses.len(),
-            default_address: addresses
-                .iter()
-                .find(|addr| addr.is_default == Some(1))
-                .and_then(|addr| addr.address.clone())
-                .or_else(|| addresses.first().and_then(|addr| addr.address.clone())),
+            default_address: default_address_entity
+                .as_ref()
+                .and_then(|addr| addr.address.clone()),
+            province: default_address_entity.as_ref().and_then(|addr| addr.province.clone()),
+            city: default_address_entity.as_ref().and_then(|addr| addr.city.clone()),
+            district: default_address_entity.as_ref().and_then(|addr| addr.district.clone()),
+            address: default_address_entity.as_ref().and_then(|addr| addr.address.clone()),
             order_count: tasks.len(),
             service_count: tasks.len(),
             latest_service_date: tasks
@@ -878,6 +897,16 @@ async fn resolve_customer_source_ids(
         let matches = item.code.as_deref() == Some(source) || item.name.as_deref() == Some(source);
         if matches { item.id } else { None }
     }))
+}
+
+fn customer_service_type_text(service_type: Option<&str>) -> &'static str {
+    match service_type.unwrap_or_default() {
+        "measure" => "量尺服务",
+        "install" => "安装服务",
+        "ironing" => "熨烫服务",
+        "cleaning" => "除尘除螨服务",
+        _ => "其他服务",
+    }
 }
 
 async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>, AppError> {

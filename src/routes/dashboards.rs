@@ -455,7 +455,7 @@ fn build_technician_dashboard(
         .filter(|item| {
             matches!(
                 technician_task_status(item),
-                Some("pending_execute") | Some("executing") | Some("pending_dealer_review")
+                Some("pending_execute") | Some("executing")
             )
         })
         .count();
