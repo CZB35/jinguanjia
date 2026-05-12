@@ -118,10 +118,17 @@ pub struct CustomerDetailResponse {
     pub name: String,
     pub mobile: String,
     pub source: Option<String>,
+    pub source_id: Option<i64>,
+    pub customer_source_id: Option<i64>,
     pub remark: Option<String>,
+    pub store_id: Option<i64>,
     pub primary_store_id: Option<i64>,
     pub primary_store_name: Option<String>,
     pub store_ids: Vec<i64>,
+    pub province: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
+    pub address: Option<String>,
     pub addresses: Vec<AddressPayload>,
     pub task_count: usize,
     pub service_count: usize,
@@ -671,21 +678,32 @@ async fn get_customer_detail_inner(
         .primary_store_id
         .or_else(|| store_ids.first().copied());
     let primary_store_name = load_store_name(state, primary_store_id).await?;
-    let default_address = addresses
+    let default_address_entity = addresses
         .iter()
         .find(|item| item.is_default == Some(1))
-        .and_then(|item| item.address.clone())
-        .or_else(|| addresses.first().and_then(|item| item.address.clone()));
+        .cloned()
+        .or_else(|| addresses.first().cloned());
+    let default_address = default_address_entity
+        .as_ref()
+        .and_then(|item| item.address.clone());
+    let source_ids = resolve_customer_source_ids(state, customer.source.as_deref()).await?;
 
     Ok(Json(ApiResponse::success(CustomerDetailResponse {
         id: customer.id.unwrap_or_default(),
         name: customer.name.unwrap_or_default(),
         mobile: customer.mobile.unwrap_or_default(),
         source: customer.source,
+        source_id: source_ids,
+        customer_source_id: source_ids,
         remark: customer.remark,
+        store_id: primary_store_id,
         primary_store_id,
         primary_store_name,
         store_ids,
+        province: default_address_entity.as_ref().and_then(|item| item.province.clone()),
+        city: default_address_entity.as_ref().and_then(|item| item.city.clone()),
+        district: default_address_entity.as_ref().and_then(|item| item.district.clone()),
+        address: default_address.clone(),
         addresses: addresses
             .into_iter()
             .map(|item| AddressPayload {
@@ -750,6 +768,27 @@ async fn resolve_customer_source_value(
     .ok_or_else(|| AppError::BadRequest("客户来源不存在".to_string()))?;
 
     Ok(customer_source.code.or(customer_source.name))
+}
+
+async fn resolve_customer_source_ids(
+    state: &AppState,
+    source: Option<&str>,
+) -> Result<Option<i64>, AppError> {
+    let Some(source) = source.map(str::trim).filter(|item| !item.is_empty()) else {
+        return Ok(None);
+    };
+    let items: Vec<CustomerSourceEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "customer_source",
+        value! {},
+    )
+    .await
+    .context("failed to query customer source ids")
+    .map_err(AppError::Internal)?;
+    Ok(items.into_iter().find_map(|item| {
+        let matches = item.code.as_deref() == Some(source) || item.name.as_deref() == Some(source);
+        if matches { item.id } else { None }
+    }))
 }
 
 async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>, AppError> {
