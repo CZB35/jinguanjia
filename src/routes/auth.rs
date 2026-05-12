@@ -83,7 +83,7 @@ pub async fn login_by_password(
         .context("failed to verify password")
         .map_err(AppError::Internal)?;
     if !password_ok {
-        return Err(AppError::Unauthorized("账号或密码错误".to_string()));
+        return Err(AppError::BadRequest("账号或密码错误".to_string()));
     }
 
     let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
@@ -387,7 +387,7 @@ async fn find_user_by_mobile(state: &AppState, mobile: &str) -> Result<UserEntit
     users
         .into_iter()
         .next()
-        .ok_or_else(|| AppError::Unauthorized("账号或密码错误".to_string()))
+        .ok_or_else(|| AppError::BadRequest("账号或密码错误".to_string()))
 }
 
 async fn find_user_by_id(state: &AppState, user_id: i64) -> Result<UserEntity, AppError> {
