@@ -5,13 +5,15 @@ use axum::{
     http::HeaderMap,
 };
 use rbs::value;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
-    models::{customer::CustomerEntity, customer_address::CustomerAddressEntity, task::TaskEntity, task_service_item::TaskServiceItemEntity, user::UserEntity},
+    models::{
+        customer::CustomerEntity, customer_address::CustomerAddressEntity, task::TaskEntity,
+        task_service_item::TaskServiceItemEntity, user::UserEntity,
+    },
     response::ApiResponse,
     state::AppState,
 };
@@ -35,6 +37,7 @@ pub struct CreateCustomerRequest {
     pub remark: Option<String>,
     #[serde(default, alias = "store_id")]
     pub primary_store_id: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_address_payload")]
     pub address: Option<AddressPayload>,
 }
 
@@ -53,6 +56,31 @@ pub struct AddressPayload {
     pub city: Option<String>,
     pub district: Option<String>,
     pub detail: String,
+}
+
+fn deserialize_optional_address_payload<'de, D>(
+    deserializer: D,
+) -> Result<Option<AddressPayload>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(text) => Ok(Some(AddressPayload {
+            province: None,
+            city: None,
+            district: None,
+            detail: text.trim().to_string(),
+        })),
+        other => serde_json::from_value::<AddressPayload>(other)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -123,31 +151,48 @@ pub async fn list_customers(
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
-    let mut customers: Vec<CustomerEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer", value! {})
-        .await
-        .context("failed to query customers")
-        .map_err(AppError::Internal)?;
+    let mut customers: Vec<CustomerEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "customer", value! {})
+            .await
+            .context("failed to query customers")
+            .map_err(AppError::Internal)?;
 
-    if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+    if auth_user.has_role("dealer")
+        && !auth_user.has_role("hq_reviewer")
+        && !auth_user.has_role("super_admin")
+    {
         let store_ids = load_user_store_ids(&state, auth_user.user_id).await?;
         let scoped_tasks = if store_ids.is_empty() {
             Vec::new()
         } else {
-            db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids })
-                .await
-                .context("failed to query dealer scoped customer tasks")
-                .map_err(AppError::Internal)?
+            db::select_by_map_compat::<TaskEntity>(
+                state.rb.as_ref(),
+                "task",
+                value! { "store_id": store_ids },
+            )
+            .await
+            .context("failed to query dealer scoped customer tasks")
+            .map_err(AppError::Internal)?
         };
         let visible_customer_ids = scoped_tasks
             .into_iter()
             .filter_map(|item| item.customer_id)
             .collect::<std::collections::BTreeSet<_>>();
-        customers.retain(|customer| customer.id.map(|id| visible_customer_ids.contains(&id)).unwrap_or(false));
+        customers.retain(|customer| {
+            customer
+                .id
+                .map(|id| visible_customer_ids.contains(&id))
+                .unwrap_or(false)
+        });
     }
 
     customers.retain(|customer| {
         if let Some(mobile) = &query.mobile
-            && !customer.mobile.as_deref().unwrap_or_default().contains(mobile)
+            && !customer
+                .mobile
+                .as_deref()
+                .unwrap_or_default()
+                .contains(mobile)
         {
             return false;
         }
@@ -162,33 +207,52 @@ pub async fn list_customers(
     let mut items = Vec::with_capacity(customers.len());
     for customer in customers {
         let customer_id = customer.id.unwrap_or_default();
-        let addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer_address", value! { "customer_id": customer_id })
-            .await
-            .context("failed to query customer addresses")
-            .map_err(AppError::Internal)?;
-        let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "customer_id": customer_id })
-            .await
-            .context("failed to query customer tasks for list")
-            .map_err(AppError::Internal)?;
+        let addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "customer_address",
+            value! { "customer_id": customer_id },
+        )
+        .await
+        .context("failed to query customer addresses")
+        .map_err(AppError::Internal)?;
+        let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task",
+            value! { "customer_id": customer_id },
+        )
+        .await
+        .context("failed to query customer tasks for list")
+        .map_err(AppError::Internal)?;
         let latest_service_date = tasks
             .iter()
             .filter_map(|item| item.appointment_time)
             .max()
             .map(|dt| dt.format("%Y-%m-%d").to_string());
         let latest_task = tasks.iter().max_by_key(|item| item.appointment_time);
-        let store_ids = tasks.iter().filter_map(|item| item.store_id).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        let store_ids = tasks
+            .iter()
+            .filter_map(|item| item.store_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let store_names = if store_ids.is_empty() {
             Vec::new()
         } else {
-            db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
-                .await
-                .context("failed to query customer store names")
-                .map_err(AppError::Internal)?
-                .into_iter()
-                .filter_map(|item| item.store_name)
-                .collect::<Vec<_>>()
+            db::select_by_map_compat::<crate::models::store::StoreEntity>(
+                state.rb.as_ref(),
+                "store",
+                value! { "id": store_ids.clone() },
+            )
+            .await
+            .context("failed to query customer store names")
+            .map_err(AppError::Internal)?
+            .into_iter()
+            .filter_map(|item| item.store_name)
+            .collect::<Vec<_>>()
         };
-        let primary_store_id = customer.primary_store_id.or_else(|| store_ids.first().copied());
+        let primary_store_id = customer
+            .primary_store_id
+            .or_else(|| store_ids.first().copied());
         let primary_store_name = load_store_name(&state, primary_store_id).await?;
         items.push(CustomerItem {
             id: customer_id,
@@ -199,7 +263,11 @@ pub async fn list_customers(
             primary_store_name,
             store_ids: store_ids.clone(),
             address_count: addresses.len(),
-            default_address: addresses.iter().find(|item| item.is_default == Some(1)).and_then(|item| item.address.clone()).or_else(|| addresses.first().and_then(|item| item.address.clone())),
+            default_address: addresses
+                .iter()
+                .find(|item| item.is_default == Some(1))
+                .and_then(|item| item.address.clone())
+                .or_else(|| addresses.first().and_then(|item| item.address.clone())),
             order_count: tasks.len(),
             service_count: tasks.len(),
             latest_service_date,
@@ -209,7 +277,10 @@ pub async fn list_customers(
     }
 
     let total = items.len();
-    Ok(Json(ApiResponse::success(CustomerListResponse { items, total })))
+    Ok(Json(ApiResponse::success(CustomerListResponse {
+        items,
+        total,
+    })))
 }
 
 pub async fn create_customer(
@@ -227,15 +298,20 @@ pub async fn create_customer(
         return Err(AppError::BadRequest("请输入客户手机号".to_string()));
     }
 
-    let existing: Vec<CustomerEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer", value! { "mobile": payload.mobile.as_str() })
-        .await
-        .context("failed to query existing customer")
-        .map_err(AppError::Internal)?;
+    let existing: Vec<CustomerEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "customer",
+        value! { "mobile": payload.mobile.as_str() },
+    )
+    .await
+    .context("failed to query existing customer")
+    .map_err(AppError::Internal)?;
     if !existing.is_empty() {
         return Err(AppError::Conflict("该手机号客户已存在".to_string()));
     }
 
-    let primary_store_id = resolve_customer_store_id(&state, &auth_user, payload.primary_store_id).await?;
+    let primary_store_id =
+        resolve_customer_store_id(&state, &auth_user, payload.primary_store_id).await?;
 
     CustomerEntity::insert(
         state.rb.as_ref(),
@@ -243,7 +319,10 @@ pub async fn create_customer(
             id: None,
             name: Some(payload.name.clone()),
             mobile: Some(payload.mobile.clone()),
-            source: payload.source.clone().or_else(|| Some("manual".to_string())),
+            source: payload
+                .source
+                .clone()
+                .or_else(|| Some("manual".to_string())),
             remark: payload.remark.clone(),
             primary_store_id,
             created_by: Some(auth_user.user_id),
@@ -255,11 +334,15 @@ pub async fn create_customer(
     .context("failed to create customer")
     .map_err(AppError::Internal)?;
 
-    let customer: CustomerEntity = db::select_one_by_map_compat(state.rb.as_ref(), "customer", value! { "mobile": payload.mobile.as_str() })
-        .await
-        .context("failed to fetch created customer")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::Internal(anyhow!("customer create succeeded but fetch failed")))?;
+    let customer: CustomerEntity = db::select_one_by_map_compat(
+        state.rb.as_ref(),
+        "customer",
+        value! { "mobile": payload.mobile.as_str() },
+    )
+    .await
+    .context("failed to fetch created customer")
+    .map_err(AppError::Internal)?
+    .ok_or_else(|| AppError::Internal(anyhow!("customer create succeeded but fetch failed")))?;
 
     if let Some(address) = payload.address {
         CustomerAddressEntity::insert(
@@ -337,19 +420,29 @@ pub async fn get_customer_service_history(
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
     let _ = find_customer(&state, customer_id).await?;
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "customer_id": customer_id })
-        .await
-        .context("failed to query customer service history")
-        .map_err(AppError::Internal)?;
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "customer_id": customer_id },
+    )
+    .await
+    .context("failed to query customer service history")
+    .map_err(AppError::Internal)?;
     let mut items = Vec::new();
     for item in tasks {
         let task_id = item.id.unwrap_or_default();
-        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! { "task_id": task_id })
-            .await
-            .context("failed to query customer service history task service items")
-            .map_err(AppError::Internal)?;
+        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task_service_item",
+            value! { "task_id": task_id },
+        )
+        .await
+        .context("failed to query customer service history task service items")
+        .map_err(AppError::Internal)?;
         let technician_name = if let Some(technician_id) = item.current_technician_id {
-            load_user_name(&state, technician_id).await.unwrap_or_default()
+            load_user_name(&state, technician_id)
+                .await
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -366,7 +459,9 @@ pub async fn get_customer_service_history(
                 })
                 .collect(),
             technician_name,
-            service_date: item.appointment_time.map(|dt| dt.format("%Y-%m-%d").to_string()),
+            service_date: item
+                .appointment_time
+                .map(|dt| dt.format("%Y-%m-%d").to_string()),
         });
     }
     Ok(Json(ApiResponse::success(items)))
@@ -384,51 +479,86 @@ pub async fn search_customer_by_mobile(
         return Err(AppError::BadRequest("mobile不能为空".to_string()));
     }
 
-    let mut customers: Vec<CustomerEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer", value! {})
-        .await
-        .context("failed to search customer by mobile")
-        .map_err(AppError::Internal)?;
-    customers.retain(|item| item.mobile.as_deref().unwrap_or_default().contains(query.mobile.trim()));
+    let mut customers: Vec<CustomerEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "customer", value! {})
+            .await
+            .context("failed to search customer by mobile")
+            .map_err(AppError::Internal)?;
+    customers.retain(|item| {
+        item.mobile
+            .as_deref()
+            .unwrap_or_default()
+            .contains(query.mobile.trim())
+    });
 
-    if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+    if auth_user.has_role("dealer")
+        && !auth_user.has_role("hq_reviewer")
+        && !auth_user.has_role("super_admin")
+    {
         let store_ids = load_user_store_ids(&state, auth_user.user_id).await?;
         if store_ids.is_empty() {
             customers.clear();
         } else {
-            let scoped_tasks = db::select_by_map_compat::<TaskEntity>(state.rb.as_ref(), "task", value! { "store_id": store_ids })
-                .await
-                .context("failed to query dealer scoped tasks for customer mobile search")
-                .map_err(AppError::Internal)?;
+            let scoped_tasks = db::select_by_map_compat::<TaskEntity>(
+                state.rb.as_ref(),
+                "task",
+                value! { "store_id": store_ids },
+            )
+            .await
+            .context("failed to query dealer scoped tasks for customer mobile search")
+            .map_err(AppError::Internal)?;
             let visible_customer_ids = scoped_tasks
                 .into_iter()
                 .filter_map(|item| item.customer_id)
                 .collect::<std::collections::BTreeSet<_>>();
-            customers.retain(|customer| customer.id.map(|id| visible_customer_ids.contains(&id)).unwrap_or(false));
+            customers.retain(|customer| {
+                customer
+                    .id
+                    .map(|id| visible_customer_ids.contains(&id))
+                    .unwrap_or(false)
+            });
         }
     }
 
     let mut result = Vec::new();
     for item in customers {
         let customer_id = item.id.unwrap_or_default();
-        let addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer_address", value! { "customer_id": customer_id })
-            .await
-            .context("failed to query customer addresses for search")
-            .map_err(AppError::Internal)?;
-        let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "customer_id": customer_id })
-            .await
-            .context("failed to query customer tasks for search")
-            .map_err(AppError::Internal)?;
-        let store_ids = tasks.iter().filter_map(|task| task.store_id).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        let addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "customer_address",
+            value! { "customer_id": customer_id },
+        )
+        .await
+        .context("failed to query customer addresses for search")
+        .map_err(AppError::Internal)?;
+        let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task",
+            value! { "customer_id": customer_id },
+        )
+        .await
+        .context("failed to query customer tasks for search")
+        .map_err(AppError::Internal)?;
+        let store_ids = tasks
+            .iter()
+            .filter_map(|task| task.store_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let store_names = if store_ids.is_empty() {
             Vec::new()
         } else {
-            db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
-                .await
-                .context("failed to query customer store names for search")
-                .map_err(AppError::Internal)?
-                .into_iter()
-                .filter_map(|item| item.store_name)
-                .collect::<Vec<_>>()
+            db::select_by_map_compat::<crate::models::store::StoreEntity>(
+                state.rb.as_ref(),
+                "store",
+                value! { "id": store_ids.clone() },
+            )
+            .await
+            .context("failed to query customer store names for search")
+            .map_err(AppError::Internal)?
+            .into_iter()
+            .filter_map(|item| item.store_name)
+            .collect::<Vec<_>>()
         };
         let primary_store_id = item.primary_store_id.or_else(|| store_ids.first().copied());
         let primary_store_name = load_store_name(&state, primary_store_id).await?;
@@ -441,11 +571,22 @@ pub async fn search_customer_by_mobile(
             primary_store_name,
             store_ids: store_ids.clone(),
             address_count: addresses.len(),
-            default_address: addresses.iter().find(|addr| addr.is_default == Some(1)).and_then(|addr| addr.address.clone()).or_else(|| addresses.first().and_then(|addr| addr.address.clone())),
+            default_address: addresses
+                .iter()
+                .find(|addr| addr.is_default == Some(1))
+                .and_then(|addr| addr.address.clone())
+                .or_else(|| addresses.first().and_then(|addr| addr.address.clone())),
             order_count: tasks.len(),
             service_count: tasks.len(),
-            latest_service_date: tasks.iter().filter_map(|task| task.appointment_time).max().map(|dt| dt.format("%Y-%m-%d").to_string()),
-            latest_service_status: tasks.iter().max_by_key(|task| task.appointment_time).and_then(|task| task.task_status.clone()),
+            latest_service_date: tasks
+                .iter()
+                .filter_map(|task| task.appointment_time)
+                .max()
+                .map(|dt| dt.format("%Y-%m-%d").to_string()),
+            latest_service_status: tasks
+                .iter()
+                .max_by_key(|task| task.appointment_time)
+                .and_then(|task| task.task_status.clone()),
             store_names,
         });
     }
@@ -457,35 +598,61 @@ async fn get_customer_detail_inner(
     customer_id: i64,
 ) -> Result<Json<ApiResponse<CustomerDetailResponse>>, AppError> {
     let customer = find_customer(state, customer_id).await?;
-    let addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer_address", value! { "customer_id": customer_id })
-        .await
-        .context("failed to query customer addresses")
-        .map_err(AppError::Internal)?;
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "customer_id": customer_id })
-        .await
-        .context("failed to query customer tasks")
-        .map_err(AppError::Internal)?;
+    let addresses: Vec<CustomerAddressEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "customer_address",
+        value! { "customer_id": customer_id },
+    )
+    .await
+    .context("failed to query customer addresses")
+    .map_err(AppError::Internal)?;
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "customer_id": customer_id },
+    )
+    .await
+    .context("failed to query customer tasks")
+    .map_err(AppError::Internal)?;
     let latest_service_date = tasks
         .iter()
         .filter_map(|item| item.appointment_time)
         .max()
         .map(|dt| dt.format("%Y-%m-%d").to_string());
-    let latest_service_status = tasks.iter().max_by_key(|item| item.appointment_time).and_then(|item| item.task_status.clone());
-    let store_ids = tasks.iter().filter_map(|item| item.store_id).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+    let latest_service_status = tasks
+        .iter()
+        .max_by_key(|item| item.appointment_time)
+        .and_then(|item| item.task_status.clone());
+    let store_ids = tasks
+        .iter()
+        .filter_map(|item| item.store_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let store_names = if store_ids.is_empty() {
         Vec::new()
     } else {
-        db::select_by_map_compat::<crate::models::store::StoreEntity>(state.rb.as_ref(), "store", value! { "id": store_ids.clone() })
-            .await
-            .context("failed to query customer detail store names")
-            .map_err(AppError::Internal)?
-            .into_iter()
-            .filter_map(|item| item.store_name)
-            .collect::<Vec<_>>()
+        db::select_by_map_compat::<crate::models::store::StoreEntity>(
+            state.rb.as_ref(),
+            "store",
+            value! { "id": store_ids.clone() },
+        )
+        .await
+        .context("failed to query customer detail store names")
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .filter_map(|item| item.store_name)
+        .collect::<Vec<_>>()
     };
-    let primary_store_id = customer.primary_store_id.or_else(|| store_ids.first().copied());
+    let primary_store_id = customer
+        .primary_store_id
+        .or_else(|| store_ids.first().copied());
     let primary_store_name = load_store_name(state, primary_store_id).await?;
-    let default_address = addresses.iter().find(|item| item.is_default == Some(1)).and_then(|item| item.address.clone()).or_else(|| addresses.first().and_then(|item| item.address.clone()));
+    let default_address = addresses
+        .iter()
+        .find(|item| item.is_default == Some(1))
+        .and_then(|item| item.address.clone())
+        .or_else(|| addresses.first().and_then(|item| item.address.clone()));
 
     Ok(Json(ApiResponse::success(CustomerDetailResponse {
         id: customer.id.unwrap_or_default(),
@@ -523,10 +690,14 @@ async fn find_customer(state: &AppState, customer_id: i64) -> Result<CustomerEnt
 }
 
 async fn load_user_name(state: &AppState, user_id: i64) -> Result<String, AppError> {
-    let user = db::select_one_by_map_compat::<UserEntity>(state.rb.as_ref(), "user", value! { "id": user_id })
-        .await
-        .context("failed to query user name for customer history")
-        .map_err(AppError::Internal)?;
+    let user = db::select_one_by_map_compat::<UserEntity>(
+        state.rb.as_ref(),
+        "user",
+        value! { "id": user_id },
+    )
+    .await
+    .context("failed to query user name for customer history")
+    .map_err(AppError::Internal)?;
     Ok(user.and_then(|item| item.name).unwrap_or_default())
 }
 
@@ -539,7 +710,10 @@ async fn load_user_store_ids(state: &AppState, user_id: i64) -> Result<Vec<i64>,
     .await
     .context("failed to query user stores for customer scope")
     .map_err(AppError::Internal)?;
-    Ok(stores.into_iter().filter_map(|item| item.store_id).collect())
+    Ok(stores
+        .into_iter()
+        .filter_map(|item| item.store_id)
+        .collect())
 }
 
 async fn resolve_customer_store_id(
@@ -547,7 +721,10 @@ async fn resolve_customer_store_id(
     auth_user: &auth::CurrentAuthUser,
     requested_store_id: Option<i64>,
 ) -> Result<Option<i64>, AppError> {
-    let store_id = if auth_user.has_role("dealer") && !auth_user.has_role("hq_reviewer") && !auth_user.has_role("super_admin") {
+    let store_id = if auth_user.has_role("dealer")
+        && !auth_user.has_role("hq_reviewer")
+        && !auth_user.has_role("super_admin")
+    {
         Some(dealer_owned_store_id(state, auth_user).await?)
     } else if requested_store_id.is_some() {
         requested_store_id
@@ -581,11 +758,16 @@ async fn dealer_owned_store_id(
     match store_ids.as_slice() {
         [store_id] => Ok(*store_id),
         [] => Err(AppError::Forbidden("当前经销商账号未绑定门店".to_string())),
-        _ => Err(AppError::Conflict("当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string())),
+        _ => Err(AppError::Conflict(
+            "当前经销商账号绑定了多个门店，请先在后台修正为单门店".to_string(),
+        )),
     }
 }
 
-async fn load_store_name(state: &AppState, store_id: Option<i64>) -> Result<Option<String>, AppError> {
+async fn load_store_name(
+    state: &AppState,
+    store_id: Option<i64>,
+) -> Result<Option<String>, AppError> {
     let Some(store_id) = store_id else {
         return Ok(None);
     };
