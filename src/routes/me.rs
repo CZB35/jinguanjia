@@ -48,6 +48,7 @@ pub struct ProfileResponse {
     pub email: Option<String>,
     pub avatar_url: Option<String>,
     pub status: String,
+    pub status_text: String,
     pub job_no: String,
     pub role_names: Vec<String>,
     pub store_id: Option<i64>,
@@ -695,7 +696,8 @@ async fn build_profile_response(
         mobile: user.mobile.unwrap_or_default(),
         email: user.email,
         avatar_url: user.avatar_url,
-        status: user.status.unwrap_or_else(|| "enabled".to_string()),
+        status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+        status_text: profile_status_text(user.status.as_deref()).to_string(),
         job_no,
         role_names,
         store_id: primary_store_id,
@@ -741,4 +743,12 @@ async fn count_technician_users(state: &AppState, user_ids: &[i64]) -> Result<us
         .filter_map(|item| item.user_id)
         .collect::<std::collections::BTreeSet<_>>()
         .len())
+}
+
+fn profile_status_text(status: Option<&str>) -> &'static str {
+    match status.unwrap_or("enabled") {
+        "enabled" | "active" => "已启用",
+        "disabled" | "inactive" => "已禁用",
+        _ => "未知状态",
+    }
 }

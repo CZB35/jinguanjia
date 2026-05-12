@@ -62,6 +62,7 @@ pub struct CurrentUserPayload {
     pub current_role: String,
     pub switchable: bool,
     pub status: String,
+    pub status_text: String,
 }
 
 pub async fn login_by_password(
@@ -262,7 +263,8 @@ pub async fn current_user(
         switchable: roles.len() > 1,
         roles,
         current_role,
-        status: user.status.unwrap_or_else(|| "enabled".to_string()),
+        status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+        status_text: auth_status_text(user.status.as_deref()).to_string(),
     })))
 }
 
@@ -362,8 +364,17 @@ fn build_login_response(
             roles,
             current_role,
             status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+            status_text: auth_status_text(user.status.as_deref()).to_string(),
         },
     })
+}
+
+fn auth_status_text(status: Option<&str>) -> &'static str {
+    match status.unwrap_or("enabled") {
+        "enabled" | "active" => "已启用",
+        "disabled" | "inactive" => "已禁用",
+        _ => "未知状态",
+    }
 }
 
 async fn find_user_by_mobile(state: &AppState, mobile: &str) -> Result<UserEntity, AppError> {
