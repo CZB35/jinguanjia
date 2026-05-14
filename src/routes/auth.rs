@@ -62,6 +62,7 @@ pub struct CurrentUserPayload {
     pub current_role: String,
     pub switchable: bool,
     pub status: String,
+    pub status_code: String,
     pub status_text: String,
 }
 
@@ -263,7 +264,8 @@ pub async fn current_user(
         switchable: roles.len() > 1,
         roles,
         current_role,
-        status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+        status: auth_status_text(user.status.as_deref()).to_string(),
+        status_code: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
         status_text: auth_status_text(user.status.as_deref()).to_string(),
     })))
 }
@@ -363,7 +365,8 @@ fn build_login_response(
             switchable: roles.len() > 1,
             roles,
             current_role,
-            status: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
+            status: auth_status_text(user.status.as_deref()).to_string(),
+            status_code: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
             status_text: auth_status_text(user.status.as_deref()).to_string(),
         },
     })
