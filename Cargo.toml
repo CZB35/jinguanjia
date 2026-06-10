@@ -7,18 +7,24 @@ default-run = "kgj-backend"
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8.9", features = ["multipart"] }
+base64 = "0.22"
 bcrypt = "0.17"
 calamine = "0.34.0"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 font8x8 = "0.3"
+ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+imageproc = "0.25"
 jsonwebtoken = "9.3"
+hmac = "0.12"
 mime_guess = "2.0"
+percent-encoding = "2.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rbatis = "4.9.0"
 rbs = "4.8.3"
 rbdc-mysql = "4.9.0"
+sha1 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

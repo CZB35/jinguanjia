@@ -15,15 +15,18 @@ use crate::{
     error::AppError,
     models::{
         audit_log::AuditLogEntity, customer::CustomerEntity,
-        customer_address::CustomerAddressEntity, dealer_review::DealerReviewEntity,
-        evidence::EvidenceEntity, store::StoreEntity, task::TaskEntity,
-        task_assignment::TaskAssignmentEntity, task_execution::TaskExecutionEntity,
-        task_service_item::TaskServiceItemEntity, technician_skill::TechnicianSkillEntity,
-        user::UserEntity, user_store::UserStoreEntity,
+        customer_address::CustomerAddressEntity, customer_review::CustomerReviewEntity,
+        customer_review_image::CustomerReviewImageEntity, dealer_review::DealerReviewEntity,
+        evidence::EvidenceEntity, hq_score::HqScoreEntity, hq_score_item::HqScoreItemEntity,
+        store::StoreEntity, task::TaskEntity, task_assignment::TaskAssignmentEntity,
+        task_execution::TaskExecutionEntity, task_service_item::TaskServiceItemEntity,
+        technician_skill::TechnicianSkillEntity, user::UserEntity, user_store::UserStoreEntity,
     },
     notify,
     response::ApiResponse,
+    sms,
     state::AppState,
+    storage,
 };
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +232,8 @@ pub struct TaskDetailResponse {
     pub can_submit_review: bool,
     pub can_contact_customer: bool,
     pub review_info: Option<ReviewInfoPayload>,
+    pub customer_review: Option<CustomerReviewPayload>,
+    pub hq_score: Option<TaskHqScorePayload>,
     pub assignments: Vec<AssignmentPayload>,
     pub executions: Vec<ExecutionPayload>,
     pub evidence_count: usize,
@@ -317,6 +322,36 @@ pub struct ReviewInfoPayload {
     pub tags: Vec<String>,
     pub content: Option<String>,
     pub created_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CustomerReviewPayload {
+    pub star: i32,
+    pub tags: Vec<String>,
+    pub content: String,
+    pub images: Vec<CustomerReviewImageItemPayload>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CustomerReviewImageItemPayload {
+    pub id: i64,
+    pub file_url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskHqScorePayload {
+    pub total_score: i32,
+    pub score_remark: String,
+    pub items: Vec<TaskHqScoreItemPayload>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskHqScoreItemPayload {
+    pub service_type: String,
+    pub score: i32,
+    pub deduction_reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -580,6 +615,7 @@ async fn load_task_summaries(
     }
 
     items.retain(|item| filter_task_summary(item, query));
+    sort_task_summaries_desc(&mut items);
     Ok(items)
 }
 
@@ -617,6 +653,7 @@ async fn load_dealer_task_summaries(
     }
 
     items.retain(|item| filter_task_summary(item, query));
+    sort_task_summaries_desc(&mut items);
     Ok(items)
 }
 
@@ -669,7 +706,53 @@ async fn load_technician_task_summaries(
     }
 
     items.retain(|item| filter_task_summary(item, query));
+    sort_task_summaries_desc(&mut items);
     Ok(items)
+}
+
+fn sort_task_summaries_desc(items: &mut [TaskSummary]) {
+    items.sort_by(|left, right| {
+        let left_time = left.appointment_time.as_deref().unwrap_or("");
+        let right_time = right.appointment_time.as_deref().unwrap_or("");
+        right_time
+            .cmp(left_time)
+            .then_with(|| right.task_no.cmp(&left.task_no))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
+fn task_log_action_text(action: &str, remark: Option<&str>) -> String {
+    match action {
+        "create_task" => "创建任务".to_string(),
+        "assign_task" => "分派任务".to_string(),
+        "reassign_task" => "任务重派".to_string(),
+        "start_task" => "技师开始执行任务".to_string(),
+        "submit_task" => "技师提交检核".to_string(),
+        "close_task" => "关闭任务".to_string(),
+        "hq_score" => "总部评分完成".to_string(),
+        "dealer_review" => {
+            let label = review_level_text_from_remark(remark).unwrap_or("已评价");
+            format!("客户评价：{label}")
+        }
+        other => other.to_string(),
+    }
+}
+
+fn review_level_text_from_remark(remark: Option<&str>) -> Option<&'static str> {
+    let text = remark?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.contains("非常") || text.contains("很好") || text.contains("满意") {
+        return Some("非常好");
+    }
+    if text.contains("一般") {
+        return Some("一般");
+    }
+    if text.contains("差") {
+        return Some("较差");
+    }
+    Some("已评价")
 }
 
 pub async fn get_task_detail(
@@ -715,6 +798,8 @@ pub async fn get_task_detail(
     let visible_service_items =
         scoped_service_items_for_detail(&auth_user, &service_items, &query)?;
     let dealer_review = find_dealer_review_for_scope(&state, task_id, &visible_service_items).await?;
+    let customer_review = find_customer_review_for_task(&state, task_id).await?;
+    let hq_score = find_hq_score_for_task(&state, task_id).await?;
     let scoped_service_status = if visible_service_items.len() == 1 {
         visible_service_items
             .first()
@@ -734,7 +819,7 @@ pub async fn get_task_detail(
         .unwrap_or_else(|| "normal".to_string());
     let task_desc = task.task_desc.clone();
     let task_remark = task.task_remark.clone();
-    let service_time_slot = task.service_time_slot.clone();
+    let service_time_slot = format_task_service_time_slot(task.appointment_time, task.service_time_slot.as_deref());
     let progress_percent =
         task_progress_percent(&visible_service_items, Some(task_status.as_str()));
     let progress_tracks = build_progress_tracks(
@@ -821,7 +906,7 @@ pub async fn get_task_detail(
             name: customer.name.unwrap_or_default(),
             mobile: customer_mobile.clone(),
             contact_phone: customer_mobile.clone(),
-            address: address.address,
+            address: Some(format_customer_address(&address)),
         },
         store: RelatedStore {
             id: store.id.unwrap_or_default(),
@@ -861,6 +946,8 @@ pub async fn get_task_detail(
             content: review.content,
             created_at: review.created_at.map(format_datetime),
         }),
+        customer_review,
+        hq_score,
         assignments: assignments
             .into_iter()
             .map(|item| AssignmentPayload {
@@ -1403,6 +1490,20 @@ pub async fn submit_task(
         )
         .await;
     }
+    let customer = find_customer_by_id(&state, task.customer_id).await?;
+    if task_status == "pending_dealer_review"
+        && let Some(customer_mobile) = customer.mobile.as_deref().map(str::trim).filter(|item| !item.is_empty())
+    {
+        let review_link_token = ensure_customer_review_link_for_task(&state, &task).await?;
+        let _ = sms::send_customer_review_sms(
+            &state,
+            customer_mobile,
+            sms::CustomerReviewSmsPayload {
+                review_link_code: &review_link_token,
+            },
+        )
+        .await;
+    }
     audit::write_audit_log(
         &state,
         "task",
@@ -1603,7 +1704,10 @@ pub async fn task_logs(
         .into_iter()
         .map(|item| TaskLogItem {
             id: item.id.unwrap_or_default(),
-            action: item.action.unwrap_or_default(),
+            action: task_log_action_text(
+                item.action.as_deref().unwrap_or_default(),
+                item.remark.as_deref(),
+            ),
             operator_id: item.operator_id.unwrap_or_default(),
             operator_role: item.operator_role.unwrap_or_default(),
             remark: item.remark,
@@ -1886,7 +1990,7 @@ async fn build_task_summary(
         appointment_time: task.appointment_time.map(format_datetime),
         customer_name,
         customer_mobile,
-        address: address.address.unwrap_or_default(),
+        address: format_customer_address(&address),
         store_id: task.store_id.unwrap_or_default(),
         store_name: store.store_name.unwrap_or_default(),
         dealer_user_id: task.dealer_user_id.unwrap_or_default(),
@@ -2615,6 +2719,134 @@ async fn find_dealer_review_for_scope(
     })
 }
 
+async fn ensure_customer_review_link_for_task(
+    state: &AppState,
+    task: &TaskEntity,
+) -> Result<String, AppError> {
+    let task_id = task
+        .id
+        .ok_or_else(|| AppError::Internal(anyhow!("task.id missing for customer review link")))?;
+    let existing = db::select_one_by_map_compat::<crate::models::customer_review_link::CustomerReviewLinkEntity>(
+        state.rb.as_ref(),
+        "customer_review_link",
+        value! { "task_id": task_id, "status": "pending" },
+    )
+    .await
+    .context("failed to query pending customer review link")
+    .map_err(AppError::Internal)?;
+    if let Some(link) = existing
+        && let Some(token) = link.token.filter(|item| !item.trim().is_empty())
+    {
+        return Ok(token);
+    }
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let expired_at = chrono::Utc::now() + chrono::Duration::days(3);
+    crate::models::customer_review_link::CustomerReviewLinkEntity::insert(
+        state.rb.as_ref(),
+        &crate::models::customer_review_link::CustomerReviewLinkEntity {
+            id: None,
+            task_id: task.id,
+            customer_id: task.customer_id,
+            token: Some(token.clone()),
+            expired_at: Some(expired_at.naive_utc()),
+            status: Some("pending".to_string()),
+            sent_at: Some(chrono::Utc::now().naive_utc()),
+            created_at: None,
+        },
+    )
+    .await
+    .context("failed to create customer review link during task submit")
+    .map_err(AppError::Internal)?;
+    Ok(token)
+}
+
+async fn find_customer_review_for_task(
+    state: &AppState,
+    task_id: i64,
+) -> Result<Option<CustomerReviewPayload>, AppError> {
+    let review = db::select_one_by_map_compat::<CustomerReviewEntity>(
+        state.rb.as_ref(),
+        "customer_review",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query customer review for task detail")
+    .map_err(AppError::Internal)?;
+    let Some(review) = review else {
+        return Ok(None);
+    };
+
+    let mut images = Vec::new();
+    if let Some(review_id) = review.id {
+        images = db::select_by_map_compat::<CustomerReviewImageEntity>(
+            state.rb.as_ref(),
+            "customer_review_image",
+            value! { "review_id": review_id },
+        )
+        .await
+        .context("failed to query customer review images for task detail")
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .map(|item| CustomerReviewImageItemPayload {
+            id: item.id.unwrap_or_default(),
+            file_url: storage::public_url(&item.file_url.unwrap_or_default()),
+        })
+        .collect();
+    }
+
+    Ok(Some(CustomerReviewPayload {
+        star: review.star.unwrap_or_default(),
+        tags: review
+            .tag_json
+            .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+            .unwrap_or_default(),
+        content: review.content.unwrap_or_default(),
+        images,
+        created_at: review.created_at.map(format_datetime).unwrap_or_default(),
+    }))
+}
+
+async fn find_hq_score_for_task(
+    state: &AppState,
+    task_id: i64,
+) -> Result<Option<TaskHqScorePayload>, AppError> {
+    let score = db::select_one_by_map_compat::<HqScoreEntity>(
+        state.rb.as_ref(),
+        "hq_score",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query hq score for task detail")
+    .map_err(AppError::Internal)?;
+    let Some(score) = score else {
+        return Ok(None);
+    };
+
+    let items = db::select_by_map_compat::<HqScoreItemEntity>(
+        state.rb.as_ref(),
+        "hq_score_item",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query hq score items for task detail")
+    .map_err(AppError::Internal)?
+    .into_iter()
+    .map(|item| TaskHqScoreItemPayload {
+        service_type: item.service_type.unwrap_or_default(),
+        score: item.score.unwrap_or_default(),
+        deduction_reason: item.deduction_reason.unwrap_or_default(),
+    })
+    .collect();
+
+    Ok(Some(TaskHqScorePayload {
+        total_score: score.total_score.unwrap_or_default(),
+        score_remark: score.score_remark.unwrap_or_default(),
+        items,
+        created_at: score.created_at.map(format_datetime).unwrap_or_default(),
+    }))
+}
+
 async fn find_task_execution_by_id(
     state: &AppState,
     execution_id: i64,
@@ -2745,6 +2977,35 @@ fn parse_datetime(input: &str) -> Result<NaiveDateTime, AppError> {
 
 fn format_datetime(input: NaiveDateTime) -> String {
     input.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn format_customer_address(address: &CustomerAddressEntity) -> String {
+    let mut parts = Vec::new();
+    for part in [
+        address.province.as_deref(),
+        address.city.as_deref(),
+        address.district.as_deref(),
+        address.address.as_deref(),
+    ] {
+        if let Some(part) = part.map(str::trim).filter(|item| !item.is_empty()) {
+            parts.push(part.to_string());
+        }
+    }
+    parts.join("")
+}
+
+fn format_task_service_time_slot(
+    appointment_time: Option<NaiveDateTime>,
+    service_time_slot: Option<&str>,
+) -> Option<String> {
+    if let Some(appointment_time) = appointment_time {
+        return Some(appointment_time.format("%H:%M").to_string());
+    }
+
+    service_time_slot
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
 }
 
 fn generate_task_no() -> String {
@@ -3365,11 +3626,7 @@ fn is_technician_only(auth_user: &auth::CurrentAuthUser) -> bool {
 }
 
 fn primary_role(auth_user: &auth::CurrentAuthUser) -> &str {
-    auth_user
-        .roles
-        .first()
-        .map(|item| item.as_str())
-        .unwrap_or("unknown")
+    auth_user.primary_role()
 }
 
 async fn send_task_assignment_notice(

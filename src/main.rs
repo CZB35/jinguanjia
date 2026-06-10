@@ -8,6 +8,7 @@ mod models;
 mod notify;
 mod response;
 mod routes;
+mod sms;
 mod state;
 mod storage;
 mod wechat;

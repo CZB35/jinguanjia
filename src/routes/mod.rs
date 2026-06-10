@@ -44,6 +44,9 @@ pub fn router() -> Router<AppState> {
         .route("/me/avatar", post(me::upload_avatar))
         .route("/me/wechat-bind-url", get(me::get_wechat_bind_url))
         .route("/me/wechat-binding", get(me::get_wechat_binding_status))
+        .route("/wechat/bind-url", post(me::get_public_wechat_bind_url))
+        .route("/wechat/bind/code/send", post(me::send_wechat_bind_code))
+        .route("/wechat/bind/confirm", post(me::confirm_wechat_bind))
         .route("/me/password", patch(me::update_password))
         .route("/me/permissions", get(me::get_permissions))
         .route(

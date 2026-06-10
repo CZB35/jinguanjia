@@ -1,9 +1,15 @@
 use anyhow::Context;
-use axum::{Json, extract::{Multipart, Query, State}, http::HeaderMap};
+use axum::{
+    Json,
+    extract::{Multipart, Query, State},
+    http::HeaderMap,
+    response::{IntoResponse, Redirect, Response},
+};
 use bcrypt::hash;
 use chrono::Datelike;
 use rbs::value;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
     auth, db,
@@ -14,6 +20,7 @@ use crate::{
         user_role::UserRoleEntity, user_store::UserStoreEntity,
     },
     response::ApiResponse,
+    sms,
     state::AppState,
     storage,
     wechat,
@@ -89,6 +96,30 @@ pub struct AvatarUploadResponse {
 
 #[derive(Debug, Serialize)]
 pub struct WechatBindUrlResponse {
+    pub bind_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PublicWechatBindUrlRequest {
+    pub bind_token: Option<String>,
+    pub return_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendWechatBindCodeRequest {
+    pub mobile: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmWechatBindRequest {
+    pub bind_token: String,
+    pub mobile: String,
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicWechatBindUrlResponse {
+    pub bind_token: String,
     pub bind_url: String,
 }
 
@@ -242,6 +273,108 @@ pub async fn get_wechat_bind_url(
     Ok(Json(ApiResponse::success(WechatBindUrlResponse { bind_url })))
 }
 
+pub async fn get_public_wechat_bind_url(
+    State(state): State<AppState>,
+    Json(payload): Json<PublicWechatBindUrlRequest>,
+) -> Result<Json<ApiResponse<PublicWechatBindUrlResponse>>, AppError> {
+    let bind_token = payload.bind_token.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some(return_url) = payload.return_url.as_deref() {
+        wechat::save_public_bind_return_url(&state, &bind_token, return_url).await;
+    }
+    let bind_url = wechat::build_public_bind_url(&state, &bind_token).await?;
+    Ok(Json(ApiResponse::success(PublicWechatBindUrlResponse {
+        bind_token,
+        bind_url,
+    })))
+}
+
+pub async fn send_wechat_bind_code(
+    State(state): State<AppState>,
+    Json(payload): Json<SendWechatBindCodeRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    if payload.mobile.trim().is_empty() {
+        return Err(AppError::BadRequest("请输入手机号".to_string()));
+    }
+
+    let user = find_user_by_mobile(&state, &payload.mobile).await?;
+    ensure_user_enabled(&user)?;
+
+    let now = chrono::Utc::now().timestamp();
+    {
+        let store = state.verification_codes.read().await;
+        if let Some(existing) = store.get(&payload.mobile)
+            && now - existing.sent_at < 60
+        {
+            return Err(AppError::BadRequest(
+                "验证码发送过于频繁，请稍后重试".to_string(),
+            ));
+        }
+    }
+
+    let code = format!("{:06}", (now.rem_euclid(1_000_000)));
+    sms::send_login_code_sms(&state, &payload.mobile, &code).await?;
+
+    let mut store = state.verification_codes.write().await;
+    store.insert(
+        payload.mobile.clone(),
+        crate::state::VerificationCodeState {
+            code,
+            expires_at: now + 300,
+            sent_at: now,
+        },
+    );
+
+    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+}
+
+pub async fn confirm_wechat_bind(
+    State(state): State<AppState>,
+    Json(payload): Json<ConfirmWechatBindRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    if payload.bind_token.trim().is_empty()
+        || payload.mobile.trim().is_empty()
+        || payload.code.trim().is_empty()
+    {
+        return Err(AppError::BadRequest("请填写完整绑定信息".to_string()));
+    }
+
+    let bind_state = wechat::load_public_bind_state(&state, &payload.bind_token).await?;
+    let openid = bind_state.openid.trim().to_string();
+    if openid.is_empty() {
+        return Err(AppError::Conflict("请先在微信内完成授权".to_string()));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let stored = {
+        let store = state.verification_codes.read().await;
+        store.get(&payload.mobile).cloned()
+    }
+    .ok_or_else(|| AppError::BadRequest("验证码错误".to_string()))?;
+    if stored.expires_at < now {
+        return Err(AppError::BadRequest("验证码已过期，请重新获取".to_string()));
+    }
+    if stored.code != payload.code {
+        return Err(AppError::BadRequest("验证码错误".to_string()));
+    }
+
+    let user = find_user_by_mobile(&state, &payload.mobile).await?;
+    ensure_user_enabled(&user)?;
+    let user_id = user.id.unwrap_or_default();
+    wechat::bind_service_account_user(&state, user_id, &openid, bind_state.unionid.as_deref()).await?;
+    wechat::clear_public_bind_state(&state, &payload.bind_token).await;
+
+    {
+        let mut store = state.verification_codes.write().await;
+        store.remove(&payload.mobile);
+    }
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "ok": true,
+        "user_id": user_id,
+        "wechat_bound": true
+    }))))
+}
+
 pub async fn get_wechat_binding_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -255,7 +388,7 @@ pub async fn get_wechat_binding_status(
 pub async fn wechat_service_account_callback(
     State(state): State<AppState>,
     Query(query): Query<WechatServiceAccountCallbackQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Response, AppError> {
     let claims = wechat::decode_bind_state_token(&state.config, &query.state)
         .map_err(AppError::Internal)?;
     let oauth = wechat::exchange_service_account_oauth_code(&state, &query.code).await?;
@@ -263,14 +396,46 @@ pub async fn wechat_service_account_callback(
         .openid
         .as_deref()
         .ok_or_else(|| AppError::Conflict("微信服务号授权返回缺少openid".to_string()))?;
-    wechat::bind_service_account_user(&state, claims.sub, openid, oauth.unionid.as_deref()).await?;
+
+    if claims.purpose == "wechat_service_public_bind" {
+        let bind_token = claims
+            .bind_token
+            .clone()
+            .filter(|item| !item.trim().is_empty())
+            .ok_or_else(|| AppError::Conflict("微信绑定态缺少bind_token".to_string()))?;
+        wechat::save_public_bind_state(&state, &bind_token, openid, oauth.unionid.as_deref()).await?;
+        if let Some(return_url) = wechat::load_public_bind_return_url(&state, &bind_token).await {
+            let separator = if return_url.contains('?') { '&' } else { '?' };
+            let redirect_url = format!(
+                "{}{}bind_token={}&authorized=true",
+                return_url,
+                separator,
+                urlencoding::encode(&bind_token)
+            );
+            return Ok(Redirect::temporary(&redirect_url).into_response());
+        }
+        return Ok(Json(ApiResponse::success(serde_json::json!({
+            "ok": true,
+            "bind_token": bind_token,
+            "wechat_bound": false,
+            "authorized": true,
+            "next_action": "confirm_mobile"
+        })))
+        .into_response());
+    }
+
+    let user_id = claims
+        .sub
+        .ok_or_else(|| AppError::Conflict("微信绑定态缺少用户信息".to_string()))?;
+    wechat::bind_service_account_user(&state, user_id, openid, oauth.unionid.as_deref()).await?;
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "ok": true,
-        "user_id": claims.sub,
+        "user_id": user_id,
         "wechat_bound": true,
         "wechat_openid": openid,
-    }))))
+    })))
+    .into_response())
 }
 
 pub async fn upload_avatar(
@@ -432,6 +597,24 @@ async fn load_or_create_setting(
             "message setting create succeeded but fetch failed"
         ))
     })
+}
+
+async fn find_user_by_mobile(state: &AppState, mobile: &str) -> Result<UserEntity, AppError> {
+    db::select_one_by_map_compat(state.rb.as_ref(), "user", value! { "mobile": mobile })
+        .await
+        .context("failed to query user by mobile for wechat bind")
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::BadRequest("账号不存在，请联系管理员创建账号".to_string()))
+}
+
+fn ensure_user_enabled(user: &UserEntity) -> Result<(), AppError> {
+    if user.deleted_at.is_some() {
+        return Err(AppError::NotFound("用户不存在或已删除".to_string()));
+    }
+    if user.status.as_deref() == Some("disabled") {
+        return Err(AppError::Forbidden("账号已被禁用，请联系管理员".to_string()));
+    }
+    Ok(())
 }
 
 fn to_response(item: UserMessageSettingEntity) -> MessageSettingsResponse {
@@ -608,11 +791,11 @@ async fn build_profile_response(
             .map_err(AppError::Internal)?;
             let completed = tasks
                 .iter()
-                .filter(|item| item.task_status.as_deref() == Some("completed"))
+                .filter(|item| is_profile_completed_status(item.task_status.as_deref(), true))
                 .count();
             let month_completed = tasks
                 .iter()
-                .filter(|item| item.task_status.as_deref() == Some("completed"))
+                .filter(|item| is_profile_completed_status(item.task_status.as_deref(), true))
                 .filter(|item| {
                     item.updated_at
                         .map(|dt| dt.year() == now.year() && dt.month() == now.month())
@@ -638,11 +821,11 @@ async fn build_profile_response(
             .map_err(AppError::Internal)?;
             let completed = tasks
                 .iter()
-                .filter(|item| item.task_status.as_deref() == Some("completed"))
+                .filter(|item| is_profile_completed_status(item.task_status.as_deref(), false))
                 .count();
             let month_completed = tasks
                 .iter()
-                .filter(|item| item.task_status.as_deref() == Some("completed"))
+                .filter(|item| is_profile_completed_status(item.task_status.as_deref(), false))
                 .filter(|item| {
                     item.updated_at
                         .map(|dt| dt.year() == now.year() && dt.month() == now.month())
@@ -753,4 +936,8 @@ fn profile_status_text(status: Option<&str>) -> &'static str {
         "disabled" | "inactive" => "已禁用",
         _ => "未知状态",
     }
+}
+
+fn is_profile_completed_status(status: Option<&str>, _technician_only: bool) -> bool {
+    matches!(status, Some("pending_hq_score") | Some("completed") | Some("closed"))
 }

@@ -11,6 +11,7 @@ use crate::{
     error::AppError,
     models::{role::RoleEntity, user::UserEntity, user_role::UserRoleEntity},
     response::ApiResponse,
+    sms,
     state::AppState,
 };
 
@@ -100,6 +101,7 @@ pub async fn login_by_password(
         user.id.unwrap_or_default(),
         user.mobile.as_deref().unwrap_or_default(),
         roles.clone(),
+        &current_role,
     )
     .map_err(AppError::Internal)?;
 
@@ -126,15 +128,13 @@ pub async fn refresh_token(
     ensure_user_loginable(&user)?;
 
     let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
-    let current_role = roles
-        .first()
-        .cloned()
-        .ok_or_else(|| AppError::Forbidden("账号未分配角色，请联系管理员".to_string()))?;
+    let current_role = resolve_current_role(&roles, Some(claims.current_role.as_str()))?;
     let token_pair = auth::issue_token_pair(
         &state.config.auth,
         user.id.unwrap_or_default(),
         user.mobile.as_deref().unwrap_or_default(),
         roles.clone(),
+        &current_role,
     )
     .map_err(AppError::Internal)?;
 
@@ -160,16 +160,21 @@ pub async fn send_login_code(
     ensure_user_loginable(&user)?;
 
     let now = Utc::now().timestamp();
-    let mut store = state.verification_codes.write().await;
-    if let Some(existing) = store.get(&payload.mobile)
-        && now - existing.sent_at < 60
     {
-        return Err(AppError::BadRequest(
-            "验证码发送过于频繁，请稍后重试".to_string(),
-        ));
+        let store = state.verification_codes.read().await;
+        if let Some(existing) = store.get(&payload.mobile)
+        && now - existing.sent_at < 60
+        {
+            return Err(AppError::BadRequest(
+                "验证码发送过于频繁，请稍后重试".to_string(),
+            ));
+        }
     }
 
     let code = format!("{:06}", (now.rem_euclid(1_000_000)));
+    sms::send_login_code_sms(&state, &payload.mobile, &code).await?;
+
+    let mut store = state.verification_codes.write().await;
     store.insert(
         payload.mobile.clone(),
         crate::state::VerificationCodeState {
@@ -180,8 +185,7 @@ pub async fn send_login_code(
     );
 
     Ok(Json(ApiResponse::success(serde_json::json!({
-        "ok": true,
-        "code": code
+        "ok": true
     }))))
 }
 
@@ -225,6 +229,7 @@ pub async fn login_by_code(
         user.id.unwrap_or_default(),
         user.mobile.as_deref().unwrap_or_default(),
         roles.clone(),
+        &current_role,
     )
     .map_err(AppError::Internal)?;
 
@@ -251,10 +256,7 @@ pub async fn current_user(
     ensure_user_loginable(&user)?;
 
     let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
-    let current_role = roles
-        .first()
-        .cloned()
-        .ok_or_else(|| AppError::Forbidden("账号未分配角色，请联系管理员".to_string()))?;
+    let current_role = resolve_current_role(&roles, Some(auth_user.current_role.as_str()))?;
 
     Ok(Json(ApiResponse::success(CurrentUserPayload {
         id: user.id.unwrap_or_default(),
@@ -286,6 +288,7 @@ pub async fn switch_role(
         user.id.unwrap_or_default(),
         user.mobile.as_deref().unwrap_or_default(),
         roles.clone(),
+        &current_role,
     )
     .map_err(AppError::Internal)?;
 

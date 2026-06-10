@@ -31,6 +31,7 @@ pub struct DashboardResponse {
     pub executing_tasks: usize,
     pub completed_tasks: usize,
     pub average_score: f64,
+    pub service_overview_cards: Vec<ServiceOverviewCard>,
     pub service_stats: Vec<ServiceDashboardStat>,
     pub service_trends: Vec<ServiceTrendPoint>,
     pub service_group_counts: Vec<ServiceGroupCount>,
@@ -64,6 +65,14 @@ pub struct ServiceDashboardStat {
     pub completed_count: usize,
     pub completion_rate: f64,
     pub average_score: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceOverviewCard {
+    pub service_type: String,
+    pub title: String,
+    pub total_count: usize,
+    pub completion_rate: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +127,7 @@ pub async fn dealer_dashboard(
     let mut dashboard = build_technician_dashboard(&filtered_items, query.year, query.month);
     dashboard.recent_tasks = enrich_technician_recent_tasks(&state, &filtered_items).await?;
     dashboard.service_group_counts = build_technician_service_group_counts(&filtered_items);
+    dashboard.service_overview_cards = build_service_overview_cards_from_technician_tasks(&filtered_items);
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
@@ -134,6 +144,7 @@ pub async fn technician_dashboard(
     let mut dashboard = build_technician_dashboard(&filtered_items, query.year, query.month);
     dashboard.recent_tasks = enrich_technician_recent_tasks(&state, &filtered_items).await?;
     dashboard.service_group_counts = build_technician_service_group_counts(&filtered_items);
+    dashboard.service_overview_cards = build_service_overview_cards_from_technician_tasks(&filtered_items);
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
@@ -176,6 +187,7 @@ pub async fn hq_dashboard(
         query.month,
     );
     dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
+    dashboard.service_overview_cards = build_service_overview_cards_from_service_items(&filtered_service_items);
     dashboard.service_stats = build_service_stats(filtered_service_items.clone(), score_items);
     dashboard.service_trends = build_service_trends(filtered_service_items);
     dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
@@ -415,6 +427,7 @@ fn build_dashboard(
         executing_tasks,
         completed_tasks,
         average_score,
+        service_overview_cards: build_service_overview_cards_from_tasks(&tasks),
         service_stats: Vec::new(),
         service_trends: Vec::new(),
         service_group_counts: Vec::new(),
@@ -483,6 +496,7 @@ fn build_technician_dashboard(
         executing_tasks,
         completed_tasks,
         average_score: 0.0,
+        service_overview_cards: build_service_overview_cards_from_technician_tasks(items),
         service_stats: Vec::new(),
         service_trends: Vec::new(),
         service_group_counts: Vec::new(),
@@ -603,6 +617,100 @@ fn build_service_stats(
                 completed_count,
                 completion_rate,
                 average_score,
+            }
+        })
+        .collect()
+}
+
+fn build_service_overview_cards_from_service_items(
+    service_items: &[TaskServiceItemEntity],
+) -> Vec<ServiceOverviewCard> {
+    let service_types = ["measure", "install", "ironing", "cleaning"];
+    service_types
+        .iter()
+        .map(|service_type| {
+            let scoped = service_items
+                .iter()
+                .filter(|item| item.service_type.as_deref() == Some(*service_type))
+                .collect::<Vec<_>>();
+            let total_count = scoped.len();
+            let completed_count = scoped
+                .iter()
+                .filter(|item| matches!(item.service_status.as_deref(), Some("completed") | Some("closed")))
+                .count();
+            ServiceOverviewCard {
+                service_type: (*service_type).to_string(),
+                title: service_type_dashboard_title(service_type).to_string(),
+                total_count,
+                completion_rate: completion_rate_percent(completed_count, total_count),
+            }
+        })
+        .collect()
+}
+
+fn build_service_overview_cards_from_technician_tasks(
+    items: &[TechnicianDashboardTask],
+) -> Vec<ServiceOverviewCard> {
+    let service_types = ["measure", "install", "ironing", "cleaning"];
+    service_types
+        .iter()
+        .map(|service_type| {
+            let scoped = items
+                .iter()
+                .filter(|item| technician_task_service_type(item) == Some(*service_type))
+                .collect::<Vec<_>>();
+            let total_count = scoped.len();
+            let completed_count = scoped
+                .iter()
+                .filter(|item| technician_task_status(item) == Some("completed"))
+                .count();
+            ServiceOverviewCard {
+                service_type: (*service_type).to_string(),
+                title: service_type_dashboard_title(service_type).to_string(),
+                total_count,
+                completion_rate: completion_rate_percent(completed_count, total_count),
+            }
+        })
+        .collect()
+}
+
+fn completion_rate_percent(completed_count: usize, total_count: usize) -> f64 {
+    if total_count == 0 {
+        0.0
+    } else {
+        ((completed_count as f64 / total_count as f64) * 1000.0).round() / 10.0
+    }
+}
+
+fn service_type_dashboard_title(service_type: &str) -> &'static str {
+    match service_type {
+        "measure" => "量尺任务",
+        "install" => "安装任务",
+        "ironing" => "熨烫任务",
+        "cleaning" => "除尘除螨任务",
+        _ => "服务任务",
+    }
+}
+
+fn build_service_overview_cards_from_tasks(tasks: &[TaskEntity]) -> Vec<ServiceOverviewCard> {
+    let service_types = ["measure", "install", "ironing", "cleaning"];
+    service_types
+        .iter()
+        .map(|service_type| {
+            let scoped = tasks
+                .iter()
+                .filter(|item| item.service_type.as_deref() == Some(*service_type))
+                .collect::<Vec<_>>();
+            let total_count = scoped.len();
+            let completed_count = scoped
+                .iter()
+                .filter(|item| item.task_status.as_deref() == Some("completed"))
+                .count();
+            ServiceOverviewCard {
+                service_type: (*service_type).to_string(),
+                title: service_type_dashboard_title(service_type).to_string(),
+                total_count,
+                completion_rate: completion_rate_percent(completed_count, total_count),
             }
         })
         .collect()

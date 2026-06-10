@@ -11,13 +11,18 @@ use crate::{
     config::AppConfig,
     db,
     error::AppError,
-    models::{notice::NoticeEntity, notice_delivery::NoticeDeliveryEntity, system_config::SystemConfigEntity, user::UserEntity},
+    models::{
+        customer::CustomerEntity, hq_score::HqScoreEntity, notice::NoticeEntity,
+        notice_delivery::NoticeDeliveryEntity, store::StoreEntity,
+        system_config::SystemConfigEntity, task::TaskEntity, user::UserEntity,
+    },
     state::AppState,
 };
 
 #[derive(Clone, Default)]
 pub struct WechatRuntime {
     pub access_token: Arc<RwLock<Option<WechatAccessTokenState>>>,
+    pub public_bind_return_urls: Arc<RwLock<std::collections::HashMap<String, WechatPublicBindReturnState>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,10 +31,24 @@ pub struct WechatAccessTokenState {
     pub expires_at: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct WechatPublicBindState {
+    pub openid: String,
+    pub unionid: Option<String>,
+    pub authorized_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct WechatPublicBindReturnState {
+    pub return_url: String,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WechatBindStateClaims {
-    pub sub: i64,
+    pub sub: Option<i64>,
     pub purpose: String,
+    pub bind_token: Option<String>,
     pub iat: i64,
     pub exp: i64,
 }
@@ -46,6 +65,7 @@ pub struct WechatTemplateConfig {
     pub template_id: String,
     pub page_path: Option<String>,
     pub miniprogram_appid: Option<String>,
+    pub miniprogram_state: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -103,6 +123,8 @@ struct WechatTemplateSendPayload {
 struct WechatTemplateMiniprogram {
     appid: String,
     pagepath: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    miniprogram_state: Option<String>,
 }
 
 pub async fn build_service_account_bind_url(state: &AppState, user_id: i64) -> Result<String, AppError> {
@@ -119,11 +141,26 @@ pub async fn build_service_account_bind_url(state: &AppState, user_id: i64) -> R
     ))
 }
 
+pub async fn build_public_bind_url(state: &AppState, bind_token: &str) -> Result<String, AppError> {
+    let config = load_service_account_config(state).await?;
+    if config.appid.trim().is_empty() || config.bind_redirect_uri.trim().is_empty() {
+        return Err(AppError::Conflict("微信服务号配置不完整".to_string()));
+    }
+    let state_token = build_public_bind_state_token(&state.config, bind_token).map_err(AppError::Internal)?;
+    Ok(format!(
+        "https://open.weixin.qq.com/connect/oauth2/authorize?appid={}&redirect_uri={}&response_type=code&scope=snsapi_base&state={}#wechat_redirect",
+        urlencoding::encode(&config.appid),
+        urlencoding::encode(&config.bind_redirect_uri),
+        urlencoding::encode(&state_token),
+    ))
+}
+
 pub fn build_bind_state_token(config: &AppConfig, user_id: i64) -> Result<String> {
     let now = Utc::now();
     let claims = WechatBindStateClaims {
-        sub: user_id,
+        sub: Some(user_id),
         purpose: "wechat_service_bind".to_string(),
+        bind_token: None,
         iat: now.timestamp(),
         exp: (now + Duration::minutes(10)).timestamp(),
     };
@@ -135,6 +172,23 @@ pub fn build_bind_state_token(config: &AppConfig, user_id: i64) -> Result<String
     .context("failed to encode wechat bind state token")
 }
 
+pub fn build_public_bind_state_token(config: &AppConfig, bind_token: &str) -> Result<String> {
+    let now = Utc::now();
+    let claims = WechatBindStateClaims {
+        sub: None,
+        purpose: "wechat_service_public_bind".to_string(),
+        bind_token: Some(bind_token.to_string()),
+        iat: now.timestamp(),
+        exp: (now + Duration::minutes(10)).timestamp(),
+    };
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(config.auth.jwt_secret.as_bytes()),
+    )
+    .context("failed to encode wechat public bind state token")
+}
+
 pub fn decode_bind_state_token(config: &AppConfig, token: &str) -> Result<WechatBindStateClaims> {
     let data = jsonwebtoken::decode::<WechatBindStateClaims>(
         token,
@@ -142,7 +196,9 @@ pub fn decode_bind_state_token(config: &AppConfig, token: &str) -> Result<Wechat
         &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
     )
     .context("failed to decode wechat bind state token")?;
-    if data.claims.purpose != "wechat_service_bind" {
+    if data.claims.purpose != "wechat_service_bind"
+        && data.claims.purpose != "wechat_service_public_bind"
+    {
         return Err(anyhow!("invalid bind state token"));
     }
     Ok(data.claims)
@@ -221,6 +277,66 @@ pub async fn get_bind_status(state: &AppState, user_id: i64) -> Result<WechatBin
         wechat_openid: user.wechat_openid,
         wechat_subscribe: user.wechat_subscribe.unwrap_or(0) == 1,
         wechat_bind_at: user.wechat_bind_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+    })
+}
+
+pub async fn save_public_bind_state(
+    state: &AppState,
+    bind_token: &str,
+    openid: &str,
+    unionid: Option<&str>,
+) -> Result<(), AppError> {
+    let mut store = state.wechat_public_binds.write().await;
+    store.insert(
+        bind_token.to_string(),
+        WechatPublicBindState {
+            openid: openid.to_string(),
+            unionid: unionid.map(ToString::to_string),
+            authorized_at: Utc::now().timestamp(),
+        },
+    );
+    Ok(())
+}
+
+pub async fn load_public_bind_state(
+    state: &AppState,
+    bind_token: &str,
+) -> Result<WechatPublicBindState, AppError> {
+    let store = state.wechat_public_binds.read().await;
+    let bind = store
+        .get(bind_token)
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("微信授权状态已失效，请重新发起绑定".to_string()))?;
+    if Utc::now().timestamp() - bind.authorized_at > 600 {
+        return Err(AppError::BadRequest("微信授权状态已过期，请重新发起绑定".to_string()));
+    }
+    Ok(bind)
+}
+
+pub async fn clear_public_bind_state(state: &AppState, bind_token: &str) {
+    let mut store = state.wechat_public_binds.write().await;
+    store.remove(bind_token);
+}
+
+pub async fn save_public_bind_return_url(state: &AppState, bind_token: &str, return_url: &str) {
+    let mut store = state.wechat_runtime.public_bind_return_urls.write().await;
+    store.insert(
+        bind_token.to_string(),
+        WechatPublicBindReturnState {
+            return_url: return_url.to_string(),
+            created_at: Utc::now().timestamp(),
+        },
+    );
+}
+
+pub async fn load_public_bind_return_url(state: &AppState, bind_token: &str) -> Option<String> {
+    let store = state.wechat_runtime.public_bind_return_urls.read().await;
+    store.get(bind_token).and_then(|item| {
+        if Utc::now().timestamp() - item.created_at > 1800 {
+            None
+        } else {
+            Some(item.return_url.clone())
+        }
     })
 }
 
@@ -406,6 +522,7 @@ async fn send_wechat_delivery(state: &AppState, delivery: &NoticeDeliveryEntity)
     let access_token = get_service_account_access_token(state).await?;
     let payload: serde_json::Value = serde_json::from_str(delivery.payload_json.as_deref().unwrap_or("{}"))
         .context("failed to parse notice delivery payload json")?;
+    let data = build_template_message_data(state, template_code, &payload).await?;
 
     let request = WechatTemplateSendPayload {
         touser: delivery.receiver_openid.clone().unwrap_or_default(),
@@ -418,12 +535,12 @@ async fn send_wechat_delivery(state: &AppState, delivery: &NoticeDeliveryEntity)
             .miniprogram_appid
             .clone()
             .zip(template.page_path.clone())
-            .map(|(appid, pagepath)| WechatTemplateMiniprogram { appid, pagepath }),
-        data: serde_json::json!({
-            "first": { "value": payload.get("title").and_then(|v| v.as_str()).unwrap_or_default() },
-            "keyword1": { "value": payload.get("content").and_then(|v| v.as_str()).unwrap_or_default() },
-            "remark": { "value": payload.get("biz_type").and_then(|v| v.as_str()).unwrap_or_default() },
-        }),
+            .map(|(appid, pagepath)| WechatTemplateMiniprogram {
+                appid,
+                pagepath,
+                miniprogram_state: template.miniprogram_state.clone(),
+            }),
+        data,
     };
 
     let response = reqwest::Client::new()
@@ -445,6 +562,101 @@ async fn send_wechat_delivery(state: &AppState, delivery: &NoticeDeliveryEntity)
         ));
     }
     Ok(response.msgid.map(|item| item.to_string()))
+}
+
+async fn build_template_message_data(
+    state: &AppState,
+    template_code: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    match template_code {
+        "hq_score_done" => build_hq_score_done_template_data(state, payload).await,
+        _ => Ok(serde_json::json!({
+            "first": { "value": payload.get("title").and_then(|v| v.as_str()).unwrap_or_default() },
+            "keyword1": { "value": payload.get("content").and_then(|v| v.as_str()).unwrap_or_default() },
+            "remark": { "value": payload.get("biz_type").and_then(|v| v.as_str()).unwrap_or_default() },
+        })),
+    }
+}
+
+async fn build_hq_score_done_template_data(
+    state: &AppState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let biz_id = payload
+        .get("biz_id")
+        .and_then(|item| item.as_i64())
+        .ok_or_else(|| anyhow!("wechat hq_score_done payload missing biz_id"))?;
+    let task = db::select_one_by_map_compat::<TaskEntity>(
+        state.rb.as_ref(),
+        "task",
+        value! { "id": biz_id },
+    )
+    .await
+    .context("failed to query task for wechat hq score template")?
+    .ok_or_else(|| anyhow!("task not found for wechat hq score template: {biz_id}"))?;
+    let project_name = resolve_wechat_project_name(state, &task).await?;
+    let hq_score = db::select_one_by_map_compat::<HqScoreEntity>(
+        state.rb.as_ref(),
+        "hq_score",
+        value! { "task_id": biz_id },
+    )
+    .await
+    .context("failed to query hq score for wechat template")?;
+    let score_text = if let Some(score) = hq_score.and_then(|item| item.total_score) {
+        format!("{}分，考核通过", score)
+    } else {
+        payload
+            .get("content")
+            .and_then(|item| item.as_str())
+            .unwrap_or("评分已完成")
+            .to_string()
+    };
+
+    Ok(serde_json::json!({
+        "thing2": { "value": truncate_wechat_text(&project_name, 20) },
+        "thing9": { "value": truncate_wechat_text(&score_text, 20) },
+    }))
+}
+
+async fn resolve_wechat_project_name(state: &AppState, task: &TaskEntity) -> Result<String> {
+    if let Some(store_id) = task.store_id {
+        if let Some(store) = db::select_one_by_map_compat::<StoreEntity>(
+            state.rb.as_ref(),
+            "store",
+            value! { "id": store_id },
+        )
+        .await
+        .context("failed to query store for wechat project name")?
+            && let Some(name) = store.store_name.map(|item| item.trim().to_string()).filter(|item| !item.is_empty())
+        {
+            return Ok(name);
+        }
+    }
+
+    if let Some(customer_id) = task.customer_id {
+        if let Some(customer) = db::select_one_by_map_compat::<CustomerEntity>(
+            state.rb.as_ref(),
+            "customer",
+            value! { "id": customer_id },
+        )
+        .await
+        .context("failed to query customer for wechat project name")?
+            && let Some(name) = customer.name.map(|item| item.trim().to_string()).filter(|item| !item.is_empty())
+        {
+            return Ok(name);
+        }
+    }
+
+    Ok(task.task_no.clone().unwrap_or_else(|| "项目服务".to_string()))
+}
+
+fn truncate_wechat_text(input: &str, max_chars: usize) -> String {
+    let text = input.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
 }
 
 async fn get_service_account_access_token(state: &AppState) -> Result<String> {
@@ -518,10 +730,12 @@ async fn load_template_config(state: &AppState, template_code: &str) -> Result<W
     let template_id = load_config_string(state, &format!("wechat.template.{template_code}.template_id")).await?;
     let page_path = load_config_optional_string(state, &format!("wechat.template.{template_code}.page_path")).await?;
     let miniprogram_appid = load_config_optional_string(state, &format!("wechat.template.{template_code}.miniprogram_appid")).await?;
+    let miniprogram_state = load_config_optional_string(state, &format!("wechat.template.{template_code}.miniprogram_state")).await?;
     Ok(WechatTemplateConfig {
         template_id,
         page_path,
         miniprogram_appid,
+        miniprogram_state,
     })
 }
 

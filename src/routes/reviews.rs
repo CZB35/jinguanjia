@@ -18,6 +18,7 @@ use crate::{
     },
     notify,
     response::ApiResponse,
+    sms,
     state::AppState,
 };
 
@@ -307,6 +308,7 @@ pub async fn hq_score(
             "任务总部评分已完成，流程已结束",
         )
         .await;
+        let _ = sms::send_dealer_hq_score_sms(&state, dealer_user_id).await;
     }
     audit::write_audit_log(
         &state,
@@ -523,9 +525,5 @@ fn calc_service_level(score: i32) -> &'static str {
 }
 
 fn primary_role(auth_user: &auth::CurrentAuthUser) -> &str {
-    auth_user
-        .roles
-        .first()
-        .map(|item| item.as_str())
-        .unwrap_or("unknown")
+    auth_user.primary_role()
 }
