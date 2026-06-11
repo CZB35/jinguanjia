@@ -27,6 +27,7 @@ const ALIYUN_PERCENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 const LOGIN_CODE_TEMPLATE_CODE: &str = "SMS_506190346";
 const CUSTOMER_REVIEW_TEMPLATE_CODE: &str = "SMS_506145373";
 const DEALER_HQ_SCORE_TEMPLATE_CODE: &str = "SMS_506265341";
+const CUSTOMER_REVIEW_SIGN_NAME: &str = "如鱼得水杭州软装定制";
 
 #[derive(Clone, Debug)]
 pub struct SmsTemplate {
@@ -82,11 +83,11 @@ pub async fn send_customer_review_sms(
     mobile: &str,
     payload: CustomerReviewSmsPayload<'_>,
 ) -> Result<Option<SmsDeliveryResult>, AppError> {
-    let link = format!(
-        "mobile/evaluate/index.html?token={}",
-        urlencoding::encode(payload.review_link_code)
-    );
-    let params = value!({ "code": link });
+    if !load_config_bool(state, "sms.switch.customer_review", true).await? {
+        tracing::info!(mobile, "customer review sms skipped because platform switch is disabled");
+        return Ok(None);
+    }
+    let params = value! { "code": payload.review_link_code.to_string() };
     send_sms_by_mobile(state, mobile, &customer_review_template(state), params).await
 }
 
@@ -94,6 +95,10 @@ pub async fn send_dealer_hq_score_sms(
     state: &AppState,
     receiver_id: i64,
 ) -> Result<Option<SmsDeliveryResult>, AppError> {
+    if !load_config_bool(state, "sms.switch.dealer_notify", true).await? {
+        tracing::info!(receiver_id, "dealer notify sms skipped because platform switch is disabled");
+        return Ok(None);
+    }
     if !user_sms_enabled(state, receiver_id).await? {
         return Ok(None);
     }
@@ -123,7 +128,7 @@ pub fn login_code_template(state: &AppState) -> SmsTemplate {
 pub fn customer_review_template(state: &AppState) -> SmsTemplate {
     SmsTemplate {
         template_code: CUSTOMER_REVIEW_TEMPLATE_CODE,
-        sign_name: sms_sign_name_fallback(state),
+        sign_name: customer_review_sign_name(state),
     }
 }
 
@@ -384,4 +389,8 @@ async fn load_user_by_id(state: &AppState, user_id: i64) -> Result<UserEntity, A
 
 fn sms_sign_name_fallback(_state: &AppState) -> &'static str {
     "如鱼得水高端窗帘"
+}
+
+fn customer_review_sign_name(_state: &AppState) -> &'static str {
+    CUSTOMER_REVIEW_SIGN_NAME
 }

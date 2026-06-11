@@ -60,6 +60,7 @@ pub struct ResetPasswordRequest {
 pub struct UserItem {
     pub id: i64,
     pub name: String,
+    pub account: String,
     pub mobile: String,
     pub status: String,
     pub status_code: String,
@@ -167,6 +168,7 @@ pub async fn list_users(
         items.push(UserItem {
             id: user_id,
             name: user.name.unwrap_or_default(),
+            account: user.mobile.clone().unwrap_or_default(),
             mobile: user.mobile.unwrap_or_default(),
             status: user_status_text(user.status.as_deref()).to_string(),
             status_code: user.status.clone().unwrap_or_else(|| "enabled".to_string()),
