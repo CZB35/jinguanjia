@@ -68,6 +68,8 @@ pub struct TaskListQuery {
     pub appointment_end: Option<String>,
     pub mobile: Option<String>,
     pub customer_name: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +173,8 @@ pub struct TaskSummary {
 pub struct TaskListResponse {
     pub items: Vec<TaskSummary>,
     pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -537,9 +541,15 @@ pub async fn list_tasks(
     let items = load_task_summaries(&state, &auth_user, &query).await?;
 
     let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).max(1);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(TaskListResponse {
         items,
         total,
+        page,
+        page_size,
     })))
 }
 
@@ -2740,7 +2750,7 @@ async fn ensure_customer_review_link_for_task(
         return Ok(token);
     }
 
-    let token = uuid::Uuid::new_v4().to_string();
+    let token = generate_customer_review_token();
     let expired_at = chrono::Utc::now() + chrono::Duration::days(3);
     crate::models::customer_review_link::CustomerReviewLinkEntity::insert(
         state.rb.as_ref(),
@@ -2759,6 +2769,11 @@ async fn ensure_customer_review_link_for_task(
     .context("failed to create customer review link during task submit")
     .map_err(AppError::Internal)?;
     Ok(token)
+}
+
+fn generate_customer_review_token() -> String {
+    let seed = uuid::Uuid::new_v4().as_u128() % 100_000_000;
+    format!("{:08}", seed)
 }
 
 async fn find_customer_review_for_task(

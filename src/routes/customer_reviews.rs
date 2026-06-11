@@ -1,27 +1,21 @@
 use anyhow::Context;
 use axum::{
-    extract::Multipart,
     Json,
+    extract::Multipart,
     extract::{Path, Query, State},
     http::HeaderMap,
 };
 use chrono::{Duration, Utc};
 use rbs::value;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
     models::{
-        customer_review::CustomerReviewEntity,
-        customer_review_image::CustomerReviewImageEntity,
-        customer_review_link::CustomerReviewLinkEntity,
-        hq_score::HqScoreEntity,
-        task::TaskEntity,
-        task_service_item::TaskServiceItemEntity,
-        user::UserEntity,
+        customer_review::CustomerReviewEntity, customer_review_image::CustomerReviewImageEntity,
+        customer_review_link::CustomerReviewLinkEntity, hq_score::HqScoreEntity, task::TaskEntity,
+        task_service_item::TaskServiceItemEntity, user::UserEntity,
     },
     notify,
     response::ApiResponse,
@@ -36,12 +30,14 @@ pub struct SendReviewLinkRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ReviewFormQuery {
-    pub token: String,
+    pub token: Option<String>,
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitCustomerReviewRequest {
-    pub token: String,
+    pub token: Option<String>,
+    pub code: Option<String>,
     pub star: i32,
     pub tags: Option<Vec<String>>,
     pub content: Option<String>,
@@ -98,7 +94,7 @@ pub async fn send_review_link(
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
     let task = find_task(&state, payload.task_id).await?;
-    let token = Uuid::new_v4().to_string();
+    let token = generate_customer_review_token();
     let expired_at = Utc::now() + Duration::days(3);
 
     CustomerReviewLinkEntity::insert(
@@ -137,15 +133,26 @@ pub async fn send_review_link(
     }))))
 }
 
+fn generate_customer_review_token() -> String {
+    let seed = uuid::Uuid::new_v4().as_u128() % 100_000_000;
+    format!("{:08}", seed)
+}
+
 pub async fn review_form(
     State(state): State<AppState>,
     Query(query): Query<ReviewFormQuery>,
 ) -> Result<Json<ApiResponse<CustomerReviewFormResponse>>, AppError> {
-    let link = find_link_by_token(&state, &query.token).await?;
+    let token = resolve_review_token(query.token.as_deref(), query.code.as_deref())?;
+    let link = find_link_by_token(&state, &token).await?;
     if link.status.as_deref() == Some("used") {
         return Err(AppError::Conflict("该评价链接已使用".to_string()));
     }
-    if link.expired_at.map(|dt| dt.and_utc().timestamp()).unwrap_or_default() < Utc::now().timestamp() {
+    if link
+        .expired_at
+        .map(|dt| dt.and_utc().timestamp())
+        .unwrap_or_default()
+        < Utc::now().timestamp()
+    {
         return Err(AppError::Conflict("该评价链接已过期".to_string()));
     }
 
@@ -155,14 +162,22 @@ pub async fn review_form(
     } else {
         None
     };
-    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(state.rb.as_ref(), "task_service_item", value! { "task_id": task.id.unwrap_or_default() })
-        .await
-        .context("failed to query task service items for customer review form")
-        .map_err(AppError::Internal)?;
-    let images: Vec<CustomerReviewImageEntity> = db::select_by_map_compat(state.rb.as_ref(), "customer_review_image", value! { "review_link_id": link.id.unwrap_or_default() })
-        .await
-        .context("failed to query customer review images")
-        .map_err(AppError::Internal)?;
+    let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task_service_item",
+        value! { "task_id": task.id.unwrap_or_default() },
+    )
+    .await
+    .context("failed to query task service items for customer review form")
+    .map_err(AppError::Internal)?;
+    let images: Vec<CustomerReviewImageEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "customer_review_image",
+        value! { "review_link_id": link.id.unwrap_or_default() },
+    )
+    .await
+    .context("failed to query customer review images")
+    .map_err(AppError::Internal)?;
     let technician_avg_score = if let Some(technician_id) = task.current_technician_id {
         calculate_technician_average_score(&state, technician_id).await?
     } else {
@@ -172,19 +187,42 @@ pub async fn review_form(
     Ok(Json(ApiResponse::success(CustomerReviewFormResponse {
         task_id: link.task_id.unwrap_or_default(),
         customer_id: link.customer_id.unwrap_or_default(),
-        expired_at: link.expired_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default(),
+        expired_at: link
+            .expired_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default(),
         status: link.status.unwrap_or_default(),
-        technician_name: technician.as_ref().and_then(|item| item.name.clone()).unwrap_or_default(),
+        technician_name: technician
+            .as_ref()
+            .and_then(|item| item.name.clone())
+            .unwrap_or_default(),
         technician_avatar_url: technician.as_ref().and_then(|item| item.avatar_url.clone()),
         technician_avg_score,
-        service_items_text: service_items.into_iter().filter_map(|item| item.service_type).map(service_type_name).collect::<Vec<_>>().join("、"),
-        service_time: task.appointment_time.map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
-        tag_options: vec!["服务专业".to_string(), "准时上门".to_string(), "价格透明".to_string(), "技术熟练".to_string(), "态度友好".to_string(), "清洁到位".to_string()],
-        images: images.into_iter().map(|item| CustomerReviewImagePayload {
-            id: item.id.unwrap_or_default(),
-            file_name: item.file_name.unwrap_or_default(),
-            file_url: storage::public_url(&item.file_url.unwrap_or_default()),
-        }).collect(),
+        service_items_text: service_items
+            .into_iter()
+            .filter_map(|item| item.service_type)
+            .map(service_type_name)
+            .collect::<Vec<_>>()
+            .join("、"),
+        service_time: task
+            .appointment_time
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
+        tag_options: vec![
+            "服务专业".to_string(),
+            "准时上门".to_string(),
+            "价格透明".to_string(),
+            "技术熟练".to_string(),
+            "态度友好".to_string(),
+            "清洁到位".to_string(),
+        ],
+        images: images
+            .into_iter()
+            .map(|item| CustomerReviewImagePayload {
+                id: item.id.unwrap_or_default(),
+                file_name: item.file_name.unwrap_or_default(),
+                file_url: storage::public_url(&item.file_url.unwrap_or_default()),
+            })
+            .collect(),
     })))
 }
 
@@ -193,7 +231,8 @@ pub async fn upload_customer_review_image(
     Query(query): Query<ReviewFormQuery>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<CustomerReviewImageUploadResponse>>, AppError> {
-    let link = find_link_by_token(&state, &query.token).await?;
+    let token = resolve_review_token(query.token.as_deref(), query.code.as_deref())?;
+    let link = find_link_by_token(&state, &token).await?;
     if link.status.as_deref() == Some("used") {
         return Err(AppError::Conflict("该评价链接已使用".to_string()));
     }
@@ -205,12 +244,25 @@ pub async fn upload_customer_review_image(
         .context("failed to read customer review image field")
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::BadRequest("请上传图片".to_string()))?;
-    let file_name = field.file_name().map(ToString::to_string).ok_or_else(|| AppError::BadRequest("上传文件名不能为空".to_string()))?;
+    let file_name = field
+        .file_name()
+        .map(ToString::to_string)
+        .ok_or_else(|| AppError::BadRequest("上传文件名不能为空".to_string()))?;
     let content_type = field.content_type().map(ToString::to_string);
-    let bytes = field.bytes().await.context("failed to read customer review image bytes").map_err(AppError::Internal)?;
-    let stored = storage::save_bytes(&state, "customer-reviews", &file_name, content_type.as_deref(), &bytes)
+    let bytes = field
+        .bytes()
         .await
+        .context("failed to read customer review image bytes")
         .map_err(AppError::Internal)?;
+    let stored = storage::save_bytes(
+        &state,
+        "customer-reviews",
+        &file_name,
+        content_type.as_deref(),
+        &bytes,
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     CustomerReviewImageEntity::insert(
         state.rb.as_ref(),
@@ -235,11 +287,13 @@ pub async fn upload_customer_review_image(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("customer review image fetch failed")))?;
 
-    Ok(Json(ApiResponse::success(CustomerReviewImageUploadResponse {
-        id: image.id.unwrap_or_default(),
-        file_name: image.file_name.unwrap_or_default(),
-        file_url: storage::public_url(&image.file_url.unwrap_or_default()),
-    })))
+    Ok(Json(ApiResponse::success(
+        CustomerReviewImageUploadResponse {
+            id: image.id.unwrap_or_default(),
+            file_name: image.file_name.unwrap_or_default(),
+            file_url: storage::public_url(&image.file_url.unwrap_or_default()),
+        },
+    )))
 }
 
 pub async fn delete_customer_review_image(
@@ -247,7 +301,8 @@ pub async fn delete_customer_review_image(
     Query(query): Query<ReviewFormQuery>,
     Path(image_id): Path<i64>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    let link = find_link_by_token(&state, &query.token).await?;
+    let token = resolve_review_token(query.token.as_deref(), query.code.as_deref())?;
+    let link = find_link_by_token(&state, &token).await?;
     if link.status.as_deref() == Some("used") {
         return Err(AppError::Conflict("该评价链接已使用".to_string()));
     }
@@ -270,7 +325,9 @@ pub async fn delete_customer_review_image(
     let path = storage::full_path(&state, image.file_url.as_deref().unwrap_or_default());
     let _ = tokio::fs::remove_file(path).await;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 pub async fn submit_customer_review(
@@ -281,11 +338,17 @@ pub async fn submit_customer_review(
         return Err(AppError::BadRequest("评分范围只能为 1 到 5 星".to_string()));
     }
 
-    let link = find_link_by_token(&state, &payload.token).await?;
+    let token = resolve_review_token(payload.token.as_deref(), payload.code.as_deref())?;
+    let link = find_link_by_token(&state, &token).await?;
     if link.status.as_deref() == Some("used") {
         return Err(AppError::Conflict("该评价链接已使用".to_string()));
     }
-    if link.expired_at.map(|dt| dt.and_utc().timestamp()).unwrap_or_default() < Utc::now().timestamp() {
+    if link
+        .expired_at
+        .map(|dt| dt.and_utc().timestamp())
+        .unwrap_or_default()
+        < Utc::now().timestamp()
+    {
         return Err(AppError::Conflict("该评价链接已过期".to_string()));
     }
 
@@ -301,7 +364,11 @@ pub async fn submit_customer_review(
         return Err(AppError::Conflict("该任务已完成客户评价".to_string()));
     }
 
-    let tag_json = payload.tags.as_ref().map(serde_json::to_string).transpose()
+    let tag_json = payload
+        .tags
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
         .context("failed to serialize customer review tags")
         .map_err(AppError::Internal)?;
     CustomerReviewEntity::insert(
@@ -321,11 +388,15 @@ pub async fn submit_customer_review(
     .context("failed to create customer review")
     .map_err(AppError::Internal)?;
 
-    let review: CustomerReviewEntity = db::select_one_by_map_compat(state.rb.as_ref(), "customer_review", value! { "task_id": link.task_id.unwrap_or_default() })
-        .await
-        .context("failed to fetch created customer review")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("customer review fetch failed")))?;
+    let review: CustomerReviewEntity = db::select_one_by_map_compat(
+        state.rb.as_ref(),
+        "customer_review",
+        value! { "task_id": link.task_id.unwrap_or_default() },
+    )
+    .await
+    .context("failed to fetch created customer review")
+    .map_err(AppError::Internal)?
+    .ok_or_else(|| AppError::Internal(anyhow::anyhow!("customer review fetch failed")))?;
     if let Some(image_ids) = payload.image_ids {
         for image_id in image_ids {
             let image: CustomerReviewImageEntity = db::select_one_by_map_compat(
@@ -363,14 +434,17 @@ pub async fn submit_customer_review(
     .context("failed to update customer review link status")
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 pub async fn review_detail(
     State(state): State<AppState>,
     Query(query): Query<ReviewFormQuery>,
 ) -> Result<Json<ApiResponse<CustomerReviewDetailResponse>>, AppError> {
-    let link = find_link_by_token(&state, &query.token).await?;
+    let token = resolve_review_token(query.token.as_deref(), query.code.as_deref())?;
+    let link = find_link_by_token(&state, &token).await?;
     let review: CustomerReviewEntity = db::select_one_by_map_compat(
         state.rb.as_ref(),
         "customer_review",
@@ -408,7 +482,9 @@ pub async fn review_detail(
                 file_url: storage::public_url(&item.file_url.unwrap_or_default()),
             })
             .collect(),
-        created_at: review.created_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+        created_at: review
+            .created_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
     })))
 }
 
@@ -420,12 +496,28 @@ async fn find_task(state: &AppState, task_id: i64) -> Result<TaskEntity, AppErro
         .ok_or_else(|| AppError::NotFound("任务不存在或已删除".to_string()))
 }
 
-async fn find_link_by_token(state: &AppState, token: &str) -> Result<CustomerReviewLinkEntity, AppError> {
-    db::select_one_by_map_compat(state.rb.as_ref(), "customer_review_link", value! { "token": token })
-        .await
-        .context("failed to query customer review link")
-        .map_err(AppError::Internal)?
+async fn find_link_by_token(
+    state: &AppState,
+    token: &str,
+) -> Result<CustomerReviewLinkEntity, AppError> {
+    db::select_one_by_map_compat(
+        state.rb.as_ref(),
+        "customer_review_link",
+        value! { "token": token },
+    )
+    .await
+    .context("failed to query customer review link")
+    .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound("评价链接不存在".to_string()))
+}
+
+fn resolve_review_token(token: Option<&str>, code: Option<&str>) -> Result<String, AppError> {
+    token
+        .or(code)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| AppError::BadRequest("评价链接缺少参数".to_string()))
 }
 
 async fn load_user(state: &AppState, user_id: i64) -> Result<UserEntity, AppError> {
@@ -446,23 +538,38 @@ fn service_type_name(service_type: String) -> String {
     }
 }
 
-async fn calculate_technician_average_score(state: &AppState, technician_id: i64) -> Result<f64, AppError> {
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! { "current_technician_id": technician_id })
-        .await
-        .context("failed to query technician tasks for customer review score")
-        .map_err(AppError::Internal)?;
+async fn calculate_technician_average_score(
+    state: &AppState,
+    technician_id: i64,
+) -> Result<f64, AppError> {
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "task",
+        value! { "current_technician_id": technician_id },
+    )
+    .await
+    .context("failed to query technician tasks for customer review score")
+    .map_err(AppError::Internal)?;
     let task_ids: Vec<i64> = tasks.into_iter().filter_map(|item| item.id).collect();
     if task_ids.is_empty() {
         return Ok(0.0);
     }
 
-    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! { "task_id": task_ids })
-        .await
-        .context("failed to query technician scores for customer review")
-        .map_err(AppError::Internal)?;
+    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "hq_score",
+        value! { "task_id": task_ids },
+    )
+    .await
+    .context("failed to query technician scores for customer review")
+    .map_err(AppError::Internal)?;
     if scores.is_empty() {
         return Ok(0.0);
     }
 
-    Ok(scores.iter().map(|item| item.total_score.unwrap_or_default() as f64).sum::<f64>() / scores.len() as f64)
+    Ok(scores
+        .iter()
+        .map(|item| item.total_score.unwrap_or_default() as f64)
+        .sum::<f64>()
+        / scores.len() as f64)
 }

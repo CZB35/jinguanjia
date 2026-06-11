@@ -23,6 +23,15 @@ pub struct PasswordLoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AdminPasswordLoginRequest {
+    pub account: Option<String>,
+    pub username: Option<String>,
+    pub mobile: Option<String>,
+    pub password: String,
+    pub role_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CodeLoginRequest {
     pub mobile: String,
     pub code: String,
@@ -108,6 +117,62 @@ pub async fn login_by_password(
     Ok(Json(ApiResponse::success(build_login_response(
         &user,
         roles,
+        current_role,
+        token_pair,
+    )?)))
+}
+
+pub async fn login_admin_by_password(
+    State(state): State<AppState>,
+    Json(payload): Json<AdminPasswordLoginRequest>,
+) -> Result<Json<ApiResponse<LoginResponse>>, AppError> {
+    let account = payload
+        .account
+        .as_deref()
+        .or(payload.username.as_deref())
+        .or(payload.mobile.as_deref())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .ok_or_else(|| AppError::BadRequest("请输入账号".to_string()))?
+        .to_string();
+    if payload.password.trim().is_empty() {
+        return Err(AppError::BadRequest("请输入密码".to_string()));
+    }
+
+    let user = find_user_by_account(&state, &account).await?;
+    ensure_user_loginable(&user)?;
+
+    let password_hash = user
+        .password_hash
+        .as_deref()
+        .ok_or_else(|| AppError::Unauthorized("账号或密码错误".to_string()))?;
+
+    let password_ok = verify(&payload.password, password_hash)
+        .context("failed to verify admin password")
+        .map_err(AppError::Internal)?;
+    if !password_ok {
+        return Err(AppError::BadRequest("账号或密码错误".to_string()));
+    }
+
+    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
+    let backend_roles = filter_backend_roles(roles);
+    if backend_roles.is_empty() {
+        return Err(AppError::Forbidden("当前账号无后台登录权限".to_string()));
+    }
+
+    let current_role = resolve_current_role(&backend_roles, payload.role_code.as_deref())?;
+    let token_pair = auth::issue_token_pair(
+        &state.config.auth,
+        user.id.unwrap_or_default(),
+        user.mobile.as_deref().unwrap_or_default(),
+        backend_roles.clone(),
+        &current_role,
+    )
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(ApiResponse::success(build_login_response(
+        &user,
+        backend_roles,
         current_role,
         token_pair,
     )?)))
@@ -396,6 +461,21 @@ async fn find_user_by_mobile(state: &AppState, mobile: &str) -> Result<UserEntit
         .ok_or_else(|| AppError::BadRequest("账号或密码错误".to_string()))
 }
 
+async fn find_user_by_account(state: &AppState, account: &str) -> Result<UserEntity, AppError> {
+    let users: Vec<UserEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user",
+        value! { "account": account },
+    )
+    .await
+    .context("failed to query user by account")
+    .map_err(AppError::Internal)?;
+    users
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::BadRequest("账号或密码错误".to_string()))
+}
+
 async fn find_user_by_id(state: &AppState, user_id: i64) -> Result<UserEntity, AppError> {
     let users: Vec<UserEntity> =
         db::select_by_map_compat(state.rb.as_ref(), "user", value! { "id": user_id })
@@ -444,6 +524,17 @@ fn sort_roles_by_priority(mut roles: Vec<String>) -> Vec<String> {
     roles.sort_by_key(|role| role_priority(role));
     roles.dedup();
     roles
+}
+
+fn filter_backend_roles(roles: Vec<String>) -> Vec<String> {
+    roles
+        .into_iter()
+        .filter(|role| is_backend_role(role))
+        .collect()
+}
+
+fn is_backend_role(role: &str) -> bool {
+    role == "super_admin" || role == "hq_reviewer"
 }
 
 fn role_priority(role: &str) -> i32 {

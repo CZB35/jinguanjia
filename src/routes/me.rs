@@ -389,13 +389,62 @@ pub async fn wechat_service_account_callback(
     State(state): State<AppState>,
     Query(query): Query<WechatServiceAccountCallbackQuery>,
 ) -> Result<Response, AppError> {
-    let claims = wechat::decode_bind_state_token(&state.config, &query.state)
-        .map_err(AppError::Internal)?;
+    let oauth_state = if let Some(item) = wechat::load_oauth_state(&state, &query.state).await {
+        Some(item)
+    } else {
+        None
+    };
     let oauth = wechat::exchange_service_account_oauth_code(&state, &query.code).await?;
     let openid = oauth
         .openid
         .as_deref()
         .ok_or_else(|| AppError::Conflict("微信服务号授权返回缺少openid".to_string()))?;
+
+    if let Some(oauth_state) = oauth_state {
+        wechat::clear_oauth_state(&state, &query.state).await;
+        if oauth_state.purpose == "wechat_service_public_bind" {
+            let bind_token = oauth_state
+                .bind_token
+                .clone()
+                .filter(|item| !item.trim().is_empty())
+                .ok_or_else(|| AppError::Conflict("微信绑定态缺少bind_token".to_string()))?;
+            wechat::save_public_bind_state(&state, &bind_token, openid, oauth.unionid.as_deref()).await?;
+            if let Some(return_url) = wechat::load_public_bind_return_url(&state, &bind_token).await {
+                let separator = if return_url.contains('?') { '&' } else { '?' };
+                let redirect_url = format!(
+                    "{}{}bind_token={}&authorized=true",
+                    return_url,
+                    separator,
+                    urlencoding::encode(&bind_token)
+                );
+                return Ok(Redirect::temporary(&redirect_url).into_response());
+            }
+            return Ok(Json(ApiResponse::success(serde_json::json!({
+                "ok": true,
+                "bind_token": bind_token,
+                "wechat_bound": false,
+                "authorized": true,
+                "next_action": "confirm_mobile"
+            })))
+            .into_response());
+        }
+
+        let user_id = oauth_state
+            .user_id
+            .ok_or_else(|| AppError::Conflict("微信绑定态缺少用户信息".to_string()))?;
+        wechat::bind_service_account_user(&state, user_id, openid, oauth.unionid.as_deref()).await?;
+
+        return Ok(Json(ApiResponse::success(serde_json::json!({
+            "ok": true,
+            "user_id": user_id,
+            "wechat_bound": true,
+            "wechat_openid": openid,
+        })))
+        .into_response());
+    }
+
+    let claims = wechat::decode_bind_state_token(&state.config, &query.state)
+        .map_err(AppError::Internal)?;
 
     if claims.purpose == "wechat_service_public_bind" {
         let bind_token = claims

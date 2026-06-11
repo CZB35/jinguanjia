@@ -23,6 +23,7 @@ use crate::{
 pub struct WechatRuntime {
     pub access_token: Arc<RwLock<Option<WechatAccessTokenState>>>,
     pub public_bind_return_urls: Arc<RwLock<std::collections::HashMap<String, WechatPublicBindReturnState>>>,
+    pub oauth_states: Arc<RwLock<std::collections::HashMap<String, WechatOauthState>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +42,14 @@ pub struct WechatPublicBindState {
 #[derive(Clone, Debug)]
 pub struct WechatPublicBindReturnState {
     pub return_url: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct WechatOauthState {
+    pub purpose: String,
+    pub user_id: Option<i64>,
+    pub bind_token: Option<String>,
     pub created_at: i64,
 }
 
@@ -132,7 +141,7 @@ pub async fn build_service_account_bind_url(state: &AppState, user_id: i64) -> R
     if config.appid.trim().is_empty() || config.bind_redirect_uri.trim().is_empty() {
         return Err(AppError::Conflict("微信服务号配置不完整".to_string()));
     }
-    let state_token = build_bind_state_token(&state.config, user_id).map_err(AppError::Internal)?;
+    let state_token = save_oauth_state(state, "wechat_service_bind", Some(user_id), None).await;
     Ok(format!(
         "https://open.weixin.qq.com/connect/oauth2/authorize?appid={}&redirect_uri={}&response_type=code&scope=snsapi_base&state={}#wechat_redirect",
         urlencoding::encode(&config.appid),
@@ -146,47 +155,19 @@ pub async fn build_public_bind_url(state: &AppState, bind_token: &str) -> Result
     if config.appid.trim().is_empty() || config.bind_redirect_uri.trim().is_empty() {
         return Err(AppError::Conflict("微信服务号配置不完整".to_string()));
     }
-    let state_token = build_public_bind_state_token(&state.config, bind_token).map_err(AppError::Internal)?;
+    let state_token = save_oauth_state(
+        state,
+        "wechat_service_public_bind",
+        None,
+        Some(bind_token.to_string()),
+    )
+    .await;
     Ok(format!(
         "https://open.weixin.qq.com/connect/oauth2/authorize?appid={}&redirect_uri={}&response_type=code&scope=snsapi_base&state={}#wechat_redirect",
         urlencoding::encode(&config.appid),
         urlencoding::encode(&config.bind_redirect_uri),
         urlencoding::encode(&state_token),
     ))
-}
-
-pub fn build_bind_state_token(config: &AppConfig, user_id: i64) -> Result<String> {
-    let now = Utc::now();
-    let claims = WechatBindStateClaims {
-        sub: Some(user_id),
-        purpose: "wechat_service_bind".to_string(),
-        bind_token: None,
-        iat: now.timestamp(),
-        exp: (now + Duration::minutes(10)).timestamp(),
-    };
-    jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(config.auth.jwt_secret.as_bytes()),
-    )
-    .context("failed to encode wechat bind state token")
-}
-
-pub fn build_public_bind_state_token(config: &AppConfig, bind_token: &str) -> Result<String> {
-    let now = Utc::now();
-    let claims = WechatBindStateClaims {
-        sub: None,
-        purpose: "wechat_service_public_bind".to_string(),
-        bind_token: Some(bind_token.to_string()),
-        iat: now.timestamp(),
-        exp: (now + Duration::minutes(10)).timestamp(),
-    };
-    jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(config.auth.jwt_secret.as_bytes()),
-    )
-    .context("failed to encode wechat public bind state token")
 }
 
 pub fn decode_bind_state_token(config: &AppConfig, token: &str) -> Result<WechatBindStateClaims> {
@@ -202,6 +183,57 @@ pub fn decode_bind_state_token(config: &AppConfig, token: &str) -> Result<Wechat
         return Err(anyhow!("invalid bind state token"));
     }
     Ok(data.claims)
+}
+
+pub async fn load_oauth_state(
+    state: &AppState,
+    state_token: &str,
+) -> Option<WechatOauthState> {
+    let store = state.wechat_runtime.oauth_states.read().await;
+    store.get(state_token).and_then(|item| {
+        if Utc::now().timestamp() - item.created_at > 1800 {
+            None
+        } else {
+            Some(item.clone())
+        }
+    })
+}
+
+pub async fn clear_oauth_state(state: &AppState, state_token: &str) {
+    let mut store = state.wechat_runtime.oauth_states.write().await;
+    store.remove(state_token);
+}
+
+async fn save_oauth_state(
+    state: &AppState,
+    purpose: &str,
+    user_id: Option<i64>,
+    bind_token: Option<String>,
+) -> String {
+    let state_token = generate_short_state_token();
+    let mut store = state.wechat_runtime.oauth_states.write().await;
+    store.insert(
+        state_token.clone(),
+        WechatOauthState {
+            purpose: purpose.to_string(),
+            user_id,
+            bind_token,
+            created_at: Utc::now().timestamp(),
+        },
+    );
+    state_token
+}
+
+fn generate_short_state_token() -> String {
+    let alphabet = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    let mut value = uuid::Uuid::new_v4().as_u128();
+    let mut token = String::with_capacity(10);
+    for _ in 0..10 {
+        let index = (value % alphabet.len() as u128) as usize;
+        token.push(alphabet[index] as char);
+        value /= alphabet.len() as u128;
+    }
+    token.chars().rev().collect()
 }
 
 pub async fn exchange_service_account_oauth_code(

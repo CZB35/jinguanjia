@@ -32,6 +32,7 @@ pub struct DashboardResponse {
     pub completed_tasks: usize,
     pub average_score: f64,
     pub service_overview_cards: Vec<ServiceOverviewCard>,
+    pub task_trend_compare: Vec<TaskTrendComparePoint>,
     pub service_stats: Vec<ServiceDashboardStat>,
     pub service_trends: Vec<ServiceTrendPoint>,
     pub service_group_counts: Vec<ServiceGroupCount>,
@@ -90,10 +91,18 @@ pub struct ServiceGroupCount {
     pub count: usize,
 }
 
+#[derive(Debug, Serialize)]
+pub struct TaskTrendComparePoint {
+    pub period: String,
+    pub completed_count: usize,
+    pub total_count: usize,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct DashboardQuery {
     pub year: Option<i32>,
     pub month: Option<u32>,
+    pub trend_mode: Option<String>,
 }
 
 #[derive(Clone)]
@@ -128,6 +137,7 @@ pub async fn dealer_dashboard(
     dashboard.recent_tasks = enrich_technician_recent_tasks(&state, &filtered_items).await?;
     dashboard.service_group_counts = build_technician_service_group_counts(&filtered_items);
     dashboard.service_overview_cards = build_service_overview_cards_from_technician_tasks(&filtered_items);
+    dashboard.task_trend_compare = build_task_trend_compare_from_technician_tasks(&filtered_items, query.trend_mode.as_deref());
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
@@ -145,6 +155,7 @@ pub async fn technician_dashboard(
     dashboard.recent_tasks = enrich_technician_recent_tasks(&state, &filtered_items).await?;
     dashboard.service_group_counts = build_technician_service_group_counts(&filtered_items);
     dashboard.service_overview_cards = build_service_overview_cards_from_technician_tasks(&filtered_items);
+    dashboard.task_trend_compare = build_task_trend_compare_from_technician_tasks(&filtered_items, query.trend_mode.as_deref());
     Ok(Json(ApiResponse::success(dashboard)))
 }
 
@@ -188,6 +199,7 @@ pub async fn hq_dashboard(
     );
     dashboard.recent_tasks = enrich_recent_tasks(&state, &filtered_tasks).await?;
     dashboard.service_overview_cards = build_service_overview_cards_from_service_items(&filtered_service_items);
+    dashboard.task_trend_compare = build_task_trend_compare_from_tasks(&filtered_tasks, query.trend_mode.as_deref());
     dashboard.service_stats = build_service_stats(filtered_service_items.clone(), score_items);
     dashboard.service_trends = build_service_trends(filtered_service_items);
     dashboard.service_group_counts = build_service_group_counts(&filtered_tasks);
@@ -428,6 +440,7 @@ fn build_dashboard(
         completed_tasks,
         average_score,
         service_overview_cards: build_service_overview_cards_from_tasks(&tasks),
+        task_trend_compare: build_task_trend_compare_from_tasks(&tasks, Some("week")),
         service_stats: Vec::new(),
         service_trends: Vec::new(),
         service_group_counts: Vec::new(),
@@ -497,6 +510,7 @@ fn build_technician_dashboard(
         completed_tasks,
         average_score: 0.0,
         service_overview_cards: build_service_overview_cards_from_technician_tasks(items),
+        task_trend_compare: build_task_trend_compare_from_technician_tasks(items, Some("week")),
         service_stats: Vec::new(),
         service_trends: Vec::new(),
         service_group_counts: Vec::new(),
@@ -750,13 +764,141 @@ fn build_service_trends(service_items: Vec<TaskServiceItemEntity>) -> Vec<Servic
     points
 }
 
+fn build_task_trend_compare_from_tasks(
+    tasks: &[TaskEntity],
+    trend_mode: Option<&str>,
+) -> Vec<TaskTrendComparePoint> {
+    let mode = normalize_trend_mode(trend_mode);
+    let buckets = trend_periods(mode);
+    buckets
+        .into_iter()
+        .map(|(period, start_at, end_at)| {
+            let scoped = tasks
+                .iter()
+                .filter(|item| {
+                    item.appointment_time
+                        .map(|dt| dt >= start_at && dt <= end_at)
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+            let completed_count = scoped
+                .iter()
+                .filter(|item| item.task_status.as_deref() == Some("completed"))
+                .count();
+            TaskTrendComparePoint {
+                period,
+                completed_count,
+                total_count: scoped.len(),
+            }
+        })
+        .collect()
+}
+
+fn build_task_trend_compare_from_technician_tasks(
+    items: &[TechnicianDashboardTask],
+    trend_mode: Option<&str>,
+) -> Vec<TaskTrendComparePoint> {
+    let mode = normalize_trend_mode(trend_mode);
+    let buckets = trend_periods(mode);
+    buckets
+        .into_iter()
+        .map(|(period, start_at, end_at)| {
+            let scoped = items
+                .iter()
+                .filter(|item| {
+                    technician_task_scheduled_at(item)
+                        .map(|dt| dt >= start_at && dt <= end_at)
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+            let completed_count = scoped
+                .iter()
+                .filter(|item| technician_task_status(item) == Some("completed"))
+                .count();
+            TaskTrendComparePoint {
+                period,
+                completed_count,
+                total_count: scoped.len(),
+            }
+        })
+        .collect()
+}
+
+fn normalize_trend_mode(trend_mode: Option<&str>) -> &str {
+    match trend_mode.unwrap_or("week") {
+        "month" => "month",
+        "year" => "year",
+        _ => "week",
+    }
+}
+
+fn trend_periods(mode: &str) -> Vec<(String, NaiveDateTime, NaiveDateTime)> {
+    let now = Local::now().naive_local();
+    match mode {
+        "month" => (0..30)
+            .rev()
+            .map(|offset| {
+                let day = now - chrono::Duration::days(offset);
+                (
+                    format!("{}日", day.day()),
+                    day.date().and_hms_opt(0, 0, 0).unwrap_or(day),
+                    day.date().and_hms_opt(23, 59, 59).unwrap_or(day),
+                )
+            })
+            .collect(),
+        "year" => (0..12)
+            .rev()
+            .map(|offset| {
+                let month_time = now - chrono::Duration::days(30 * offset);
+                let start_at = month_time
+                    .date()
+                    .with_day(1)
+                    .and_then(|date| date.and_hms_opt(0, 0, 0))
+                    .unwrap_or(month_time);
+                let end_at = start_at + chrono::Duration::days(31);
+                (format!("{}月", month_time.month()), start_at, end_at)
+            })
+            .collect(),
+        _ => (0..7)
+            .rev()
+            .map(|offset| {
+                let day = now - chrono::Duration::days(offset);
+                (
+                    weekday_label(day.weekday().num_days_from_monday()),
+                    day.date().and_hms_opt(0, 0, 0).unwrap_or(day),
+                    day.date().and_hms_opt(23, 59, 59).unwrap_or(day),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn weekday_label(weekday_index_from_monday: u32) -> String {
+    match weekday_index_from_monday {
+        0 => "周一",
+        1 => "周二",
+        2 => "周三",
+        3 => "周四",
+        4 => "周五",
+        5 => "周六",
+        6 => "周日",
+        _ => "周",
+    }
+    .to_string()
+}
+
 async fn enrich_recent_tasks(
     state: &AppState,
     tasks: &[TaskEntity],
 ) -> Result<Vec<DashboardTaskItem>, AppError> {
     let mut sorted = tasks.to_vec();
-    sorted.sort_by_key(|item| item.appointment_time);
-    sorted.reverse();
+    sorted.sort_by(|left, right| {
+        right
+            .appointment_time
+            .cmp(&left.appointment_time)
+            .then_with(|| right.task_no.cmp(&left.task_no))
+            .then_with(|| right.id.cmp(&left.id))
+    });
 
     let mut items = Vec::new();
     for task in sorted.into_iter().take(5) {
@@ -834,8 +976,12 @@ async fn enrich_technician_recent_tasks(
     tasks: &[TechnicianDashboardTask],
 ) -> Result<Vec<DashboardTaskItem>, AppError> {
     let mut sorted = tasks.to_vec();
-    sorted.sort_by_key(technician_task_scheduled_at);
-    sorted.reverse();
+    sorted.sort_by(|left, right| {
+        technician_task_scheduled_at(right)
+            .cmp(&technician_task_scheduled_at(left))
+            .then_with(|| right.task.task_no.cmp(&left.task.task_no))
+            .then_with(|| right.task.id.cmp(&left.task.id))
+    });
 
     let mut items = Vec::new();
     for item in sorted.into_iter().take(5) {

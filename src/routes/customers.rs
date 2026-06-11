@@ -23,6 +23,8 @@ use crate::{
 pub struct CustomerListQuery {
     pub mobile: Option<String>,
     pub name: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,12 +117,15 @@ pub struct CustomerItem {
     pub latest_service_date: Option<String>,
     pub latest_service_status: Option<String>,
     pub store_names: Vec<String>,
+    pub service_history: Vec<CustomerServiceHistoryItem>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CustomerListResponse {
     pub items: Vec<CustomerItem>,
     pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +152,7 @@ pub struct CustomerDetailResponse {
     pub latest_service_status: Option<String>,
     pub store_names: Vec<String>,
     pub default_address: Option<String>,
+    pub service_history: Vec<CustomerServiceHistoryItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +164,8 @@ pub struct CustomerServiceHistoryItem {
     pub service_items: Vec<CustomerServiceItemPayload>,
     pub technician_name: String,
     pub service_date: Option<String>,
+    pub appointment_time: Option<String>,
+    pub store_name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,7 +199,7 @@ pub async fn list_customers(
             db::select_by_map_compat::<TaskEntity>(
                 state.rb.as_ref(),
                 "task",
-                value! { "store_id": store_ids },
+                value! { "store_id": store_ids.clone() },
             )
             .await
             .context("failed to query dealer scoped customer tasks")
@@ -203,9 +211,13 @@ pub async fn list_customers(
             .collect::<std::collections::BTreeSet<_>>();
         customers.retain(|customer| {
             customer
-                .id
-                .map(|id| visible_customer_ids.contains(&id))
+                .primary_store_id
+                .map(|id| store_ids.contains(&id))
                 .unwrap_or(false)
+                || customer
+                    .id
+                    .map(|id| visible_customer_ids.contains(&id))
+                    .unwrap_or(false)
         });
     }
 
@@ -303,13 +315,20 @@ pub async fn list_customers(
             latest_service_date,
             latest_service_status: latest_task.and_then(|item| item.task_status.clone()),
             store_names,
+            service_history: Vec::new(),
         });
     }
 
     let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).max(1);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(CustomerListResponse {
         items,
         total,
+        page,
+        page_size,
     })))
 }
 
@@ -559,42 +578,7 @@ pub async fn get_customer_service_history(
     .await
     .context("failed to query customer service history")
     .map_err(AppError::Internal)?;
-    let mut items = Vec::new();
-    for item in tasks {
-        let task_id = item.id.unwrap_or_default();
-        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
-            state.rb.as_ref(),
-            "task_service_item",
-            value! { "task_id": task_id },
-        )
-        .await
-        .context("failed to query customer service history task service items")
-        .map_err(AppError::Internal)?;
-        let technician_name = if let Some(technician_id) = item.current_technician_id {
-            load_user_name(&state, technician_id)
-                .await
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        items.push(CustomerServiceHistoryItem {
-            task_id,
-            task_no: item.task_no.unwrap_or_default(),
-            service_type: customer_service_type_text(item.service_type.as_deref()).to_string(),
-            task_status: item.task_status.unwrap_or_default(),
-            service_items: service_items
-                .into_iter()
-                .map(|service_item| CustomerServiceItemPayload {
-                    service_type: customer_service_type_text(service_item.service_type.as_deref()).to_string(),
-                    service_status: service_item.service_status.unwrap_or_default(),
-                })
-                .collect(),
-            technician_name,
-            service_date: item
-                .appointment_time
-                .map(|dt| dt.format("%Y-%m-%d").to_string()),
-        });
-    }
+    let items = build_customer_service_history_items(&state, tasks).await?;
     Ok(Json(ApiResponse::success(items)))
 }
 
@@ -633,7 +617,7 @@ pub async fn search_customer_by_mobile(
             let scoped_tasks = db::select_by_map_compat::<TaskEntity>(
                 state.rb.as_ref(),
                 "task",
-                value! { "store_id": store_ids },
+                value! { "store_id": store_ids.clone() },
             )
             .await
             .context("failed to query dealer scoped tasks for customer mobile search")
@@ -644,9 +628,13 @@ pub async fn search_customer_by_mobile(
                 .collect::<std::collections::BTreeSet<_>>();
             customers.retain(|customer| {
                 customer
-                    .id
-                    .map(|id| visible_customer_ids.contains(&id))
+                    .primary_store_id
+                    .map(|id| store_ids.contains(&id))
                     .unwrap_or(false)
+                    || customer
+                        .id
+                        .map(|id| visible_customer_ids.contains(&id))
+                        .unwrap_or(false)
             });
         }
     }
@@ -726,6 +714,7 @@ pub async fn search_customer_by_mobile(
                 .max_by_key(|task| task.appointment_time)
                 .and_then(|task| task.task_status.clone()),
             store_names,
+            service_history: build_customer_service_history_items(&state, tasks.clone()).await?,
         });
     }
     Ok(Json(ApiResponse::success(result)))
@@ -761,6 +750,7 @@ async fn get_customer_detail_inner(
         .iter()
         .max_by_key(|item| item.appointment_time)
         .and_then(|item| item.task_status.clone());
+    let service_history = build_customer_service_history_items(state, tasks.clone()).await?;
     let store_ids = tasks
         .iter()
         .filter_map(|item| item.store_id)
@@ -827,7 +817,57 @@ async fn get_customer_detail_inner(
         latest_service_status,
         store_names,
         default_address,
+        service_history,
     })))
+}
+
+async fn build_customer_service_history_items(
+    state: &AppState,
+    tasks: Vec<TaskEntity>,
+) -> Result<Vec<CustomerServiceHistoryItem>, AppError> {
+    let mut items = Vec::new();
+    for item in tasks {
+        let task_id = item.id.unwrap_or_default();
+        let service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task_service_item",
+            value! { "task_id": task_id },
+        )
+        .await
+        .context("failed to query customer service history task service items")
+        .map_err(AppError::Internal)?;
+        let technician_name = if let Some(technician_id) = item.current_technician_id {
+            load_user_name(state, technician_id).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let store_name = load_store_name(state, item.store_id).await?.unwrap_or_default();
+        items.push(CustomerServiceHistoryItem {
+            task_id,
+            task_no: item.task_no.unwrap_or_default(),
+            service_type: customer_service_type_text(item.service_type.as_deref()).to_string(),
+            task_status: item.task_status.unwrap_or_default(),
+            service_items: service_items
+                .into_iter()
+                .map(|service_item| CustomerServiceItemPayload {
+                    service_type: customer_service_type_text(service_item.service_type.as_deref())
+                        .to_string(),
+                    service_status: service_item.service_status.unwrap_or_default(),
+                })
+                .collect(),
+            technician_name,
+            service_date: item
+                .appointment_time
+                .map(|dt| dt.format("%Y-%m-%d").to_string()),
+            appointment_time: item
+                .appointment_time
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+            store_name,
+        });
+    }
+
+    items.sort_by(|left, right| right.appointment_time.cmp(&left.appointment_time));
+    Ok(items)
 }
 
 async fn find_customer(state: &AppState, customer_id: i64) -> Result<CustomerEntity, AppError> {

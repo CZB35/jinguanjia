@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct UserEntity {
     pub id: Option<i64>,
     pub mobile: Option<String>,
+    pub account: Option<String>,
     pub password_hash: Option<String>,
     pub name: Option<String>,
     pub nickname: Option<String>,

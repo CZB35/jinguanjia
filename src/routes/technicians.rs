@@ -27,6 +27,8 @@ pub struct TechnicianListQuery {
     pub mobile: Option<String>,
     pub name: Option<String>,
     pub service_type: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +110,8 @@ pub struct TechnicianItem {
 pub struct TechnicianListResponse {
     pub items: Vec<TechnicianItem>,
     pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,9 +313,15 @@ pub async fn list_technicians(
     }
 
     let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).max(1);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(TechnicianListResponse {
         items,
         total,
+        page,
+        page_size,
     })))
 }
 
@@ -364,7 +374,7 @@ pub async fn create_technician(
         return Err(AppError::BadRequest("请至少选择一个服务能力".to_string()));
     }
 
-    let exists: Vec<UserEntity> = db::select_by_map_compat(
+    let existing_users: Vec<UserEntity> = db::select_by_map_compat(
         state.rb.as_ref(),
         "user",
         value! { "mobile": payload.mobile.as_str() },
@@ -372,102 +382,68 @@ pub async fn create_technician(
     .await
     .context("failed to query existing user by mobile")
     .map_err(AppError::Internal)?;
-    if !exists.is_empty() {
-        return Err(AppError::Conflict("该手机号账号已存在".to_string()));
-    }
+    let user = if let Some(existing_user) = existing_users.into_iter().next() {
+        if existing_user.deleted_at.is_some() {
+            return Err(AppError::Conflict("该手机号账号已存在且已删除，请联系管理员处理".to_string()));
+        }
+        existing_user
+    } else {
+        let password_hash = hash(&password, 10)
+            .context("failed to hash technician password")
+            .map_err(AppError::Internal)?;
 
-    let password_hash = hash(&password, 10)
-        .context("failed to hash technician password")
-        .map_err(AppError::Internal)?;
-
-    UserEntity::insert(
-        state.rb.as_ref(),
-        &UserEntity {
-            id: None,
-            mobile: Some(payload.mobile.clone()),
-            password_hash: Some(password_hash),
-            name: Some(payload.name.clone()),
-            nickname: payload.nickname.clone(),
-            email: None,
-            avatar_url: payload.avatar_url.clone(),
-            job_no: payload.job_no.clone().or_else(|| {
-                Some(format!(
-                    "SF{:08}",
-                    Utc::now().timestamp_millis().rem_euclid(100_000_000)
-                ))
-            }),
-            id_card: payload.id_card.clone(),
-            emergency_contact_name: payload.emergency_contact_name.clone(),
-            emergency_contact_mobile: payload.emergency_contact_mobile.clone(),
-            status: Some("enabled".to_string()),
-            last_login_at: None,
-            last_login_ip: None,
-            created_at: None,
-            updated_at: None,
-            deleted_at: None,
-            wechat_openid: None,
-            wechat_unionid: None,
-            wechat_subscribe: Some(0),
-            wechat_bind_at: None,
-            wechat_subscribe_updated_at: None,
-        },
-    )
-    .await
-    .context("failed to create technician user")
-    .map_err(AppError::Internal)?;
-
-    let user: UserEntity = db::select_one_by_map_compat(
-        state.rb.as_ref(),
-        "user",
-        value! { "mobile": payload.mobile.as_str() },
-    )
-    .await
-    .context("failed to fetch created technician")
-    .map_err(AppError::Internal)?
-    .ok_or_else(|| AppError::Internal(anyhow!("technician create succeeded but fetch failed")))?;
-    let user_id = user.id.unwrap_or_default();
-
-    let role_id = find_role_id_by_code(&state, "technician").await?;
-    UserRoleEntity::insert(
-        state.rb.as_ref(),
-        &UserRoleEntity {
-            id: None,
-            user_id: Some(user_id),
-            role_id: Some(role_id),
-            created_at: None,
-        },
-    )
-    .await
-    .context("failed to bind technician role")
-    .map_err(AppError::Internal)?;
-
-    UserStoreEntity::insert(
-        state.rb.as_ref(),
-        &UserStoreEntity {
-            id: None,
-            user_id: Some(user_id),
-            store_id: Some(store_id),
-            created_at: None,
-        },
-    )
-    .await
-    .context("failed to bind technician store")
-    .map_err(AppError::Internal)?;
-
-    for service_type in service_types {
-        TechnicianSkillEntity::insert(
+        UserEntity::insert(
             state.rb.as_ref(),
-            &TechnicianSkillEntity {
+            &UserEntity {
                 id: None,
-                user_id: Some(user_id),
-                service_type: Some(service_type),
+                mobile: Some(payload.mobile.clone()),
+                account: Some(payload.mobile.clone()),
+                password_hash: Some(password_hash),
+                name: Some(payload.name.clone()),
+                nickname: payload.nickname.clone(),
+                email: None,
+                avatar_url: payload.avatar_url.clone(),
+                job_no: payload.job_no.clone().or_else(|| {
+                    Some(format!(
+                        "SF{:08}",
+                        Utc::now().timestamp_millis().rem_euclid(100_000_000)
+                    ))
+                }),
+                id_card: payload.id_card.clone(),
+                emergency_contact_name: payload.emergency_contact_name.clone(),
+                emergency_contact_mobile: payload.emergency_contact_mobile.clone(),
+                status: Some("enabled".to_string()),
+                last_login_at: None,
+                last_login_ip: None,
                 created_at: None,
+                updated_at: None,
+                deleted_at: None,
+                wechat_openid: None,
+                wechat_unionid: None,
+                wechat_subscribe: Some(0),
+                wechat_bind_at: None,
+                wechat_subscribe_updated_at: None,
             },
         )
         .await
-        .context("failed to create technician skill")
+        .context("failed to create technician user")
         .map_err(AppError::Internal)?;
-    }
+
+        db::select_one_by_map_compat(
+            state.rb.as_ref(),
+            "user",
+            value! { "mobile": payload.mobile.as_str() },
+        )
+        .await
+        .context("failed to fetch created technician")
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::Internal(anyhow!("technician create succeeded but fetch failed")))?
+    };
+    let user_id = user.id.unwrap_or_default();
+
+    ensure_technician_role_binding(&state, user_id).await?;
+    upsert_single_store_binding(&state, user_id, store_id).await?;
+    replace_technician_skills(&state, user_id, service_types).await?;
 
     get_technician_detail_inner(&state, user_id).await
 }
@@ -603,6 +579,36 @@ pub async fn update_technician_status(
     get_technician_detail_inner(&state, technician_id).await
 }
 
+pub async fn reset_technician_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(technician_id): Path<i64>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let auth_user = auth::authenticate(&state, &headers)?;
+    auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    ensure_technician_access(&state, &auth_user, technician_id).await?;
+    let _ = find_user(&state, technician_id).await?;
+
+    let password_hash = hash("123456", 10)
+        .context("failed to hash technician reset password")
+        .map_err(AppError::Internal)?;
+    UserEntity::update_by_map(
+        state.rb.as_ref(),
+        &UserEntity {
+            password_hash: Some(password_hash),
+            ..Default::default()
+        },
+        value! { "id": technician_id },
+    )
+    .await
+    .context("failed to reset technician password")
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true, "default_password": "123456" }),
+    )))
+}
+
 pub async fn get_technician_performance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -710,6 +716,7 @@ async fn available_technicians_for_service(
         if !service_types.iter().any(|item| item == service_type) {
             continue;
         }
+        let stats = build_technician_aggregate_stats(state, user_id).await?;
         items.push(TechnicianItem {
             id: user_id,
             name: user.name.unwrap_or_default(),
@@ -722,14 +729,14 @@ async fn available_technicians_for_service(
             status_text: technician_status_text(user.status.as_deref()).to_string(),
             role_names: vec!["技师".to_string()],
             store_names: vec![store_name.to_string()],
-            work_status: "idle".to_string(),
+            work_status: stats.work_status,
             service_types,
-            average_score: 0.0,
-            completed_order_count: 0,
-            pending_order_count: 0,
-            current_task_no: None,
-            current_task_status: None,
-            score_count: 0,
+            average_score: stats.average_score,
+            completed_order_count: stats.completed_count,
+            pending_order_count: stats.pending_count,
+            current_task_no: stats.current_task_no,
+            current_task_status: stats.current_task_status,
+            score_count: stats.score_count,
         });
     }
 
@@ -889,6 +896,121 @@ async fn find_role_id_by_code(state: &AppState, role_code: &str) -> Result<i64, 
     .map_err(AppError::Internal)?
     .and_then(|item| item.id)
     .ok_or_else(|| AppError::Internal(anyhow!("role not found: {role_code}")))
+}
+
+async fn ensure_technician_role_binding(state: &AppState, user_id: i64) -> Result<(), AppError> {
+    let role_id = find_role_id_by_code(state, "technician").await?;
+    let existing: Vec<UserRoleEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_role",
+        value! { "user_id": user_id, "role_id": role_id },
+    )
+    .await
+    .context("failed to query existing technician role binding")
+    .map_err(AppError::Internal)?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    UserRoleEntity::insert(
+        state.rb.as_ref(),
+        &UserRoleEntity {
+            id: None,
+            user_id: Some(user_id),
+            role_id: Some(role_id),
+            created_at: None,
+        },
+    )
+    .await
+    .context("failed to bind technician role")
+    .map_err(AppError::Internal)?;
+    Ok(())
+}
+
+async fn upsert_single_store_binding(
+    state: &AppState,
+    user_id: i64,
+    store_id: i64,
+) -> Result<(), AppError> {
+    let existing: Vec<UserStoreEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_store",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query existing technician stores")
+    .map_err(AppError::Internal)?;
+
+    if existing.iter().any(|item| item.store_id == Some(store_id)) {
+        return Ok(());
+    }
+
+    if existing.len() > 1 {
+        return Err(AppError::Conflict(
+            "当前账号绑定了多个门店，请先在后台修正为单门店再添加技师角色".to_string(),
+        ));
+    }
+
+    for relation in existing {
+        if let Some(id) = relation.id {
+            UserStoreEntity::delete_by_map(state.rb.as_ref(), value! { "id": id })
+                .await
+                .context("failed to delete existing technician store relation")
+                .map_err(AppError::Internal)?;
+        }
+    }
+
+    UserStoreEntity::insert(
+        state.rb.as_ref(),
+        &UserStoreEntity {
+            id: None,
+            user_id: Some(user_id),
+            store_id: Some(store_id),
+            created_at: None,
+        },
+    )
+    .await
+    .context("failed to bind technician store")
+    .map_err(AppError::Internal)?;
+    Ok(())
+}
+
+async fn replace_technician_skills(
+    state: &AppState,
+    user_id: i64,
+    service_types: Vec<String>,
+) -> Result<(), AppError> {
+    let existing: Vec<TechnicianSkillEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "technician_skill",
+        value! { "user_id": user_id },
+    )
+    .await
+    .context("failed to query existing technician skills")
+    .map_err(AppError::Internal)?;
+    for skill in existing {
+        if let Some(id) = skill.id {
+            TechnicianSkillEntity::delete_by_map(state.rb.as_ref(), value! { "id": id })
+                .await
+                .context("failed to delete technician skill")
+                .map_err(AppError::Internal)?;
+        }
+    }
+    for service_type in service_types {
+        TechnicianSkillEntity::insert(
+            state.rb.as_ref(),
+            &TechnicianSkillEntity {
+                id: None,
+                user_id: Some(user_id),
+                service_type: Some(service_type),
+                created_at: None,
+            },
+        )
+        .await
+        .context("failed to create technician skill")
+        .map_err(AppError::Internal)?;
+    }
+    Ok(())
 }
 
 async fn find_role_names(state: &AppState, user_id: i64) -> Result<Vec<String>, AppError> {

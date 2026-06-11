@@ -27,6 +27,8 @@ pub struct ReviewTaskQuery {
     pub task_status: Option<String>,
     pub service_type: Option<String>,
     pub task_type: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +56,8 @@ pub struct ReviewTaskItem {
 pub struct ReviewTaskListResponse {
     pub items: Vec<ReviewTaskItem>,
     pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,10 +107,16 @@ pub async fn list_review_tasks(
     ensure_hq_access(&state, &headers)?;
     let items = load_review_tasks(&state, &query).await?;
     let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).max(1);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
 
     Ok(Json(ApiResponse::success(ReviewTaskListResponse {
         items,
         total,
+        page,
+        page_size,
     })))
 }
 
@@ -229,6 +239,7 @@ pub async fn get_review_task_detail(
     let store = load_store(&state, task.store_id.unwrap_or_default()).await?;
     let address =
         load_customer_address_text(&state, task.customer_address_id.unwrap_or_default()).await?;
+    let service_time_slot = format_review_service_time_slot(task.appointment_time, task.service_time_slot.as_deref());
 
     Ok(Json(ApiResponse::success(ReviewTaskDetailResponse {
         id: task.id.unwrap_or_default(),
@@ -252,7 +263,7 @@ pub async fn get_review_task_detail(
         customer_mobile: customer.mobile.unwrap_or_default(),
         customer_address: address,
         appointment_time: task.appointment_time.map(format_datetime),
-        service_time_slot: task.service_time_slot,
+        service_time_slot,
         task_desc: task.task_desc,
         task_remark: task.task_remark,
         evidence_count: evidences.len(),
@@ -290,10 +301,14 @@ pub async fn list_review_reminders(
         }
     }
     let total = items.len();
+    let page = 1;
+    let page_size = total.max(1);
 
     Ok(Json(ApiResponse::success(ReviewTaskListResponse {
         items,
         total,
+        page,
+        page_size,
     })))
 }
 
@@ -473,8 +488,39 @@ async fn load_customer_address_text(state: &AppState, address_id: i64) -> Result
     Ok(addresses
         .into_iter()
         .next()
-        .and_then(|item| item.address)
+        .map(|item| format_review_customer_address(&item))
         .unwrap_or_default())
+}
+
+fn format_review_customer_address(
+    address: &crate::models::customer_address::CustomerAddressEntity,
+) -> String {
+    let mut parts = Vec::new();
+    for part in [
+        address.province.as_deref(),
+        address.city.as_deref(),
+        address.district.as_deref(),
+        address.address.as_deref(),
+    ] {
+        if let Some(part) = part.map(str::trim).filter(|item| !item.is_empty()) {
+            parts.push(part.to_string());
+        }
+    }
+    parts.join("")
+}
+
+fn format_review_service_time_slot(
+    appointment_time: Option<chrono::NaiveDateTime>,
+    service_time_slot: Option<&str>,
+) -> Option<String> {
+    if let Some(appointment_time) = appointment_time {
+        return Some(appointment_time.format("%H:%M").to_string());
+    }
+
+    service_time_slot
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
 }
 
 fn format_datetime(input: chrono::NaiveDateTime) -> String {

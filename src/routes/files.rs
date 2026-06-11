@@ -1,5 +1,6 @@
-use std::{io::Write, path::Path};
+use std::{collections::HashMap, io::Write, path::Path};
 
+use ab_glyph::{FontArc, PxScale};
 use anyhow::{Context, anyhow};
 use axum::{
     Json,
@@ -9,8 +10,12 @@ use axum::{
     response::Response,
 };
 use chrono::Local;
-use font8x8::{BASIC_FONTS, UnicodeFonts};
 use image::{ImageFormat, Rgba};
+use imageproc::{
+    drawing::{draw_filled_rect_mut, draw_text_mut},
+    rect::Rect,
+};
+use font8x8::{BASIC_FONTS, UnicodeFonts};
 use rbs::value;
 use serde::Serialize;
 use tokio::fs;
@@ -20,7 +25,9 @@ use crate::{
     auth, db,
     error::AppError,
     models::{
-        attachment::AttachmentEntity, evidence::EvidenceEntity, task::TaskEntity,
+        attachment::AttachmentEntity, customer::CustomerEntity,
+        customer_address::CustomerAddressEntity, evidence::EvidenceEntity,
+        store::StoreEntity, task::TaskEntity,
         task_execution::TaskExecutionEntity, task_service_item::TaskServiceItemEntity,
         user_store::UserStoreEntity,
     },
@@ -42,6 +49,14 @@ pub struct FileItem {
 pub struct FileListResponse {
     pub items: Vec<FileItem>,
     pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FileListQuery {
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,7 +70,10 @@ pub struct UploadResponse {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct BatchDownloadRequest {
+    #[serde(default)]
     pub attachment_ids: Vec<i64>,
+    #[serde(default)]
+    pub task_ids: Vec<i64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -129,6 +147,7 @@ pub async fn list_task_attachments(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<i64>,
+    Query(query): Query<FileListQuery>,
 ) -> Result<Json<ApiResponse<FileListResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     ensure_task_access(&state, &auth_user, task_id).await?;
@@ -154,9 +173,15 @@ pub async fn list_task_attachments(
     .collect::<Vec<_>>();
 
     let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).max(1);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(FileListResponse {
         items,
         total,
+        page,
+        page_size,
     })))
 }
 
@@ -184,6 +209,7 @@ pub async fn list_task_evidences(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<i64>,
+    Query(query): Query<FileListQuery>,
 ) -> Result<Json<ApiResponse<FileListResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     ensure_task_access(&state, &auth_user, task_id).await?;
@@ -209,9 +235,15 @@ pub async fn list_task_evidences(
     .collect::<Vec<_>>();
 
     let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).max(1);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(FileListResponse {
         items,
         total,
+        page,
+        page_size,
     })))
 }
 
@@ -306,18 +338,24 @@ pub async fn batch_download_attachments(
     Json(payload): Json<BatchDownloadRequest>,
 ) -> Result<Response, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
-    if payload.attachment_ids.is_empty() {
-        return Err(AppError::BadRequest("attachment_ids不能为空".to_string()));
+    if payload.attachment_ids.is_empty() && payload.task_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "attachment_ids和task_ids不能同时为空".to_string(),
+        ));
+    }
+
+    let attachments = resolve_batch_download_attachments(&state, &auth_user, &payload).await?;
+    if attachments.is_empty() {
+        return Err(AppError::BadRequest("所选任务暂无附件".to_string()));
     }
 
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut zip = ZipWriter::new(&mut buffer);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let mut used_file_names = HashMap::<String, usize>::new();
 
-        for attachment_id in payload.attachment_ids {
-            let attachment = find_attachment(&state, attachment_id).await?;
-            ensure_task_access(&state, &auth_user, attachment.task_id.unwrap_or_default()).await?;
+        for attachment in attachments {
             let path =
                 storage::full_path(&state, attachment.file_url.as_deref().unwrap_or_default());
             let bytes = fs::read(&path)
@@ -326,10 +364,14 @@ pub async fn batch_download_attachments(
                     format!("failed to read attachment file for zip: {}", path.display())
                 })
                 .map_err(AppError::Internal)?;
-            let file_name = sanitize_filename(
-                &attachment
-                    .file_name
-                    .unwrap_or_else(|| format!("{}.bin", attachment_id)),
+            let base_file_name = attachment
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("attachment-{}.bin", attachment.id.unwrap_or_default()));
+            let file_name = unique_zip_entry_name(
+                &mut used_file_names,
+                &base_file_name,
+                attachment.task_id,
             );
             zip.start_file(file_name, options)
                 .map_err(|_| AppError::Internal(anyhow!("failed to start zip entry")))?;
@@ -349,9 +391,104 @@ pub async fn batch_download_attachments(
     );
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=\"attachments-batch.zip\""),
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"",
+            build_batch_attachment_filename(&payload)
+        ))
+        .map_err(|_| AppError::Internal(anyhow!("invalid content disposition header")))?,
     );
     Ok(response)
+}
+
+fn build_batch_attachment_filename(payload: &BatchDownloadRequest) -> String {
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    if !payload.task_ids.is_empty() {
+        format!("task-attachments-{timestamp}.zip")
+    } else {
+        format!("attachments-{timestamp}.zip")
+    }
+}
+
+async fn resolve_batch_download_attachments(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    payload: &BatchDownloadRequest,
+) -> Result<Vec<AttachmentEntity>, AppError> {
+    let mut attachment_map = std::collections::BTreeMap::new();
+
+    for &attachment_id in &payload.attachment_ids {
+        let attachment = find_attachment(state, attachment_id).await?;
+        ensure_task_access(state, auth_user, attachment.task_id.unwrap_or_default()).await?;
+        attachment_map.insert(attachment.id.unwrap_or_default(), attachment);
+    }
+
+    if !payload.task_ids.is_empty() {
+        for &task_id in &payload.task_ids {
+            ensure_task_access(state, auth_user, task_id).await?;
+        }
+
+        let attachments: Vec<AttachmentEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "attachment",
+            value! { "task_id": payload.task_ids.clone() },
+        )
+        .await
+        .context("failed to query batch download attachments by task ids")
+        .map_err(AppError::Internal)?;
+
+        for attachment in attachments {
+            attachment_map.insert(attachment.id.unwrap_or_default(), attachment);
+        }
+    }
+
+    let mut items = attachment_map.into_values().collect::<Vec<_>>();
+    items.sort_by_key(|item| (item.task_id.unwrap_or_default(), item.id.unwrap_or_default()));
+    Ok(items)
+}
+
+fn unique_zip_entry_name(
+    used_file_names: &mut HashMap<String, usize>,
+    original_name: &str,
+    task_id: Option<i64>,
+) -> String {
+    let sanitized_original = sanitize_filename(original_name);
+    let base_candidate = if let Some(task_id) = task_id {
+        sanitize_filename(&format!("task-{task_id}_{sanitized_original}"))
+    } else {
+        sanitized_original
+    };
+
+    if !used_file_names.contains_key(&base_candidate) {
+        used_file_names.insert(base_candidate.clone(), 1);
+        return base_candidate;
+    }
+
+    let extension = Path::new(&base_candidate)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or("")
+        .to_string();
+    let stem = Path::new(&base_candidate)
+        .file_stem()
+        .and_then(|item| item.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let mut next_count = used_file_names.get(&base_candidate).copied().unwrap_or(1);
+
+    loop {
+        let suffix = next_count;
+        next_count += 1;
+        let candidate = if extension.is_empty() {
+            format!("{stem}_{suffix}")
+        } else {
+            format!("{stem}_{suffix}.{extension}")
+        };
+        if !used_file_names.contains_key(&candidate) {
+            used_file_names.insert(candidate.clone(), 1);
+            used_file_names.insert(base_candidate.clone(), next_count);
+            return candidate;
+        }
+    }
 }
 
 async fn upload_evidence(
@@ -399,7 +536,7 @@ async fn upload_evidence(
     } else {
         "evidences/videos"
     };
-    let watermark_text = build_evidence_watermark_text(task_id);
+    let watermark_text = build_evidence_watermark_data(&state, &task).await?;
     let file_bytes = if evidence_type == "image" {
         match apply_visible_watermark(&upload.bytes, &watermark_text) {
             Ok(bytes) => bytes,
@@ -430,7 +567,7 @@ async fn upload_evidence(
             file_url: Some(stored.relative_path.clone()),
             file_size: Some(stored.file_size),
             mime_type: Some(stored.mime_type.clone()),
-            watermark_text: Some(watermark_text),
+            watermark_text: Some(watermark_text.fallback_text),
             longitude: None,
             latitude: None,
             shot_at: Some(Local::now().naive_local()),
@@ -528,54 +665,203 @@ fn validate_upload(
     Ok(())
 }
 
-fn build_evidence_watermark_text(task_id: i64) -> String {
-    format!(
-        "任务:{} {} 金管家",
-        task_id,
-        Local::now().format("%Y-%m-%d %H:%M:%S")
-    )
+struct EvidenceWatermarkData {
+    info_lines: Vec<String>,
+    time_text: String,
+    fallback_text: String,
 }
 
-fn apply_visible_watermark(bytes: &[u8], text: &str) -> Result<Vec<u8>, anyhow::Error> {
+async fn build_evidence_watermark_data(
+    state: &AppState,
+    task: &TaskEntity,
+) -> Result<EvidenceWatermarkData, AppError> {
+    let store_name = if let Some(store_id) = task.store_id {
+        db::select_one_by_map_compat::<StoreEntity>(
+            state.rb.as_ref(),
+            "store",
+            value! { "id": store_id },
+        )
+        .await
+        .context("failed to query store for evidence watermark")
+        .map_err(AppError::Internal)?
+        .and_then(|item| item.store_name)
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let service_address = if let Some(address_id) = task.customer_address_id {
+        db::select_one_by_map_compat::<CustomerAddressEntity>(
+            state.rb.as_ref(),
+            "customer_address",
+            value! { "id": address_id },
+        )
+        .await
+        .context("failed to query customer address for evidence watermark")
+        .map_err(AppError::Internal)?
+        .and_then(|item| item.address)
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (customer_name, customer_mobile) = if let Some(customer_id) = task.customer_id {
+        let customer = db::select_one_by_map_compat::<CustomerEntity>(
+            state.rb.as_ref(),
+            "customer",
+            value! { "id": customer_id },
+        )
+        .await
+        .context("failed to query customer for evidence watermark")
+        .map_err(AppError::Internal)?;
+        (
+            customer.as_ref().and_then(|item| item.name.clone()).unwrap_or_default(),
+            customer.and_then(|item| item.mobile).unwrap_or_default(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+
+    let service_type_text = match task.service_type.as_deref().unwrap_or_default() {
+        "measure" => "量尺",
+        "install" => "安装",
+        "ironing" => "熨烫",
+        "cleaning" => "除尘除螨",
+        _ => "服务",
+    };
+    let masked_mobile = mask_mobile(&customer_mobile);
+    let time_text = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let info_lines = vec![
+        if store_name.trim().is_empty() { "-".to_string() } else { store_name.trim().to_string() },
+        if service_address.trim().is_empty() { "-".to_string() } else { service_address.trim().to_string() },
+        format!(
+            "客户: {}({})",
+            if customer_name.trim().is_empty() { "-" } else { customer_name.trim() },
+            masked_mobile
+        ),
+        format!("服务环节: {}", service_type_text),
+    ];
+    let fallback_text = format!(
+        "门店:{} 地址:{} 客户:{}({}) 服务:{} 时间:{}",
+        if store_name.trim().is_empty() { "-" } else { store_name.trim() },
+        if service_address.trim().is_empty() { "-" } else { service_address.trim() },
+        if customer_name.trim().is_empty() { "-" } else { customer_name.trim() },
+        masked_mobile,
+        service_type_text,
+        time_text
+    );
+
+    Ok(EvidenceWatermarkData {
+        info_lines,
+        time_text,
+        fallback_text,
+    })
+}
+
+fn apply_visible_watermark(
+    bytes: &[u8],
+    watermark: &EvidenceWatermarkData,
+) -> Result<Vec<u8>, anyhow::Error> {
     let format = image::guess_format(bytes).context("failed to guess image format")?;
     let mut image = image::load_from_memory(bytes)
         .context("failed to decode image for watermark")?
         .to_rgba8();
-    let (width, height) = image.dimensions();
+    if let Some(font) = load_watermark_font() {
+        draw_chinese_watermark(&mut image, &font, watermark);
+    } else {
+        let (width, height) = image.dimensions();
+        let scale = (width.max(height) / 320).max(1);
+        let char_w = 8 * scale;
+        let char_h = 8 * scale;
+        let padding = 12 * scale;
+        let line_height = char_h + 4 * scale;
+        let max_chars = ((width.saturating_sub(padding * 2)) / char_w).max(1) as usize;
+        let lines = wrap_text(&watermark.fallback_text, max_chars);
+        let overlay_height = (lines.len() as u32 * line_height) + padding;
+        let overlay_y = height.saturating_sub(overlay_height + padding / 2);
 
-    let scale = (width.max(height) / 320).max(1);
-    let char_w = 8 * scale;
-    let char_h = 8 * scale;
-    let padding = 12 * scale;
-    let line_height = char_h + 4 * scale;
-    let max_chars = ((width.saturating_sub(padding * 2)) / char_w).max(1) as usize;
-    let lines = wrap_text(text, max_chars);
-    let overlay_height = (lines.len() as u32 * line_height) + padding;
-    let overlay_y = height.saturating_sub(overlay_height + padding / 2);
-
-    for y in overlay_y..height {
-        for x in 0..width {
-            let pixel = image.get_pixel_mut(x, y);
-            let alpha = 80u16;
-            let bg = [0u8, 0u8, 0u8, 255u8];
-            let blended = [
-                (((pixel[0] as u16 * (255 - alpha)) + (bg[0] as u16 * alpha)) / 255) as u8,
-                (((pixel[1] as u16 * (255 - alpha)) + (bg[1] as u16 * alpha)) / 255) as u8,
-                (((pixel[2] as u16 * (255 - alpha)) + (bg[2] as u16 * alpha)) / 255) as u8,
-                255,
-            ];
-            *pixel = Rgba(blended);
+        for y in overlay_y..height {
+            for x in 0..width {
+                let pixel = image.get_pixel_mut(x, y);
+                let alpha = 80u16;
+                let bg = [0u8, 0u8, 0u8, 255u8];
+                let blended = [
+                    (((pixel[0] as u16 * (255 - alpha)) + (bg[0] as u16 * alpha)) / 255) as u8,
+                    (((pixel[1] as u16 * (255 - alpha)) + (bg[1] as u16 * alpha)) / 255) as u8,
+                    (((pixel[2] as u16 * (255 - alpha)) + (bg[2] as u16 * alpha)) / 255) as u8,
+                    255,
+                ];
+                *pixel = Rgba(blended);
+            }
         }
-    }
 
-    for (index, line) in lines.iter().enumerate() {
-        let y = overlay_y + padding / 2 + index as u32 * line_height;
-        draw_text_bitmap(&mut image, padding, y, line, scale, Rgba([255, 255, 255, 255]));
+        for (index, line) in lines.iter().enumerate() {
+            let y = overlay_y + padding / 2 + index as u32 * line_height;
+            draw_text_bitmap(&mut image, padding, y, line, scale, Rgba([255, 255, 255, 255]));
+        }
     }
 
     let mut out = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image).write_to(&mut out, image_output_format(format))?;
     Ok(out.into_inner())
+}
+
+fn draw_chinese_watermark(
+    image: &mut image::RgbaImage,
+    font: &FontArc,
+    watermark: &EvidenceWatermarkData,
+) {
+    let width = image.width();
+    let scale_value = ((width as f32) / 48.0).clamp(18.0, 28.0);
+    let text_scale = PxScale::from(scale_value);
+    let time_scale = PxScale::from((scale_value - 2.0).max(16.0));
+    let padding = 18i32;
+    let line_gap = 8i32;
+    let line_height = scale_value as i32 + line_gap;
+    let box_width = ((width as f32) * 0.62) as u32;
+    let box_height = (padding * 2 + watermark.info_lines.len() as i32 * line_height) as u32;
+
+    draw_filled_rect_mut(
+        image,
+        Rect::at(padding, padding).of_size(box_width.max(260), box_height.max(120)),
+        Rgba([0, 0, 0, 160]),
+    );
+
+    for (index, line) in watermark.info_lines.iter().enumerate() {
+        draw_text_mut(
+            image,
+            Rgba([255, 255, 255, 255]),
+            padding + 12,
+            padding + 10 + index as i32 * line_height,
+            text_scale,
+            font,
+            line,
+        );
+    }
+
+    draw_text_mut(
+        image,
+        Rgba([255, 255, 255, 235]),
+        width.saturating_sub((watermark.time_text.chars().count() as u32 * (scale_value as u32 / 2 + 9)) + 20) as i32,
+        padding + 6,
+        time_scale,
+        font,
+        &watermark.time_text,
+    );
+}
+
+fn load_watermark_font() -> Option<FontArc> {
+    let bytes = include_bytes!("../assets/fonts/simhei.ttf");
+    FontArc::try_from_slice(bytes).ok()
+}
+
+fn mask_mobile(mobile: &str) -> String {
+    let mobile = mobile.trim();
+    if mobile.len() >= 7 {
+        format!("{}****{}", &mobile[..3], &mobile[mobile.len().saturating_sub(4)..])
+    } else if mobile.is_empty() {
+        "-".to_string()
+    } else {
+        mobile.to_string()
+    }
 }
 
 fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {

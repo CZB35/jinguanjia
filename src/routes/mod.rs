@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health::health_check))
         .route("/auth/login/password", post(auth::login_by_password))
+        .route("/auth/login/admin", post(auth::login_admin_by_password))
         .route("/auth/login/code", post(auth::login_by_code))
         .route("/auth/code/send", post(auth::send_login_code))
         .route("/auth/refresh", post(auth::refresh_token))
@@ -129,6 +130,19 @@ pub fn router() -> Router<AppState> {
             "/customers/{id}/service-history",
             get(customers::get_customer_service_history),
         )
+        .route("/dealers", get(users::list_dealers).post(users::create_dealer))
+        .route(
+            "/dealers/{id}",
+            get(users::get_dealer_detail).patch(users::update_dealer),
+        )
+        .route(
+            "/dealers/{id}/reset-password",
+            post(users::reset_dealer_password),
+        )
+        .route(
+            "/dealers/{id}/reset-password",
+            post(users::reset_dealer_password),
+        )
         .route(
             "/technicians",
             get(technicians::list_technicians).post(technicians::create_technician),
@@ -152,6 +166,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/technicians/{id}/status",
             patch(technicians::update_technician_status),
+        )
+        .route(
+            "/technicians/{id}/reset-password",
+            post(technicians::reset_technician_password),
+        )
+        .route(
+            "/technicians/{id}/reset-password",
+            post(technicians::reset_technician_password),
         )
         .route("/users", get(users::list_users).post(users::create_user))
         .route(

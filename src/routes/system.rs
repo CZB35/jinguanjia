@@ -61,6 +61,14 @@ pub struct AuditLogItem {
 pub struct AuditLogListResponse {
     pub items: Vec<AuditLogItem>,
     pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditLogQuery {
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +246,7 @@ pub async fn get_changelog(
 pub async fn get_operation_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<AuditLogQuery>,
 ) -> Result<Json<ApiResponse<AuditLogListResponse>>, AppError> {
     ensure_admin_access(&state, &headers)?;
     let logs: Vec<AuditLogEntity> =
@@ -262,10 +271,16 @@ pub async fn get_operation_logs(
         })
         .collect::<Vec<_>>();
     let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).max(1);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
 
     Ok(Json(ApiResponse::success(AuditLogListResponse {
         items,
         total,
+        page,
+        page_size,
     })))
 }
 

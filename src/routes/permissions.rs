@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
 };
 use rbs::value;
@@ -19,6 +19,8 @@ use crate::{
     response::ApiResponse,
     state::AppState,
 };
+
+const HIDDEN_BUSINESS_ROLE_CODES: &[&str] = &["dealer", "technician"];
 
 #[derive(Debug, Serialize)]
 pub struct RoleItem {
@@ -37,6 +39,15 @@ pub struct RoleItem {
 #[derive(Debug, Serialize)]
 pub struct RoleListResponse {
     pub items: Vec<RoleItem>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RoleListQuery {
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -83,10 +94,21 @@ pub struct UpdateRoleRequest {
 pub async fn get_roles(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<RoleListQuery>,
 ) -> Result<Json<ApiResponse<RoleListResponse>>, AppError> {
     ensure_admin_access(&state, &headers)?;
     let items = load_role_items(&state, None).await?;
-    Ok(Json(ApiResponse::success(RoleListResponse { items })))
+    let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).max(1);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
+    Ok(Json(ApiResponse::success(RoleListResponse {
+        items,
+        total,
+        page,
+        page_size,
+    })))
 }
 
 pub async fn get_role_detail(
@@ -118,6 +140,7 @@ pub async fn create_role(
     let status = normalize_role_status(payload.status.as_deref())?;
     let permission_ids =
         resolve_permission_ids(&state, payload.permission_ids, payload.permission_keys).await?;
+    ensure_backend_role_code(&role_code)?;
 
     ensure_role_name_unique(&state, &role_name, None).await?;
     ensure_role_code_unique(&state, &role_code, None).await?;
@@ -177,6 +200,7 @@ pub async fn update_role(
             .clone()
             .or_else(|| Some("active".to_string())),
     };
+    ensure_backend_role_code(&role_code)?;
 
     ensure_role_name_unique(&state, &role_name, Some(role_id)).await?;
     ensure_role_code_unique(&state, &role_code, Some(role_id)).await?;
@@ -329,6 +353,15 @@ async fn load_role_items(
             .context("failed to query roles for role items")
             .map_err(AppError::Internal)?,
     };
+    let roles = roles
+        .into_iter()
+        .filter(|role| {
+            role.role_code
+                .as_deref()
+                .map(|code| !HIDDEN_BUSINESS_ROLE_CODES.contains(&code))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
 
     let role_ids = roles.iter().filter_map(|item| item.id).collect::<Vec<_>>();
     let relations = if role_ids.is_empty() {
@@ -555,7 +588,83 @@ fn build_permission_tree(permissions: Vec<PermissionEntity>) -> Vec<PermissionTr
         items
     }
 
-    build_children(None, &mut grouped)
+    let mut roots = build_children(None, &mut grouped);
+    regroup_permission_roots(&mut roots);
+    for item in &mut roots {
+        remap_permission_title(item);
+    }
+    roots
+}
+
+fn regroup_permission_roots(roots: &mut Vec<PermissionTreeItem>) {
+    let settings_index = roots.iter().position(|item| item.permission_code == "settings");
+    let master_data_index = roots.iter().position(|item| item.permission_code == "master-data");
+    let (Some(settings_index), Some(master_data_index)) = (settings_index, master_data_index) else {
+        return;
+    };
+
+    roots[master_data_index].title = "基础信息".to_string();
+    roots[master_data_index].permission_name = "基础信息".to_string();
+
+    let settings_children = std::mem::take(&mut roots[settings_index].children);
+    let mut kept_settings_children = Vec::new();
+    let mut moved_to_base = Vec::new();
+
+    for child in settings_children {
+        match child.permission_code.as_str() {
+            "settings:roles" | "settings:permissions" => kept_settings_children.push(child),
+            "settings:privacy-policy"
+            | "settings:user-agreement"
+            | "settings:project-settings"
+            | "settings:sms-switch" => moved_to_base.push(remap_setting_child_to_base_info(child)),
+            _ => kept_settings_children.push(child),
+        }
+    }
+
+    roots[settings_index].children = kept_settings_children;
+    roots[master_data_index].children.extend(moved_to_base);
+    if !roots[master_data_index]
+        .children
+        .iter()
+        .any(|item| item.permission_code == "settings:sms-switch")
+    {
+        roots[master_data_index].children.push(PermissionTreeItem {
+            id: 0,
+            key: "settings:sms-switch".to_string(),
+            title: "短信开关配置".to_string(),
+            permission_code: "settings:sms-switch".to_string(),
+            permission_name: "短信开关配置".to_string(),
+            permission_type: "menu".to_string(),
+            parent_id: None,
+            sort_no: 504,
+            children: Vec::new(),
+        });
+    }
+    roots[master_data_index]
+        .children
+        .sort_by_key(|item| (item.sort_no, item.id));
+}
+
+fn remap_setting_child_to_base_info(mut item: PermissionTreeItem) -> PermissionTreeItem {
+    item.parent_id = None;
+    item.sort_no = match item.permission_code.as_str() {
+        "settings:project-settings" => 503,
+        "settings:sms-switch" => 504,
+        "settings:privacy-policy" => 505,
+        "settings:user-agreement" => 506,
+        _ => item.sort_no,
+    };
+    item
+}
+
+fn remap_permission_title(item: &mut PermissionTreeItem) {
+    if item.permission_code == "settings:permissions" {
+        item.title = "账号管理".to_string();
+        item.permission_name = "账号管理".to_string();
+    }
+    for child in &mut item.children {
+        remap_permission_title(child);
+    }
 }
 
 async fn find_role(state: &AppState, role_id: i64) -> Result<RoleEntity, AppError> {
@@ -653,6 +762,15 @@ fn normalize_role_status(value: Option<&str>) -> Result<String, AppError> {
 
 fn normalize_optional_owned(value: Option<String>) -> Option<String> {
     value.and_then(|item| normalize_optional_text(Some(item.as_str())))
+}
+
+fn ensure_backend_role_code(role_code: &str) -> Result<(), AppError> {
+    if HIDDEN_BUSINESS_ROLE_CODES.contains(&role_code) {
+        return Err(AppError::BadRequest(
+            "业务端角色不允许在后台角色管理中维护".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_optional_text(value: Option<&str>) -> Option<String> {
