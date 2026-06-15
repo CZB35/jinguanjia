@@ -21,6 +21,7 @@ pub struct UserEntity {
     pub emergency_contact_name: Option<String>,
     pub emergency_contact_mobile: Option<String>,
     pub status: Option<String>,
+    pub session_version: Option<i64>,
     pub last_login_at: Option<NaiveDateTime>,
     pub last_login_ip: Option<String>,
     pub created_at: Option<NaiveDateTime>,

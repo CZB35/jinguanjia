@@ -9,7 +9,7 @@ use rbs::value;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth, db,
+    audit, auth, db,
     error::AppError,
     models::{
         role::RoleEntity, store::StoreEntity, task::TaskEntity, user::UserEntity,
@@ -371,6 +371,7 @@ pub async fn create_dealer(
     let dealer_roles = vec!["dealer".to_string()];
     let store_ids = validate_user_store_binding(&dealer_roles, payload.store_ids.clone().unwrap_or_default())?;
     let existing = find_user_by_mobile(&state, &payload.mobile).await?;
+    let user_existed_before = existing.is_some();
     let user = if let Some(existing_user) = existing {
         if existing_user.deleted_at.is_some() {
             return Err(AppError::Conflict("该手机号账号已存在且已删除，请联系管理员处理".to_string()));
@@ -406,9 +407,28 @@ pub async fn create_dealer(
     };
 
     let user_id = user.id.unwrap_or_default();
+    let before_user = user.clone();
     ensure_specific_role_binding(&state, user_id, "dealer").await?;
     replace_user_stores(&state, user_id, store_ids).await?;
-    get_user_detail_inner(&state, user_id).await
+    if user_existed_before {
+        auth::bump_user_session_version(&state, user_id).await?;
+    }
+    let detail = get_user_detail_inner(&state, user_id).await?;
+    let after_user = find_user(&state, user_id).await?;
+    let auth_user = auth::authenticate(&state, &headers)?;
+    audit::write_audit_log(
+        &state,
+        "user",
+        user_id,
+        "create_dealer",
+        auth_user.user_id,
+        auth_user.primary_role(),
+        Some(&before_user),
+        Some(&after_user),
+        Some("后台新增经销商".to_string()),
+    )
+    .await?;
+    Ok(detail)
 }
 
 pub async fn update_dealer(
@@ -419,6 +439,8 @@ pub async fn update_dealer(
 ) -> Result<Json<ApiResponse<UserDetailResponse>>, AppError> {
     ensure_admin_access(&state, &headers)?;
     ensure_dealer_user(&state, user_id).await?;
+    let auth_user = auth::authenticate(&state, &headers)?;
+    let before_user = find_user(&state, user_id).await?;
     let current_store_ids = load_user_store_ids(&state, user_id).await?;
     let dealer_roles = vec!["dealer".to_string()];
     let next_store_ids = validate_user_store_binding(
@@ -442,8 +464,23 @@ pub async fn update_dealer(
 
     if payload.store_ids.is_some() || next_store_ids != load_user_store_ids(&state, user_id).await? {
         replace_user_stores(&state, user_id, next_store_ids).await?;
+        auth::bump_user_session_version(&state, user_id).await?;
     }
-    get_user_detail_inner(&state, user_id).await
+    let detail = get_user_detail_inner(&state, user_id).await?;
+    let after_user = find_user(&state, user_id).await?;
+    audit::write_audit_log(
+        &state,
+        "user",
+        user_id,
+        "update_dealer",
+        auth_user.user_id,
+        auth_user.primary_role(),
+        Some(&before_user),
+        Some(&after_user),
+        Some("后台编辑经销商".to_string()),
+    )
+    .await?;
+    Ok(detail)
 }
 
 pub async fn reset_dealer_password(
@@ -453,7 +490,23 @@ pub async fn reset_dealer_password(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     ensure_admin_access(&state, &headers)?;
     ensure_dealer_user(&state, user_id).await?;
-    reset_password_to_default(&state, user_id).await
+    let auth_user = auth::authenticate(&state, &headers)?;
+    let before_user = find_user(&state, user_id).await?;
+    let result = reset_password_to_default(&state, user_id).await?;
+    let after_user = find_user(&state, user_id).await?;
+    audit::write_audit_log(
+        &state,
+        "user",
+        user_id,
+        "reset_dealer_password",
+        auth_user.user_id,
+        auth_user.primary_role(),
+        Some(&before_user),
+        Some(&after_user),
+        Some("后台重置经销商密码".to_string()),
+    )
+    .await?;
+    Ok(result)
 }
 
 pub async fn get_user_detail(
@@ -472,6 +525,7 @@ pub async fn create_user(
     Json(payload): Json<CreateUserRequest>,
 ) -> Result<Json<ApiResponse<UserDetailResponse>>, AppError> {
     ensure_admin_access(&state, &headers)?;
+    let auth_user = auth::authenticate(&state, &headers)?;
 
     if payload.name.trim().is_empty() {
         return Err(AppError::BadRequest("请输入用户名".to_string()));
@@ -548,6 +602,7 @@ pub async fn create_user(
             emergency_contact_name: None,
             emergency_contact_mobile: None,
             status: Some(payload.status.unwrap_or_else(|| "enabled".to_string())),
+            session_version: Some(1),
             last_login_at: None,
             last_login_ip: None,
             created_at: None,
@@ -577,8 +632,21 @@ pub async fn create_user(
 
     replace_user_roles(&state, user_id, normalized_role_codes).await?;
     replace_user_stores(&state, user_id, store_ids).await?;
-
-    get_user_detail_inner(&state, user_id).await
+    let detail = get_user_detail_inner(&state, user_id).await?;
+    let after_user = find_user(&state, user_id).await?;
+    audit::write_audit_log(
+        &state,
+        "user",
+        user_id,
+        "create_user",
+        auth_user.user_id,
+        auth_user.primary_role(),
+        None::<&UserEntity>,
+        Some(&after_user),
+        Some("后台新增账号".to_string()),
+    )
+    .await?;
+    Ok(detail)
 }
 
 pub async fn update_user(
@@ -588,7 +656,9 @@ pub async fn update_user(
     Json(payload): Json<UpdateUserRequest>,
 ) -> Result<Json<ApiResponse<UserDetailResponse>>, AppError> {
     ensure_admin_access(&state, &headers)?;
+    let auth_user = auth::authenticate(&state, &headers)?;
     ensure_backend_user(&state, user_id).await?;
+    let before_user = find_user(&state, user_id).await?;
     let current_role_codes = find_role_codes(&state, user_id).await?;
     let current_store_ids = load_user_store_ids(&state, user_id).await?;
     let next_role_codes = payload
@@ -642,16 +712,38 @@ pub async fn update_user(
     .context("failed to update user")
     .map_err(AppError::Internal)?;
 
+    let mut should_bump_session = payload.account.is_some()
+        || payload.username.is_some()
+        || payload.role_codes.is_some();
     if payload.role_codes.is_some() {
         let role_codes = next_role_codes.clone();
         replace_user_roles(&state, user_id, role_codes).await?;
+        should_bump_session = true;
     }
     if payload.store_ids.is_some() || next_store_ids != load_user_store_ids(&state, user_id).await?
     {
         replace_user_stores(&state, user_id, next_store_ids).await?;
+        should_bump_session = true;
+    }
+    if should_bump_session {
+        auth::bump_user_session_version(&state, user_id).await?;
     }
 
-    get_user_detail_inner(&state, user_id).await
+    let detail = get_user_detail_inner(&state, user_id).await?;
+    let after_user = find_user(&state, user_id).await?;
+    audit::write_audit_log(
+        &state,
+        "user",
+        user_id,
+        "update_user",
+        auth_user.user_id,
+        auth_user.primary_role(),
+        Some(&before_user),
+        Some(&after_user),
+        Some("后台编辑账号".to_string()),
+    )
+    .await?;
+    Ok(detail)
 }
 
 pub async fn update_user_status(
@@ -679,6 +771,7 @@ pub async fn update_user_status(
     .await
     .context("failed to update user status")
     .map_err(AppError::Internal)?;
+    auth::bump_user_session_version(&state, user_id).await?;
 
     get_user_detail_inner(&state, user_id).await
 }
@@ -691,6 +784,8 @@ pub async fn reset_user_password(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     ensure_admin_access(&state, &headers)?;
     ensure_backend_user(&state, user_id).await?;
+    let auth_user = auth::authenticate(&state, &headers)?;
+    let before_user = find_user(&state, user_id).await?;
     if payload.password.trim().len() < 6 {
         return Err(AppError::BadRequest("密码长度不能少于6位".to_string()));
     }
@@ -709,10 +804,25 @@ pub async fn reset_user_password(
     .await
     .context("failed to reset user password")
     .map_err(AppError::Internal)?;
+    auth::bump_user_session_version(&state, user_id).await?;
 
-    Ok(Json(ApiResponse::success(
+    let result = Json(ApiResponse::success(
         serde_json::json!({ "ok": true }),
-    )))
+    ));
+    let after_user = find_user(&state, user_id).await?;
+    audit::write_audit_log(
+        &state,
+        "user",
+        user_id,
+        "reset_user_password",
+        auth_user.user_id,
+        auth_user.primary_role(),
+        Some(&before_user),
+        Some(&after_user),
+        Some("后台重置账号密码".to_string()),
+    )
+    .await?;
+    Ok(result)
 }
 
 async fn reset_password_to_default(
@@ -733,6 +843,7 @@ async fn reset_password_to_default(
     .await
     .context("failed to reset default password")
     .map_err(AppError::Internal)?;
+    auth::bump_user_session_version(state, user_id).await?;
 
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "ok": true, "default_password": "123456" }),

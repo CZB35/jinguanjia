@@ -253,6 +253,7 @@ pub async fn update_password(
     .await
     .context("failed to update password")
     .map_err(AppError::Internal)?;
+    auth::bump_user_session_version(&state, auth_user.user_id).await?;
 
     {
         let mut store = state.verification_codes.write().await;

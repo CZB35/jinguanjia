@@ -1,16 +1,19 @@
-use anyhow::{anyhow, Context, Result};
-use axum::http::{header, HeaderMap};
+use anyhow::{Context, Result, anyhow};
+use axum::http::{HeaderMap, header};
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
+use tokio::{runtime::Handle, task::block_in_place};
 
-use crate::{config::AuthConfig, error::AppError, state::AppState};
+use crate::{config::AuthConfig, db, error::AppError, models::user::UserEntity, state::AppState};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JwtClaims {
     pub sub: i64,
     pub mobile: String,
     pub roles: Vec<String>,
+    pub current_role: String,
+    pub session_version: i64,
     pub token_kind: String,
     pub iat: i64,
     pub exp: i64,
@@ -29,6 +32,8 @@ pub struct CurrentAuthUser {
     pub user_id: i64,
     pub mobile: String,
     pub roles: Vec<String>,
+    pub current_role: String,
+    pub session_version: i64,
 }
 
 pub fn issue_token_pair(
@@ -36,6 +41,8 @@ pub fn issue_token_pair(
     user_id: i64,
     mobile: &str,
     roles: Vec<String>,
+    current_role: &str,
+    session_version: i64,
 ) -> Result<TokenPair> {
     let now = Utc::now();
     let access_exp = now + Duration::minutes(config.access_token_expire_minutes);
@@ -45,6 +52,8 @@ pub fn issue_token_pair(
         sub: user_id,
         mobile: mobile.to_string(),
         roles: roles.clone(),
+        current_role: current_role.to_string(),
+        session_version,
         token_kind: "access".to_string(),
         iat: now.timestamp(),
         exp: access_exp.timestamp(),
@@ -54,6 +63,8 @@ pub fn issue_token_pair(
         sub: user_id,
         mobile: mobile.to_string(),
         roles,
+        current_role: current_role.to_string(),
+        session_version,
         token_kind: "refresh".to_string(),
         iat: now.timestamp(),
         exp: refresh_exp.timestamp(),
@@ -88,16 +99,34 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<CurrentAuth
     let claims = decode_access_token(&state.config.auth, &token)
         .map_err(|_| AppError::Unauthorized("登录已失效，请重新登录".to_string()))?;
 
+    let user = block_in_place(|| {
+        Handle::current().block_on(db::select_one_by_map_compat::<UserEntity>(
+            state.rb.as_ref(),
+            "user",
+            rbs::value! { "id": claims.sub },
+        ))
+    })
+    .map_err(|_| AppError::Unauthorized("登录已失效，请重新登录".to_string()))?
+    .ok_or_else(|| AppError::Unauthorized("登录已失效，请重新登录".to_string()))?;
+    if user.deleted_at.is_some() || user.status.as_deref() == Some("disabled") {
+        return Err(AppError::Unauthorized("登录已失效，请重新登录".to_string()));
+    }
+    if user.session_version.unwrap_or(1) != claims.session_version {
+        return Err(AppError::Unauthorized("账号权限已变更，请重新登录".to_string()));
+    }
+
     Ok(CurrentAuthUser {
         user_id: claims.sub,
         mobile: claims.mobile,
         roles: claims.roles,
+        current_role: claims.current_role,
+        session_version: claims.session_version,
     })
 }
 
 impl CurrentAuthUser {
     pub fn has_role(&self, role: &str) -> bool {
-        self.roles.iter().any(|item| item == role)
+        self.current_role == role
     }
 
     pub fn require_any_role(&self, roles: &[&str]) -> Result<(), AppError> {
@@ -106,6 +135,35 @@ impl CurrentAuthUser {
         }
         Err(AppError::Forbidden("您没有权限执行该操作".to_string()))
     }
+
+    pub fn primary_role(&self) -> &str {
+        self.current_role.as_str()
+    }
+}
+
+pub async fn bump_user_session_version(state: &AppState, user_id: i64) -> Result<(), AppError> {
+    let user = db::select_one_by_map_compat::<UserEntity>(
+        state.rb.as_ref(),
+        "user",
+        rbs::value! { "id": user_id },
+    )
+    .await
+    .context("failed to query user for session version bump")
+    .map_err(AppError::Internal)?
+    .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
+    let next_version = user.session_version.unwrap_or(1) + 1;
+    UserEntity::update_by_map(
+        state.rb.as_ref(),
+        &UserEntity {
+            session_version: Some(next_version),
+            ..Default::default()
+        },
+        rbs::value! { "id": user_id, "column": ["session_version"] },
+    )
+    .await
+    .context("failed to update user session version")
+    .map_err(AppError::Internal)?;
+    Ok(())
 }
 
 fn encode_token(config: &AuthConfig, claims: &JwtClaims) -> Result<String> {

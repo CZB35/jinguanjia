@@ -1,3 +1,5 @@
+use std::{collections::HashMap, io::Cursor};
+
 use anyhow::{Context, anyhow};
 use axum::{
     Json,
@@ -7,8 +9,13 @@ use axum::{
     response::Response,
 };
 use chrono::{Local, NaiveDateTime};
+use image::ImageFormat;
 use rbs::value;
+use rust_xlsxwriter::{
+    Color, Format, FormatAlign, FormatBorder, Image as XlsxImage, Workbook,
+};
 use serde::{Deserialize, Serialize};
+use tokio::fs;
 
 use crate::{
     audit, auth, db,
@@ -175,6 +182,11 @@ pub struct TaskListResponse {
     pub total: usize,
     pub page: usize,
     pub page_size: usize,
+}
+
+struct TaskExportRow {
+    summary: TaskSummary,
+    image_buffers: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -561,41 +573,178 @@ pub async fn export_tasks(
     let auth_user = auth::authenticate(&state, &headers)?;
     let items = load_task_summaries(&state, &auth_user, &query).await?;
 
-    let mut csv = String::from(
-        "task_id,task_no,service_type,service_items,task_status,display_status,review_status,score_status,appointment_time,customer_name,customer_mobile,store_name,dealer_name,technician_name,technician_mobile,is_overdue,task_tags\n",
-    );
+    let mut image_cache = HashMap::<i64, Vec<Vec<u8>>>::new();
+    let mut export_rows = Vec::with_capacity(items.len());
+    let mut max_image_count = 0usize;
     for item in items {
-        csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            item.id,
-            csv_cell(&item.task_no),
-            csv_cell(&item.service_type),
-            csv_cell(&item.service_items_text),
-            csv_cell(&item.task_status_text),
-            csv_cell(&item.display_status_text),
-            csv_cell(&item.review_status_text),
-            csv_cell(&item.score_status_text),
-            csv_cell(&item.appointment_time.unwrap_or_default()),
-            csv_cell(&item.customer_name),
-            csv_cell(&item.customer_mobile),
-            csv_cell(&item.store_name),
-            csv_cell(&item.dealer_name),
-            csv_cell(&item.technician_name.unwrap_or_default()),
-            csv_cell(&item.technician_mobile.unwrap_or_default()),
-            if item.is_overdue { "是" } else { "否" },
-            csv_cell(&item.task_tags.join("|")),
-        ));
+        let image_buffers = if let Some(cached) = image_cache.get(&item.id) {
+            cached.clone()
+        } else {
+            let loaded = load_task_export_image_buffers(&state, item.id).await?;
+            image_cache.insert(item.id, loaded.clone());
+            loaded
+        };
+        max_image_count = max_image_count.max(image_buffers.len());
+        export_rows.push(TaskExportRow {
+            summary: item,
+            image_buffers,
+        });
     }
 
-    let mut response = Response::new(Body::from(csv));
+    let mut workbook = Workbook::new();
+    {
+        let header_format = Format::new()
+            .set_bold()
+            .set_font_color(Color::White)
+            .set_background_color(Color::RGB(0x1F4E78))
+            .set_border(FormatBorder::Thin)
+            .set_align(FormatAlign::Center)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_text_wrap();
+        let cell_format = Format::new()
+            .set_border(FormatBorder::Thin)
+            .set_align(FormatAlign::VerticalCenter)
+            .set_text_wrap();
+        let image_cell_format = Format::new()
+            .set_border(FormatBorder::Thin)
+            .set_align(FormatAlign::Center)
+            .set_align(FormatAlign::VerticalCenter);
+        let worksheet = workbook
+            .add_worksheet()
+            .set_name("任务导出")
+            .context("failed to create task export worksheet")
+            .map_err(AppError::Internal)?;
+
+        let base_headers = vec![
+            "任务ID",
+            "任务编号",
+            "服务类型",
+            "服务项目",
+            "任务状态",
+            "展示状态",
+            "评价状态",
+            "评分状态",
+            "预约时间",
+            "客户姓名",
+            "客户手机号",
+            "门店名称",
+            "经销商",
+            "技师姓名",
+            "技师手机号",
+            "是否逾期",
+            "任务标签",
+        ];
+        let base_column_widths = [
+            90_u32, 140, 100, 160, 100, 100, 100, 100, 150, 110, 130, 140, 110, 110, 130, 90,
+            220,
+        ];
+        let mut headers = base_headers.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        for image_index in 0..max_image_count {
+            headers.push(format!("现场图片{}", image_index + 1));
+        }
+
+        worksheet
+            .set_row_height_pixels(0, 28)
+            .context("failed to set export header row height")
+            .map_err(AppError::Internal)?;
+        for (index, width) in base_column_widths.iter().enumerate() {
+            worksheet
+                .set_column_width_pixels(index as u16, *width)
+                .context("failed to set export base column width")
+                .map_err(AppError::Internal)?;
+        }
+        for image_index in 0..max_image_count {
+            worksheet
+                .set_column_width_pixels((base_headers.len() + image_index) as u16, 180)
+                .context("failed to set export image column width")
+                .map_err(AppError::Internal)?;
+        }
+
+        for (col, title) in headers.iter().enumerate() {
+            worksheet
+                .write_string_with_format(0, col as u16, title, &header_format)
+                .context("failed to write export header cell")
+                .map_err(AppError::Internal)?;
+        }
+
+        for (row_index, row) in export_rows.iter().enumerate() {
+            let excel_row = (row_index + 1) as u32;
+            let summary = &row.summary;
+            let row_height = if row.image_buffers.is_empty() { 26 } else { 140 };
+            worksheet
+                .set_row_height_pixels(excel_row, row_height)
+                .context("failed to set export data row height")
+                .map_err(AppError::Internal)?;
+
+            let text_columns = vec![
+                summary.task_no.clone(),
+                summary.service_type.clone(),
+                summary.service_items_text.clone(),
+                summary.task_status_text.clone(),
+                summary.display_status_text.clone(),
+                summary.review_status_text.clone(),
+                summary.score_status_text.clone(),
+                summary.appointment_time.clone().unwrap_or_default(),
+                summary.customer_name.clone(),
+                summary.customer_mobile.clone(),
+                summary.store_name.clone(),
+                summary.dealer_name.clone(),
+                summary.technician_name.clone().unwrap_or_default(),
+                summary.technician_mobile.clone().unwrap_or_default(),
+                if summary.is_overdue {
+                    "是".to_string()
+                } else {
+                    "否".to_string()
+                },
+                summary.task_tags.join(" | "),
+            ];
+
+            worksheet
+                .write_with_format(excel_row, 0, summary.id, &cell_format)
+                .context("failed to write export task id")
+                .map_err(AppError::Internal)?;
+            for (offset, value) in text_columns.iter().enumerate() {
+                worksheet
+                    .write_string_with_format(excel_row, (offset + 1) as u16, value, &cell_format)
+                    .context("failed to write export text cell")
+                    .map_err(AppError::Internal)?;
+            }
+
+            for image_index in 0..max_image_count {
+                let col = (base_headers.len() + image_index) as u16;
+                worksheet
+                    .write_string_with_format(excel_row, col, "", &image_cell_format)
+                    .context("failed to write export image placeholder cell")
+                    .map_err(AppError::Internal)?;
+                if let Some(image_buffer) = row.image_buffers.get(image_index) {
+                    let image = XlsxImage::new_from_buffer(image_buffer)
+                        .context("failed to build export image from buffer")
+                        .map_err(AppError::Internal)?;
+                    worksheet
+                        .insert_image_fit_to_cell_centered(excel_row, col, &image)
+                        .context("failed to insert export image into worksheet")
+                        .map_err(AppError::Internal)?;
+                }
+            }
+        }
+    }
+
+    let workbook_bytes = workbook
+        .save_to_buffer()
+        .context("failed to render task export workbook")
+        .map_err(AppError::Internal)?;
+
+    let mut response = Response::new(Body::from(workbook_bytes));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("text/csv; charset=utf-8"),
+        HeaderValue::from_static(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
     );
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=\"tasks-export.csv\""),
+        HeaderValue::from_static("attachment; filename=\"tasks-export.xlsx\""),
     );
     Ok(response)
 }
@@ -763,6 +912,33 @@ fn review_level_text_from_remark(remark: Option<&str>) -> Option<&'static str> {
         return Some("较差");
     }
     Some("已评价")
+}
+
+async fn resolve_task_submit_project_name(
+    state: &AppState,
+    task: &TaskEntity,
+) -> Result<String, AppError> {
+    if let Some(store_id) = task.store_id {
+        if let Some(store) = db::select_one_by_map_compat::<StoreEntity>(
+            state.rb.as_ref(),
+            "store",
+            value! { "id": store_id },
+        )
+        .await
+        .context("failed to query store for task submit project name")
+        .map_err(AppError::Internal)?
+            && let Some(name) = store.store_name.filter(|item| !item.trim().is_empty())
+        {
+            return Ok(name);
+        }
+    }
+
+    let customer = find_customer_by_id(state, task.customer_id).await?;
+    if let Some(name) = customer.name.filter(|item| !item.trim().is_empty()) {
+        return Ok(name);
+    }
+
+    Ok(task.task_no.clone().unwrap_or_else(|| "项目服务".to_string()))
 }
 
 pub async fn get_task_detail(
@@ -1490,13 +1666,32 @@ pub async fn submit_task(
     if task_status == "pending_dealer_review"
         && let Some(dealer_user_id) = task.dealer_user_id
     {
-        let _ = notify::create_notice(
+        let project_name = resolve_task_submit_project_name(&state, &task).await?;
+        let technician_name = find_user_by_id(&state, task.current_technician_id)
+            .await
+            .ok()
+            .and_then(|item| item.name)
+            .unwrap_or_else(|| "服务人员".to_string());
+        let completed_at = after_task
+            .updated_at
+            .map(format_datetime)
+            .unwrap_or_else(|| format_datetime(local_now()));
+        let _ = notify::create_notice_with_payload(
             &state,
             dealer_user_id,
             "task_submit",
             task_id,
             "任务待评价",
             "技师已提交检核，请尽快评价",
+            serde_json::json!({
+                "title": "客户服务已完成通知",
+                "content": "技师已提交检核，请尽快评价",
+                "biz_type": "task_submit",
+                "biz_id": task_id,
+                "technician_name": technician_name,
+                "project_name": project_name,
+                "completed_at": completed_at,
+            }),
         )
         .await;
     }
@@ -3572,10 +3767,6 @@ fn overdue_text(is_overdue: bool) -> &'static str {
     if is_overdue { "已逾期" } else { "正常" }
 }
 
-fn csv_cell(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
 fn build_task_tags(
     task: &TaskEntity,
     service_items: &[TaskServiceItemPayload],
@@ -3638,6 +3829,51 @@ fn is_technician_only(auth_user: &auth::CurrentAuthUser) -> bool {
         && !auth_user.has_role("dealer")
         && !auth_user.has_role("hq_reviewer")
         && !auth_user.has_role("super_admin")
+}
+
+async fn load_task_export_image_buffers(
+    state: &AppState,
+    task_id: i64,
+) -> Result<Vec<Vec<u8>>, AppError> {
+    let mut evidences: Vec<EvidenceEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "evidence",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query task export evidences")
+    .map_err(AppError::Internal)?;
+    evidences.retain(|item| item.evidence_type.as_deref() == Some("image"));
+    evidences.sort_by(|left, right| left.id.unwrap_or_default().cmp(&right.id.unwrap_or_default()));
+
+    let mut image_buffers = Vec::new();
+    for evidence in evidences {
+        let relative_path = evidence.file_url.unwrap_or_default();
+        if relative_path.trim().is_empty() {
+            continue;
+        }
+        let absolute_path = storage::full_path(state, &relative_path);
+        let bytes = match fs::read(&absolute_path).await {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        if let Some(buffer) = normalize_export_image_buffer(&bytes) {
+            image_buffers.push(buffer);
+        }
+    }
+
+    Ok(image_buffers)
+}
+
+fn normalize_export_image_buffer(bytes: &[u8]) -> Option<Vec<u8>> {
+    if XlsxImage::new_from_buffer(bytes).is_ok() {
+        return Some(bytes.to_vec());
+    }
+
+    let image = image::load_from_memory(bytes).ok()?;
+    let mut out = Cursor::new(Vec::new());
+    image.write_to(&mut out, ImageFormat::Png).ok()?;
+    Some(out.into_inner())
 }
 
 fn primary_role(auth_user: &auth::CurrentAuthUser) -> &str {

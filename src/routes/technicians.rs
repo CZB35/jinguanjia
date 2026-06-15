@@ -10,7 +10,7 @@ use rbs::value;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth, db,
+    audit, auth, db,
     error::AppError,
     models::{
         hq_score_item::HqScoreItemEntity, role::RoleEntity, task::TaskEntity,
@@ -382,6 +382,7 @@ pub async fn create_technician(
     .await
     .context("failed to query existing user by mobile")
     .map_err(AppError::Internal)?;
+    let user_existed_before = !existing_users.is_empty();
     let user = if let Some(existing_user) = existing_users.into_iter().next() {
         if existing_user.deleted_at.is_some() {
             return Err(AppError::Conflict("该手机号账号已存在且已删除，请联系管理员处理".to_string()));
@@ -413,6 +414,7 @@ pub async fn create_technician(
                 emergency_contact_name: payload.emergency_contact_name.clone(),
                 emergency_contact_mobile: payload.emergency_contact_mobile.clone(),
                 status: Some("enabled".to_string()),
+                session_version: Some(1),
                 last_login_at: None,
                 last_login_ip: None,
                 created_at: None,
@@ -444,6 +446,9 @@ pub async fn create_technician(
     ensure_technician_role_binding(&state, user_id).await?;
     upsert_single_store_binding(&state, user_id, store_id).await?;
     replace_technician_skills(&state, user_id, service_types).await?;
+    if user_existed_before {
+        auth::bump_user_session_version(&state, user_id).await?;
+    }
 
     get_technician_detail_inner(&state, user_id).await
 }
@@ -479,6 +484,7 @@ pub async fn update_technician(
     .context("failed to update technician")
     .map_err(AppError::Internal)?;
 
+    let mut should_bump_session = false;
     if let Some(service_types) = payload.service_types {
         let existing: Vec<TechnicianSkillEntity> = db::select_by_map_compat(
             state.rb.as_ref(),
@@ -510,6 +516,7 @@ pub async fn update_technician(
             .context("failed to recreate technician skill")
             .map_err(AppError::Internal)?;
         }
+        should_bump_session = true;
     }
 
     if let Some(store_id) = payload.store_id {
@@ -543,6 +550,11 @@ pub async fn update_technician(
         .await
         .context("failed to bind technician store")
         .map_err(AppError::Internal)?;
+        should_bump_session = true;
+    }
+
+    if should_bump_session {
+        auth::bump_user_session_version(&state, technician_id).await?;
     }
 
     get_technician_detail_inner(&state, technician_id).await
@@ -575,6 +587,7 @@ pub async fn update_technician_status(
     .await
     .context("failed to update technician status")
     .map_err(AppError::Internal)?;
+    auth::bump_user_session_version(&state, technician_id).await?;
 
     get_technician_detail_inner(&state, technician_id).await
 }
@@ -587,7 +600,7 @@ pub async fn reset_technician_password(
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
     ensure_technician_access(&state, &auth_user, technician_id).await?;
-    let _ = find_user(&state, technician_id).await?;
+    let before_user = find_user(&state, technician_id).await?;
 
     let password_hash = hash("123456", 10)
         .context("failed to hash technician reset password")
@@ -603,10 +616,25 @@ pub async fn reset_technician_password(
     .await
     .context("failed to reset technician password")
     .map_err(AppError::Internal)?;
+    auth::bump_user_session_version(&state, technician_id).await?;
 
-    Ok(Json(ApiResponse::success(
+    let result = Json(ApiResponse::success(
         serde_json::json!({ "ok": true, "default_password": "123456" }),
-    )))
+    ));
+    let after_user = find_user(&state, technician_id).await?;
+    audit::write_audit_log(
+        &state,
+        "user",
+        technician_id,
+        "reset_technician_password",
+        auth_user.user_id,
+        auth_user.primary_role(),
+        Some(&before_user),
+        Some(&after_user),
+        Some("后台重置师傅密码".to_string()),
+    )
+    .await?;
+    Ok(result)
 }
 
 pub async fn get_technician_performance(

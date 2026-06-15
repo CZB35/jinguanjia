@@ -228,6 +228,7 @@ pub async fn update_role(
             resolve_permission_ids(&state, payload.permission_ids, payload.permission_keys).await?;
         replace_role_permissions(&state, role_id, &permission_ids).await?;
     }
+    bump_role_bound_user_sessions(&state, role_id).await?;
 
     get_role_detail(State(state), headers, Path(role_id)).await
 }
@@ -316,6 +317,7 @@ pub async fn update_role_permissions(
     let permission_ids =
         resolve_permission_ids(&state, payload.permission_ids, payload.permission_keys).await?;
     replace_role_permissions(&state, role_id, &permission_ids).await?;
+    bump_role_bound_user_sessions(&state, role_id).await?;
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "ok": true }),
     )))
@@ -482,6 +484,25 @@ async fn replace_role_permissions(
         .map_err(AppError::Internal)?;
     }
 
+    Ok(())
+}
+
+async fn bump_role_bound_user_sessions(state: &AppState, role_id: i64) -> Result<(), AppError> {
+    let relations: Vec<UserRoleEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "user_role",
+        value! { "role_id": role_id },
+    )
+    .await
+    .context("failed to query role user bindings for session invalidation")
+    .map_err(AppError::Internal)?;
+    let user_ids = relations
+        .into_iter()
+        .filter_map(|item| item.user_id)
+        .collect::<BTreeSet<_>>();
+    for user_id in user_ids {
+        auth::bump_user_session_version(state, user_id).await?;
+    }
     Ok(())
 }
 

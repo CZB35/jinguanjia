@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    auth, db,
+    audit, auth, db,
     error::AppError,
     models::{
         hq_score::HqScoreEntity, hq_score_item::HqScoreItemEntity, role::RoleEntity,
@@ -64,10 +64,19 @@ pub async fn batch_delete_users(
     Json(payload): Json<BatchDeleteUsersRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     ensure_admin_access(&state, &headers)?;
+    let auth_user = auth::authenticate(&state, &headers)?;
     if payload.user_ids.is_empty() {
         return Err(AppError::BadRequest("user_ids不能为空".to_string()));
     }
     for user_id in payload.user_ids {
+        let before_user = db::select_one_by_map_compat::<UserEntity>(
+            state.rb.as_ref(),
+            "user",
+            value! { "id": user_id },
+        )
+        .await
+        .context("failed to query user before batch delete")
+        .map_err(AppError::Internal)?;
         UserEntity::update_by_map(
             state.rb.as_ref(),
             &UserEntity {
@@ -79,6 +88,27 @@ pub async fn batch_delete_users(
         .await
         .context("failed to soft delete user in batch")
         .map_err(AppError::Internal)?;
+        auth::bump_user_session_version(&state, user_id).await?;
+        let after_user = db::select_one_by_map_compat::<UserEntity>(
+            state.rb.as_ref(),
+            "user",
+            value! { "id": user_id },
+        )
+        .await
+        .context("failed to query user after batch delete")
+        .map_err(AppError::Internal)?;
+        audit::write_audit_log(
+            &state,
+            "user",
+            user_id,
+            "batch_delete_user",
+            auth_user.user_id,
+            auth_user.primary_role(),
+            before_user.as_ref(),
+            after_user.as_ref(),
+            Some("后台批量删除账号".to_string()),
+        )
+        .await?;
     }
 
     Ok(Json(ApiResponse::success(
@@ -92,6 +122,15 @@ pub async fn delete_user(
     axum::extract::Path(user_id): axum::extract::Path<i64>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     ensure_admin_access(&state, &headers)?;
+    let auth_user = auth::authenticate(&state, &headers)?;
+    let before_user = db::select_one_by_map_compat::<UserEntity>(
+        state.rb.as_ref(),
+        "user",
+        value! { "id": user_id },
+    )
+    .await
+    .context("failed to query user before delete")
+    .map_err(AppError::Internal)?;
     UserEntity::update_by_map(
         state.rb.as_ref(),
         &UserEntity {
@@ -103,6 +142,27 @@ pub async fn delete_user(
     .await
     .context("failed to soft delete user")
     .map_err(AppError::Internal)?;
+    auth::bump_user_session_version(&state, user_id).await?;
+    let after_user = db::select_one_by_map_compat::<UserEntity>(
+        state.rb.as_ref(),
+        "user",
+        value! { "id": user_id },
+    )
+    .await
+    .context("failed to query user after delete")
+    .map_err(AppError::Internal)?;
+    audit::write_audit_log(
+        &state,
+        "user",
+        user_id,
+        "delete_user",
+        auth_user.user_id,
+        auth_user.primary_role(),
+        before_user.as_ref(),
+        after_user.as_ref(),
+        Some("后台删除账号".to_string()),
+    )
+    .await?;
 
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "ok": true }),
@@ -152,7 +212,7 @@ pub async fn download_user_import_template(
             "dealers-import-template.csv",
             build_csv_template(
                 &["姓名", "手机号", "密码", "所属门店ID", "状态"],
-                &["示例经销商", "13800009999", "123456", "1", "enabled"],
+                &["示例经销商", "13800009999", "123456", "1", "启用"],
             ),
         )
     } else {
@@ -160,7 +220,7 @@ pub async fn download_user_import_template(
             "users-import-template.csv",
             build_csv_template(
                 &["姓名", "手机号", "密码", "角色编码", "所属门店ID", "状态"],
-                &["示例用户", "13800009999", "123456", "dealer", "1", "enabled"],
+                &["示例用户", "13800009999", "123456", "dealer", "1", "启用"],
             ),
         )
     };
@@ -263,6 +323,7 @@ pub async fn import_users(
             &UserEntity {
                 id: None,
                 mobile: Some(row.mobile.clone()),
+                account: Some(row.mobile.clone()),
                 password_hash: Some(password_hash),
                 name: Some(row.name.clone()),
                 nickname: None,
@@ -273,11 +334,17 @@ pub async fn import_users(
                 emergency_contact_name: None,
                 emergency_contact_mobile: None,
                 status: Some(normalize_user_status(Some(row.status.as_str()))?),
+                session_version: Some(1),
                 last_login_at: None,
                 last_login_ip: None,
                 created_at: None,
                 updated_at: None,
                 deleted_at: None,
+                wechat_openid: None,
+                wechat_unionid: None,
+                wechat_subscribe: Some(0),
+                wechat_bind_at: None,
+                wechat_subscribe_updated_at: None,
             },
         )
         .await
@@ -746,17 +813,17 @@ fn validate_import_store_binding(role_codes: &[String], store_ids: &[i64]) -> Re
 }
 
 fn normalize_user_status(value: Option<&str>) -> Result<String, AppError> {
-    match value
-        .unwrap_or("enabled")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "enabled" | "active" => Ok("enabled".to_string()),
-        "disabled" | "inactive" => Ok("disabled".to_string()),
-        _ => Err(AppError::BadRequest(
-            "用户状态只能为enabled/disabled或active/inactive".to_string(),
-        )),
+    let raw = value.unwrap_or("enabled").trim();
+    match raw {
+        "启用" => Ok("enabled".to_string()),
+        "禁用" => Ok("disabled".to_string()),
+        _ => match raw.to_ascii_lowercase().as_str() {
+            "enabled" | "active" => Ok("enabled".to_string()),
+            "disabled" | "inactive" => Ok("disabled".to_string()),
+            _ => Err(AppError::BadRequest(
+                "用户状态只能为启用/禁用或enabled/disabled或active/inactive".to_string(),
+            )),
+        },
     }
 }
 

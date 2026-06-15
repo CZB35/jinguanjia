@@ -1546,6 +1546,7 @@ dependencies = [
  "rbdc-mysql",
  "rbs",
  "reqwest",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "sha1",
@@ -2700,6 +2701,15 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.95.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f281b687352597d29efaad39701d1167d5c48aa76fb973e392bc13e9d44e7f36"
+dependencies = [
+ "zip",
 ]
 
 [[package]]

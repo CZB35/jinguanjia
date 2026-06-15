@@ -39,6 +39,7 @@ use crate::{
 #[derive(Debug, Serialize)]
 pub struct FileItem {
     pub id: i64,
+    pub source: String,
     pub file_name: String,
     pub file_url: String,
     pub file_size: i64,
@@ -152,7 +153,7 @@ pub async fn list_task_attachments(
     let auth_user = auth::authenticate(&state, &headers)?;
     ensure_task_access(&state, &auth_user, task_id).await?;
 
-    let items = db::select_by_map_compat::<AttachmentEntity>(
+    let mut items = db::select_by_map_compat::<AttachmentEntity>(
         state.rb.as_ref(),
         "attachment",
         value! { "task_id": task_id },
@@ -163,6 +164,7 @@ pub async fn list_task_attachments(
     .into_iter()
     .map(|item: AttachmentEntity| FileItem {
         id: item.id.unwrap_or_default(),
+        source: "attachment".to_string(),
         file_name: item.file_name.unwrap_or_default(),
         file_url: storage::public_url(&item.file_url.unwrap_or_default()),
         file_size: item.file_size.unwrap_or_default(),
@@ -171,6 +173,29 @@ pub async fn list_task_attachments(
             .unwrap_or_else(|| "application/octet-stream".to_string()),
     })
     .collect::<Vec<_>>();
+
+    let evidence_items = db::select_by_map_compat::<EvidenceEntity>(
+        state.rb.as_ref(),
+        "evidence",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query attachment-compatible evidences")
+    .map_err(AppError::Internal)?
+    .into_iter()
+    .map(|item: EvidenceEntity| FileItem {
+        id: item.id.unwrap_or_default(),
+        source: "evidence".to_string(),
+        file_name: item.file_name.unwrap_or_default(),
+        file_url: storage::public_url(&item.file_url.unwrap_or_default()),
+        file_size: item.file_size.unwrap_or_default(),
+        mime_type: item
+            .mime_type
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+    })
+    .collect::<Vec<_>>();
+    items.extend(evidence_items);
+    items.sort_by(|left, right| right.id.cmp(&left.id));
 
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
@@ -225,6 +250,7 @@ pub async fn list_task_evidences(
     .into_iter()
     .map(|item: EvidenceEntity| FileItem {
         id: item.id.unwrap_or_default(),
+        source: "evidence".to_string(),
         file_name: item.file_name.unwrap_or_default(),
         file_url: storage::public_url(&item.file_url.unwrap_or_default()),
         file_size: item.file_size.unwrap_or_default(),

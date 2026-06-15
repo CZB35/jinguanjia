@@ -111,6 +111,7 @@ pub async fn login_by_password(
         user.mobile.as_deref().unwrap_or_default(),
         roles.clone(),
         &current_role,
+        user.session_version.unwrap_or(1),
     )
     .map_err(AppError::Internal)?;
 
@@ -167,6 +168,7 @@ pub async fn login_admin_by_password(
         user.mobile.as_deref().unwrap_or_default(),
         backend_roles.clone(),
         &current_role,
+        user.session_version.unwrap_or(1),
     )
     .map_err(AppError::Internal)?;
 
@@ -191,6 +193,9 @@ pub async fn refresh_token(
 
     let user = find_user_by_id(&state, claims.sub).await?;
     ensure_user_loginable(&user)?;
+    if user.session_version.unwrap_or(1) != claims.session_version {
+        return Err(AppError::Unauthorized("账号权限已变更，请重新登录".to_string()));
+    }
 
     let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
     let current_role = resolve_current_role(&roles, Some(claims.current_role.as_str()))?;
@@ -200,6 +205,7 @@ pub async fn refresh_token(
         user.mobile.as_deref().unwrap_or_default(),
         roles.clone(),
         &current_role,
+        user.session_version.unwrap_or(1),
     )
     .map_err(AppError::Internal)?;
 
@@ -295,6 +301,7 @@ pub async fn login_by_code(
         user.mobile.as_deref().unwrap_or_default(),
         roles.clone(),
         &current_role,
+        user.session_version.unwrap_or(1),
     )
     .map_err(AppError::Internal)?;
 
@@ -354,6 +361,7 @@ pub async fn switch_role(
         user.mobile.as_deref().unwrap_or_default(),
         roles.clone(),
         &current_role,
+        user.session_version.unwrap_or(1),
     )
     .map_err(AppError::Internal)?;
 
