@@ -34,6 +34,7 @@ pub struct NoticeListResponse {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct NoticeListQuery {
+    pub keyword: Option<String>,
     pub page: Option<usize>,
     pub page_size: Option<usize>,
 }
@@ -58,7 +59,7 @@ pub async fn list_notices(
     .context("failed to query notices")
     .map_err(AppError::Internal)?;
 
-    let items = notices
+    let mut items = notices
         .into_iter()
         .map(|item| NoticeItem {
             id: item.id.unwrap_or_default(),
@@ -74,11 +75,30 @@ pub async fn list_notices(
         })
         .collect::<Vec<_>>();
 
+    if let Some(keyword) = query
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        items.retain(|item| item.title.contains(keyword) || item.content.contains(keyword));
+    }
+    items.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).max(1);
     let start = page.saturating_sub(1).saturating_mul(page_size);
-    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
+    let items = items
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(NoticeListResponse {
         items,
         total,

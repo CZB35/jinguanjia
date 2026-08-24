@@ -4,7 +4,6 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use chrono::Local;
 use rbs::value;
 use serde::{Deserialize, Serialize};
 
@@ -76,13 +75,9 @@ pub async fn dealer_review(
         .or_else(|| payload.service_type.clone())
         .or_else(|| task.service_type.clone());
 
-    let existing = load_existing_dealer_reviews(
-        &state,
-        task_id,
-        service_item_id,
-        service_type.as_deref(),
-    )
-    .await?;
+    let existing =
+        load_existing_dealer_reviews(&state, task_id, service_item_id, service_type.as_deref())
+            .await?;
     if !existing.is_empty() {
         return Err(AppError::Conflict(
             "该服务环节已完成评价，请勿重复提交".to_string(),
@@ -118,14 +113,14 @@ pub async fn dealer_review(
     let task_status = update_task_after_dealer_review(&state, &task, service_item_id).await?;
 
     let after_task = find_task(&state, task_id).await?;
-    if task_status == "pending_hq_score" {
+    if task_status == "completed" {
         let _ = notify::create_notice(
             &state,
             auth_user.user_id,
             "dealer_review_done",
             task_id,
             "评价已提交",
-            "经销商评价已提交，任务进入总部评分环节",
+            "经销商评价已提交，任务已完成，等待总部核验",
         )
         .await;
     }
@@ -165,7 +160,10 @@ pub async fn hq_score(
 
     let task = find_task(&state, task_id).await?;
     let before_task = task.clone();
-    if task.task_status.as_deref() != Some("pending_hq_score") {
+    if !matches!(
+        task.task_status.as_deref(),
+        Some("pending_dealer_review") | Some("pending_hq_score") | Some("completed")
+    ) {
         return Err(AppError::Conflict("当前任务状态不允许评分".to_string()));
     }
 
@@ -174,10 +172,22 @@ pub async fn hq_score(
             .await
             .context("failed to query existing hq score")
             .map_err(AppError::Internal)?;
-    if !existing.is_empty() {
-        return Err(AppError::Conflict(
-            "该任务已完成评分，请勿重复提交".to_string(),
-        ));
+    let existing_score_ids = existing
+        .iter()
+        .filter_map(|item| item.id)
+        .collect::<Vec<_>>();
+    if !existing_score_ids.is_empty() {
+        HqScoreItemEntity::delete_by_map(
+            state.rb.as_ref(),
+            value! { "hq_score_id": existing_score_ids.clone() },
+        )
+        .await
+        .context("failed to delete existing hq score items")
+        .map_err(AppError::Internal)?;
+        HqScoreEntity::delete_by_map(state.rb.as_ref(), value! { "task_id": task_id })
+            .await
+            .context("failed to delete existing hq score")
+            .map_err(AppError::Internal)?;
     }
 
     let task_service_items: Vec<TaskServiceItemEntity> = db::select_by_map_compat(
@@ -259,32 +269,13 @@ pub async fn hq_score(
         state.rb.as_ref(),
         &TaskEntity {
             score_status: Some("scored".to_string()),
-            task_status: Some("completed".to_string()),
             ..Default::default()
         },
-        value! { "id": task_id },
+        value! { "id": task_id, "column": ["score_status"] },
     )
     .await
     .context("failed to update task after hq score")
     .map_err(AppError::Internal)?;
-
-    for service_item in task_service_items {
-        if let Some(id) = service_item.id {
-            TaskServiceItemEntity::update_by_map(
-                state.rb.as_ref(),
-                &TaskServiceItemEntity {
-                    service_status: Some("completed".to_string()),
-                    progress_percent: Some(100),
-                    completed_at: Some(Local::now().naive_local()),
-                    ..Default::default()
-                },
-                value! { "id": id },
-            )
-            .await
-            .context("failed to update task service item after score")
-            .map_err(AppError::Internal)?;
-        }
-    }
 
     let after_task = find_task(&state, task_id).await?;
     if let Some(technician_id) = task.current_technician_id {
@@ -325,7 +316,7 @@ pub async fn hq_score(
 
     Ok(Json(ApiResponse::success(ReviewActionResponse {
         task_id,
-        task_status: "completed".to_string(),
+        task_status: task.task_status.unwrap_or_default(),
         service_item_id: None,
         service_type: None,
     })))
@@ -380,7 +371,8 @@ async fn resolve_dealer_review_service_item(
             [] => return Err(AppError::Conflict("当前服务环节状态不允许评价".to_string())),
             _ => {
                 return Err(AppError::BadRequest(
-                    "当前任务包含多个待评价服务环节，请传 service_item_id 或 service_type".to_string(),
+                    "当前任务包含多个待评价服务环节，请传 service_item_id 或 service_type"
+                        .to_string(),
                 ));
             }
         }
@@ -418,10 +410,14 @@ async fn load_existing_dealer_reviews(
         .context("failed to query existing dealer review by service type")
         .map_err(AppError::Internal);
     }
-    db::select_by_map_compat(state.rb.as_ref(), "dealer_review", value! { "task_id": task_id })
-        .await
-        .context("failed to query existing dealer review")
-        .map_err(AppError::Internal)
+    db::select_by_map_compat(
+        state.rb.as_ref(),
+        "dealer_review",
+        value! { "task_id": task_id },
+    )
+    .await
+    .context("failed to query existing dealer review")
+    .map_err(AppError::Internal)
 }
 
 async fn update_task_after_dealer_review(
@@ -436,8 +432,8 @@ async fn update_task_after_dealer_review(
         TaskServiceItemEntity::update_by_map(
             state.rb.as_ref(),
             &TaskServiceItemEntity {
-                service_status: Some("pending_hq_score".to_string()),
-                progress_percent: Some(95),
+                service_status: Some("completed".to_string()),
+                progress_percent: Some(100),
                 ..Default::default()
             },
             value! { "id": service_item_id },
@@ -454,6 +450,12 @@ async fn update_task_after_dealer_review(
         .await
         .context("failed to query service items after dealer review")
         .map_err(AppError::Internal)?;
+        let any_reviewed = service_items.iter().any(|item| {
+            matches!(
+                item.service_status.as_deref(),
+                Some("pending_hq_score") | Some("completed") | Some("closed")
+            )
+        });
         let all_reviewed = service_items.iter().all(|item| {
             matches!(
                 item.service_status.as_deref(),
@@ -461,6 +463,19 @@ async fn update_task_after_dealer_review(
             )
         });
         if !all_reviewed {
+            if any_reviewed && task.review_status.as_deref() != Some("reviewed") {
+                TaskEntity::update_by_map(
+                    state.rb.as_ref(),
+                    &TaskEntity {
+                        review_status: Some("reviewed".to_string()),
+                        ..Default::default()
+                    },
+                    value! { "id": task_id, "column": ["review_status"] },
+                )
+                .await
+                .context("failed to update task review status after partial dealer review")
+                .map_err(AppError::Internal)?;
+            }
             return Ok(task.task_status.clone().unwrap_or_default());
         }
     }
@@ -469,7 +484,7 @@ async fn update_task_after_dealer_review(
         state.rb.as_ref(),
         &TaskEntity {
             review_status: Some("reviewed".to_string()),
-            task_status: Some("pending_hq_score".to_string()),
+            task_status: Some("completed".to_string()),
             ..Default::default()
         },
         value! { "id": task_id },
@@ -477,15 +492,20 @@ async fn update_task_after_dealer_review(
     .await
     .context("failed to update task after dealer review")
     .map_err(AppError::Internal)?;
-    Ok("pending_hq_score".to_string())
+    Ok("completed".to_string())
 }
 
 async fn find_task(state: &AppState, task_id: i64) -> Result<TaskEntity, AppError> {
-    db::select_one_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
-        .await
-        .context("failed to query task by id")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::NotFound("任务不存在或已删除".to_string()))
+    let task: TaskEntity =
+        db::select_one_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
+            .await
+            .context("failed to query task by id")
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound("任务不存在或已删除".to_string()))?;
+    if task.deleted_at.is_some() {
+        return Err(AppError::NotFound("任务不存在或已删除".to_string()));
+    }
+    Ok(task)
 }
 
 async fn ensure_dealer_can_review_task(

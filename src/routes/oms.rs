@@ -1,16 +1,11 @@
 use anyhow::Context;
-use axum::{
-    Json,
-    extract::State,
-    http::HeaderMap,
-};
+use axum::{Json, extract::State, http::HeaderMap};
 use chrono::Utc;
 use rbs::value;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
     models::{oms_config::OmsConfigEntity, oms_sync_log::OmsSyncLogEntity, task::TaskEntity},
     response::ApiResponse,
@@ -63,10 +58,11 @@ pub async fn update_config(
     Json(payload): Json<UpdateOmsConfigRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     ensure_admin_access(&state, &headers)?;
-    let existing: Vec<OmsConfigEntity> = db::select_by_map_compat(state.rb.as_ref(), "oms_config", value! {})
-        .await
-        .context("failed to query oms config")
-        .map_err(AppError::Internal)?;
+    let existing: Vec<OmsConfigEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "oms_config", value! {})
+            .await
+            .context("failed to query oms config")
+            .map_err(AppError::Internal)?;
     if let Some(item) = existing.into_iter().next() {
         OmsConfigEntity::update_by_map(
             state.rb.as_ref(),
@@ -100,7 +96,9 @@ pub async fn update_config(
         .map_err(AppError::Internal)?;
     }
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 pub async fn sync_tasks(
@@ -114,7 +112,11 @@ pub async fn sync_tasks(
         .await
         .context("failed to query tasks for oms sync")
         .map_err(AppError::Internal)?;
-    for task in tasks.into_iter().take(20) {
+    for task in tasks
+        .into_iter()
+        .filter(|task| task.deleted_at.is_none())
+        .take(20)
+    {
         OmsSyncLogEntity::insert(
             state.rb.as_ref(),
             &OmsSyncLogEntity {
@@ -134,7 +136,9 @@ pub async fn sync_tasks(
         .map_err(AppError::Internal)?;
     }
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 pub async fn sync_logs(
@@ -142,10 +146,11 @@ pub async fn sync_logs(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<Vec<OmsSyncLogItem>>>, AppError> {
     ensure_admin_access(&state, &headers)?;
-    let logs: Vec<OmsSyncLogEntity> = db::select_by_map_compat(state.rb.as_ref(), "oms_sync_log", value! {})
-        .await
-        .context("failed to query oms sync logs")
-        .map_err(AppError::Internal)?;
+    let logs: Vec<OmsSyncLogEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "oms_sync_log", value! {})
+            .await
+            .context("failed to query oms sync logs")
+            .map_err(AppError::Internal)?;
 
     Ok(Json(ApiResponse::success(
         logs.into_iter()
@@ -162,16 +167,17 @@ pub async fn sync_logs(
 }
 
 async fn load_or_default_config(state: &AppState) -> Result<OmsConfigEntity, AppError> {
-    let config = db::select_one_by_map_compat::<OmsConfigEntity>(state.rb.as_ref(), "oms_config", value! {})
-        .await
-        .context("failed to query oms config")
-        .map_err(AppError::Internal)?
-        .unwrap_or(OmsConfigEntity {
-            base_url: Some(String::new()),
-            app_key: Some(String::new()),
-            status: Some("enabled".to_string()),
-            ..Default::default()
-        });
+    let config =
+        db::select_one_by_map_compat::<OmsConfigEntity>(state.rb.as_ref(), "oms_config", value! {})
+            .await
+            .context("failed to query oms config")
+            .map_err(AppError::Internal)?
+            .unwrap_or(OmsConfigEntity {
+                base_url: Some(String::new()),
+                app_key: Some(String::new()),
+                status: Some("enabled".to_string()),
+                ..Default::default()
+            });
     Ok(config)
 }
 

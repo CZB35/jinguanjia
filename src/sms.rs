@@ -12,7 +12,10 @@ use sha1::Sha1;
 use crate::{
     db,
     error::AppError,
-    models::{system_config::SystemConfigEntity, user::UserEntity, user_message_setting::UserMessageSettingEntity},
+    models::{
+        system_config::SystemConfigEntity, user::UserEntity,
+        user_message_setting::UserMessageSettingEntity,
+    },
     state::AppState,
 };
 
@@ -84,7 +87,10 @@ pub async fn send_customer_review_sms(
     payload: CustomerReviewSmsPayload<'_>,
 ) -> Result<Option<SmsDeliveryResult>, AppError> {
     if !load_config_bool(state, "sms.switch.customer_review", true).await? {
-        tracing::info!(mobile, "customer review sms skipped because platform switch is disabled");
+        tracing::info!(
+            mobile,
+            "customer review sms skipped because platform switch is disabled"
+        );
         return Ok(None);
     }
     let params = value! { "code": payload.review_link_code.to_string() };
@@ -96,7 +102,10 @@ pub async fn send_dealer_hq_score_sms(
     receiver_id: i64,
 ) -> Result<Option<SmsDeliveryResult>, AppError> {
     if !load_config_bool(state, "sms.switch.dealer_notify", true).await? {
-        tracing::info!(receiver_id, "dealer notify sms skipped because platform switch is disabled");
+        tracing::info!(
+            receiver_id,
+            "dealer notify sms skipped because platform switch is disabled"
+        );
         return Ok(None);
     }
     if !user_sms_enabled(state, receiver_id).await? {
@@ -109,13 +118,7 @@ pub async fn send_dealer_hq_score_sms(
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .ok_or_else(|| AppError::BadRequest("经销商手机号不存在，无法发送短信".to_string()))?;
-    send_sms_by_mobile(
-        state,
-        mobile,
-        &dealer_hq_score_template(state),
-        value!({}),
-    )
-    .await
+    send_sms_by_mobile(state, mobile, &dealer_hq_score_template(state), value!({})).await
 }
 
 pub fn login_code_template(state: &AppState) -> SmsTemplate {
@@ -260,7 +263,8 @@ fn build_aliyun_sms_request(
         .collect::<Vec<_>>()
         .join("&");
     let string_to_sign = format!("GET&%2F&{}", percent_encode(&canonicalized));
-    let signature = sign_with_hmac_sha1(&format!("{}&", config.access_key_secret), &string_to_sign)?;
+    let signature =
+        sign_with_hmac_sha1(&format!("{}&", config.access_key_secret), &string_to_sign)?;
     params.insert("Signature".to_string(), signature);
     Ok(params)
 }
@@ -316,7 +320,9 @@ fn rbs_value_to_json(value: rbs::Value) -> serde_json::Value {
         rbs::Value::F64(v) => serde_json::Value::from(v),
         rbs::Value::String(v) => serde_json::Value::String(v),
         rbs::Value::Binary(v) => serde_json::Value::String(String::from_utf8_lossy(&v).to_string()),
-        rbs::Value::Array(values) => serde_json::Value::Array(values.into_iter().map(rbs_value_to_json).collect()),
+        rbs::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(rbs_value_to_json).collect())
+        }
         rbs::Value::Map(map) => {
             let mut object = serde_json::Map::new();
             for (key, value) in map {
@@ -333,10 +339,15 @@ fn rbs_value_to_json(value: rbs::Value) -> serde_json::Value {
 }
 
 async fn load_config_string(state: &AppState, key: &str) -> Result<String, AppError> {
-    Ok(load_config_optional_string(state, key).await?.unwrap_or_default())
+    Ok(load_config_optional_string(state, key)
+        .await?
+        .unwrap_or_default())
 }
 
-async fn load_config_optional_string(state: &AppState, key: &str) -> Result<Option<String>, AppError> {
+async fn load_config_optional_string(
+    state: &AppState,
+    key: &str,
+) -> Result<Option<String>, AppError> {
     let item = db::select_one_by_map_compat::<SystemConfigEntity>(
         state.rb.as_ref(),
         "system_config",
@@ -376,15 +387,11 @@ async fn user_sms_enabled(state: &AppState, user_id: i64) -> Result<bool, AppErr
 }
 
 async fn load_user_by_id(state: &AppState, user_id: i64) -> Result<UserEntity, AppError> {
-    db::select_one_by_map_compat::<UserEntity>(
-        state.rb.as_ref(),
-        "user",
-        value! { "id": user_id },
-    )
-    .await
-    .context("failed to query sms receiver user")
-    .map_err(AppError::Internal)?
-    .ok_or_else(|| AppError::NotFound("用户不存在，无法发送短信".to_string()))
+    db::select_one_by_map_compat::<UserEntity>(state.rb.as_ref(), "user", value! { "id": user_id })
+        .await
+        .context("failed to query sms receiver user")
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound("用户不存在，无法发送短信".to_string()))
 }
 
 fn sms_sign_name_fallback(_state: &AppState) -> &'static str {

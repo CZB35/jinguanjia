@@ -9,11 +9,14 @@ use crate::{
     auth::{self, TokenPair},
     db,
     error::AppError,
+    identity,
     models::{role::RoleEntity, user::UserEntity, user_role::UserRoleEntity},
     response::ApiResponse,
     sms,
     state::AppState,
 };
+
+const BUSINESS_TOKEN_EXPIRE_DAYS: i64 = 30;
 
 #[derive(Debug, Deserialize)]
 pub struct PasswordLoginRequest {
@@ -98,29 +101,29 @@ pub async fn login_by_password(
     }
 
     let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
-    if roles.is_empty() {
-        return Err(AppError::Forbidden(
-            "账号未分配角色，请联系管理员".to_string(),
-        ));
+    let business_roles = filter_business_roles(roles);
+    if business_roles.is_empty() {
+        return Err(AppError::Forbidden("当前账号无业务端登录权限".to_string()));
     }
 
-    let current_role = resolve_current_role(&roles, payload.role_code.as_deref())?;
-    let token_pair = auth::issue_token_pair(
+    let current_role = resolve_current_role_with_default(
+        &business_roles,
+        payload.role_code.as_deref(),
+        default_business_role,
+    )?;
+    let token_pair = issue_business_token_pair(
         &state.config.auth,
         user.id.unwrap_or_default(),
         user.mobile.as_deref().unwrap_or_default(),
-        roles.clone(),
+        business_roles.clone(),
         &current_role,
         user.session_version.unwrap_or(1),
     )
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(build_login_response(
-        &user,
-        roles,
-        current_role,
-        token_pair,
-    )?)))
+    Ok(Json(ApiResponse::success(
+        build_login_response(&state, &user, business_roles, current_role, token_pair).await?,
+    )))
 }
 
 pub async fn login_admin_by_password(
@@ -161,7 +164,11 @@ pub async fn login_admin_by_password(
         return Err(AppError::Forbidden("当前账号无后台登录权限".to_string()));
     }
 
-    let current_role = resolve_current_role(&backend_roles, payload.role_code.as_deref())?;
+    let current_role = resolve_current_role_with_default(
+        &backend_roles,
+        payload.role_code.as_deref(),
+        default_backend_role,
+    )?;
     let token_pair = auth::issue_token_pair(
         &state.config.auth,
         user.id.unwrap_or_default(),
@@ -172,12 +179,9 @@ pub async fn login_admin_by_password(
     )
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(build_login_response(
-        &user,
-        backend_roles,
-        current_role,
-        token_pair,
-    )?)))
+    Ok(Json(ApiResponse::success(
+        build_login_response(&state, &user, backend_roles, current_role, token_pair).await?,
+    )))
 }
 
 pub async fn refresh_token(
@@ -194,27 +198,43 @@ pub async fn refresh_token(
     let user = find_user_by_id(&state, claims.sub).await?;
     ensure_user_loginable(&user)?;
     if user.session_version.unwrap_or(1) != claims.session_version {
-        return Err(AppError::Unauthorized("账号权限已变更，请重新登录".to_string()));
+        return Err(AppError::Unauthorized(
+            "账号权限已变更，请重新登录".to_string(),
+        ));
     }
 
-    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
+    let roles = filter_roles_for_current_scope(
+        sort_roles_by_priority(find_role_codes(&state, user.id).await?),
+        claims.current_role.as_str(),
+    );
+    if roles.is_empty() {
+        return Err(AppError::Forbidden("当前账号无当前端登录权限".to_string()));
+    }
     let current_role = resolve_current_role(&roles, Some(claims.current_role.as_str()))?;
-    let token_pair = auth::issue_token_pair(
-        &state.config.auth,
-        user.id.unwrap_or_default(),
-        user.mobile.as_deref().unwrap_or_default(),
-        roles.clone(),
-        &current_role,
-        user.session_version.unwrap_or(1),
-    )
+    let token_pair = if is_business_role(&current_role) {
+        issue_business_token_pair(
+            &state.config.auth,
+            user.id.unwrap_or_default(),
+            user.mobile.as_deref().unwrap_or_default(),
+            roles.clone(),
+            &current_role,
+            user.session_version.unwrap_or(1),
+        )
+    } else {
+        auth::issue_token_pair(
+            &state.config.auth,
+            user.id.unwrap_or_default(),
+            user.mobile.as_deref().unwrap_or_default(),
+            roles.clone(),
+            &current_role,
+            user.session_version.unwrap_or(1),
+        )
+    }
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(build_login_response(
-        &user,
-        roles,
-        current_role,
-        token_pair,
-    )?)))
+    Ok(Json(ApiResponse::success(
+        build_login_response(&state, &user, roles, current_role, token_pair).await?,
+    )))
 }
 
 pub async fn send_login_code(
@@ -234,7 +254,7 @@ pub async fn send_login_code(
     {
         let store = state.verification_codes.read().await;
         if let Some(existing) = store.get(&payload.mobile)
-        && now - existing.sent_at < 60
+            && now - existing.sent_at < 60
         {
             return Err(AppError::BadRequest(
                 "验证码发送过于频繁，请稍后重试".to_string(),
@@ -288,14 +308,18 @@ pub async fn login_by_code(
     let user = find_user_by_mobile(&state, &payload.mobile).await?;
     ensure_user_loginable(&user)?;
 
-    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
+    let roles = filter_business_roles(sort_roles_by_priority(
+        find_role_codes(&state, user.id).await?,
+    ));
     if roles.is_empty() {
-        return Err(AppError::Forbidden(
-            "账号未分配角色，请联系管理员".to_string(),
-        ));
+        return Err(AppError::Forbidden("当前账号无业务端登录权限".to_string()));
     }
-    let current_role = resolve_current_role(&roles, payload.role_code.as_deref())?;
-    let token_pair = auth::issue_token_pair(
+    let current_role = resolve_current_role_with_default(
+        &roles,
+        payload.role_code.as_deref(),
+        default_business_role,
+    )?;
+    let token_pair = issue_business_token_pair(
         &state.config.auth,
         user.id.unwrap_or_default(),
         user.mobile.as_deref().unwrap_or_default(),
@@ -310,12 +334,9 @@ pub async fn login_by_code(
         store.remove(&payload.mobile);
     }
 
-    Ok(Json(ApiResponse::success(build_login_response(
-        &user,
-        roles,
-        current_role,
-        token_pair,
-    )?)))
+    Ok(Json(ApiResponse::success(
+        build_login_response(&state, &user, roles, current_role, token_pair).await?,
+    )))
 }
 
 pub async fn current_user(
@@ -327,12 +348,22 @@ pub async fn current_user(
     let user = find_user_by_id(&state, auth_user.user_id).await?;
     ensure_user_loginable(&user)?;
 
-    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
+    let roles = filter_roles_for_current_scope(
+        sort_roles_by_priority(find_role_codes(&state, user.id).await?),
+        auth_user.current_role.as_str(),
+    );
     let current_role = resolve_current_role(&roles, Some(auth_user.current_role.as_str()))?;
+    let display_name = identity::role_display_name(
+        &state,
+        user.id.unwrap_or_default(),
+        &current_role,
+        user.name.as_deref(),
+    )
+    .await?;
 
     Ok(Json(ApiResponse::success(CurrentUserPayload {
         id: user.id.unwrap_or_default(),
-        name: user.name.unwrap_or_default(),
+        name: display_name,
         mobile: user.mobile.unwrap_or_default(),
         avatar_url: user.avatar_url.clone(),
         switchable: roles.len() > 1,
@@ -353,9 +384,12 @@ pub async fn switch_role(
     let user = find_user_by_id(&state, auth_user.user_id).await?;
     ensure_user_loginable(&user)?;
 
-    let roles = sort_roles_by_priority(find_role_codes(&state, user.id).await?);
+    let roles = filter_roles_for_current_scope(
+        sort_roles_by_priority(find_role_codes(&state, user.id).await?),
+        auth_user.current_role.as_str(),
+    );
     let current_role = resolve_current_role(&roles, Some(payload.role_code.as_str()))?;
-    let token_pair = auth::issue_token_pair(
+    let token_pair = issue_business_token_pair(
         &state.config.auth,
         user.id.unwrap_or_default(),
         user.mobile.as_deref().unwrap_or_default(),
@@ -365,12 +399,9 @@ pub async fn switch_role(
     )
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(build_login_response(
-        &user,
-        roles,
-        current_role,
-        token_pair,
-    )?)))
+    Ok(Json(ApiResponse::success(
+        build_login_response(&state, &user, roles, current_role, token_pair).await?,
+    )))
 }
 
 pub async fn logout() -> Json<ApiResponse<serde_json::Value>> {
@@ -385,6 +416,26 @@ fn validate_login_request(payload: &PasswordLoginRequest) -> Result<(), AppError
         return Err(AppError::BadRequest("请输入密码".to_string()));
     }
     Ok(())
+}
+
+fn issue_business_token_pair(
+    config: &crate::config::AuthConfig,
+    user_id: i64,
+    mobile: &str,
+    roles: Vec<String>,
+    current_role: &str,
+    session_version: i64,
+) -> anyhow::Result<TokenPair> {
+    auth::issue_token_pair_with_expiry(
+        config,
+        user_id,
+        mobile,
+        roles,
+        current_role,
+        session_version,
+        chrono::Duration::days(BUSINESS_TOKEN_EXPIRE_DAYS),
+        chrono::Duration::days(BUSINESS_TOKEN_EXPIRE_DAYS),
+    )
 }
 
 fn ensure_user_loginable(user: &UserEntity) -> Result<(), AppError> {
@@ -416,12 +467,34 @@ fn resolve_current_role(
         .ok_or_else(|| AppError::Forbidden("账号未分配角色，请联系管理员".to_string()))
 }
 
-fn build_login_response(
+fn resolve_current_role_with_default(
+    roles: &[String],
+    requested_role: Option<&str>,
+    default_selector: fn(&[String]) -> Option<String>,
+) -> Result<String, AppError> {
+    if requested_role.is_some() {
+        return resolve_current_role(roles, requested_role);
+    }
+    if let Some(role) = default_selector(roles) {
+        return Ok(role);
+    }
+    resolve_current_role(roles, None)
+}
+
+async fn build_login_response(
+    state: &AppState,
     user: &UserEntity,
     roles: Vec<String>,
     current_role: String,
     token_pair: TokenPair,
 ) -> Result<LoginResponse, AppError> {
+    let display_name = identity::role_display_name(
+        state,
+        user.id.unwrap_or_default(),
+        &current_role,
+        user.name.as_deref(),
+    )
+    .await?;
     Ok(LoginResponse {
         access_token: token_pair.access_token,
         refresh_token: token_pair.refresh_token,
@@ -429,10 +502,7 @@ fn build_login_response(
         expires_in: token_pair.expires_in,
         user: CurrentUserPayload {
             id: user.id.unwrap_or_default(),
-            name: user
-                .name
-                .clone()
-                .ok_or_else(|| AppError::Internal(anyhow!("user.name is missing")))?,
+            name: display_name,
             mobile: user
                 .mobile
                 .clone()
@@ -470,14 +540,11 @@ async fn find_user_by_mobile(state: &AppState, mobile: &str) -> Result<UserEntit
 }
 
 async fn find_user_by_account(state: &AppState, account: &str) -> Result<UserEntity, AppError> {
-    let users: Vec<UserEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "user",
-        value! { "account": account },
-    )
-    .await
-    .context("failed to query user by account")
-    .map_err(AppError::Internal)?;
+    let users: Vec<UserEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "user", value! { "account": account })
+            .await
+            .context("failed to query user by account")
+            .map_err(AppError::Internal)?;
     users
         .into_iter()
         .next()
@@ -510,6 +577,7 @@ async fn find_role_codes(state: &AppState, user_id: Option<i64>) -> Result<Vec<S
 
     let role_ids: Vec<i64> = user_roles
         .into_iter()
+        .filter(|item| role_relation_enabled(item.status.as_deref()))
         .filter_map(|item| item.role_id)
         .collect();
     if role_ids.is_empty() {
@@ -528,6 +596,10 @@ async fn find_role_codes(state: &AppState, user_id: Option<i64>) -> Result<Vec<S
         .collect())
 }
 
+fn role_relation_enabled(status: Option<&str>) -> bool {
+    !matches!(status, Some("disabled") | Some("inactive"))
+}
+
 fn sort_roles_by_priority(mut roles: Vec<String>) -> Vec<String> {
     roles.sort_by_key(|role| role_priority(role));
     roles.dedup();
@@ -541,8 +613,49 @@ fn filter_backend_roles(roles: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn filter_business_roles(roles: Vec<String>) -> Vec<String> {
+    roles
+        .into_iter()
+        .filter(|role| is_business_role(role))
+        .collect()
+}
+
+fn filter_roles_for_current_scope(roles: Vec<String>, current_role: &str) -> Vec<String> {
+    if is_backend_role(current_role) {
+        return filter_backend_roles(roles);
+    }
+    if is_business_role(current_role) {
+        return filter_business_roles(roles);
+    }
+    roles
+}
+
+fn default_business_role(roles: &[String]) -> Option<String> {
+    if roles.iter().any(|role| role == "technician") {
+        return Some("technician".to_string());
+    }
+    if roles.iter().any(|role| role == "dealer") {
+        return Some("dealer".to_string());
+    }
+    None
+}
+
+fn default_backend_role(roles: &[String]) -> Option<String> {
+    if roles.iter().any(|role| role == "super_admin") {
+        return Some("super_admin".to_string());
+    }
+    if roles.iter().any(|role| role == "hq_reviewer") {
+        return Some("hq_reviewer".to_string());
+    }
+    None
+}
+
 fn is_backend_role(role: &str) -> bool {
     role == "super_admin" || role == "hq_reviewer"
+}
+
+fn is_business_role(role: &str) -> bool {
+    role == "dealer" || role == "technician"
 }
 
 fn role_priority(role: &str) -> i32 {

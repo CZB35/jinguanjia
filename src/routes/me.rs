@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     auth, db,
     error::AppError,
+    identity,
     models::{
         permission::PermissionEntity, role::RoleEntity, role_permission::RolePermissionEntity,
         store::StoreEntity, user::UserEntity, user_message_setting::UserMessageSettingEntity,
@@ -22,8 +23,7 @@ use crate::{
     response::ApiResponse,
     sms,
     state::AppState,
-    storage,
-    wechat,
+    storage, wechat,
 };
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +59,8 @@ pub struct ProfileResponse {
     pub status_text: String,
     pub job_no: String,
     pub role_names: Vec<String>,
+    pub role_codes: Vec<String>,
+    pub current_role: String,
     pub store_id: Option<i64>,
     pub store_ids: Vec<i64>,
     pub store_names: Vec<String>,
@@ -68,6 +70,7 @@ pub struct ProfileResponse {
     pub customer_count: usize,
     pub month_completed_count: usize,
     pub completion_rate: f64,
+    pub service_types: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,7 +148,7 @@ pub async fn get_profile(
     let auth_user = auth::authenticate(&state, &headers)?;
     let user = find_user(&state, auth_user.user_id).await?;
     Ok(Json(ApiResponse::success(
-        build_profile_response(&state, user).await?,
+        build_profile_response(&state, user, &auth_user).await?,
     )))
 }
 
@@ -159,8 +162,14 @@ pub async fn update_profile(
     let nickname = normalize_optional_owned(payload.nickname);
     let email = normalize_optional_owned(payload.email);
     let avatar_url = normalize_optional_owned(payload.avatar_url);
+    let role_name = if matches!(auth_user.current_role.as_str(), "dealer" | "technician") {
+        name.clone()
+    } else {
+        None
+    };
+    let account_name = if role_name.is_none() { name } else { None };
     let mut columns = Vec::new();
-    if name.is_some() {
+    if account_name.is_some() {
         columns.push("name");
     }
     if nickname.is_some() {
@@ -173,31 +182,42 @@ pub async fn update_profile(
         columns.push("avatar_url");
     }
 
-    if columns.is_empty() {
+    if columns.is_empty() && role_name.is_none() {
         let user = find_user(&state, auth_user.user_id).await?;
         return Ok(Json(ApiResponse::success(
-            build_profile_response(&state, user).await?,
+            build_profile_response(&state, user, &auth_user).await?,
         )));
     }
 
-    UserEntity::update_by_map(
-        state.rb.as_ref(),
-        &UserEntity {
-            name,
-            nickname,
-            email,
-            avatar_url,
-            ..Default::default()
-        },
-        value! { "id": auth_user.user_id, "column": columns },
-    )
-    .await
-    .context("failed to update profile")
-    .map_err(AppError::Internal)?;
+    if !columns.is_empty() {
+        UserEntity::update_by_map(
+            state.rb.as_ref(),
+            &UserEntity {
+                name: account_name,
+                nickname,
+                email,
+                avatar_url,
+                ..Default::default()
+            },
+            value! { "id": auth_user.user_id, "column": columns },
+        )
+        .await
+        .context("failed to update profile")
+        .map_err(AppError::Internal)?;
+    }
+    if let Some(role_name) = role_name {
+        identity::update_role_display_name(
+            &state,
+            auth_user.user_id,
+            &auth_user.current_role,
+            &role_name,
+        )
+        .await?;
+    }
 
     let user = find_user(&state, auth_user.user_id).await?;
     Ok(Json(ApiResponse::success(
-        build_profile_response(&state, user).await?,
+        build_profile_response(&state, user, &auth_user).await?,
     )))
 }
 
@@ -271,14 +291,18 @@ pub async fn get_wechat_bind_url(
 ) -> Result<Json<ApiResponse<WechatBindUrlResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     let bind_url = wechat::build_service_account_bind_url(&state, auth_user.user_id).await?;
-    Ok(Json(ApiResponse::success(WechatBindUrlResponse { bind_url })))
+    Ok(Json(ApiResponse::success(WechatBindUrlResponse {
+        bind_url,
+    })))
 }
 
 pub async fn get_public_wechat_bind_url(
     State(state): State<AppState>,
     Json(payload): Json<PublicWechatBindUrlRequest>,
 ) -> Result<Json<ApiResponse<PublicWechatBindUrlResponse>>, AppError> {
-    let bind_token = payload.bind_token.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let bind_token = payload
+        .bind_token
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     if let Some(return_url) = payload.return_url.as_deref() {
         wechat::save_public_bind_return_url(&state, &bind_token, return_url).await;
     }
@@ -325,7 +349,9 @@ pub async fn send_wechat_bind_code(
         },
     );
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "ok": true }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
 }
 
 pub async fn confirm_wechat_bind(
@@ -361,7 +387,8 @@ pub async fn confirm_wechat_bind(
     let user = find_user_by_mobile(&state, &payload.mobile).await?;
     ensure_user_enabled(&user)?;
     let user_id = user.id.unwrap_or_default();
-    wechat::bind_service_account_user(&state, user_id, &openid, bind_state.unionid.as_deref()).await?;
+    wechat::bind_service_account_user(&state, user_id, &openid, bind_state.unionid.as_deref())
+        .await?;
     wechat::clear_public_bind_state(&state, &payload.bind_token).await;
 
     {
@@ -409,8 +436,10 @@ pub async fn wechat_service_account_callback(
                 .clone()
                 .filter(|item| !item.trim().is_empty())
                 .ok_or_else(|| AppError::Conflict("微信绑定态缺少bind_token".to_string()))?;
-            wechat::save_public_bind_state(&state, &bind_token, openid, oauth.unionid.as_deref()).await?;
-            if let Some(return_url) = wechat::load_public_bind_return_url(&state, &bind_token).await {
+            wechat::save_public_bind_state(&state, &bind_token, openid, oauth.unionid.as_deref())
+                .await?;
+            if let Some(return_url) = wechat::load_public_bind_return_url(&state, &bind_token).await
+            {
                 let separator = if return_url.contains('?') { '&' } else { '?' };
                 let redirect_url = format!(
                     "{}{}bind_token={}&authorized=true",
@@ -433,7 +462,8 @@ pub async fn wechat_service_account_callback(
         let user_id = oauth_state
             .user_id
             .ok_or_else(|| AppError::Conflict("微信绑定态缺少用户信息".to_string()))?;
-        wechat::bind_service_account_user(&state, user_id, openid, oauth.unionid.as_deref()).await?;
+        wechat::bind_service_account_user(&state, user_id, openid, oauth.unionid.as_deref())
+            .await?;
 
         return Ok(Json(ApiResponse::success(serde_json::json!({
             "ok": true,
@@ -444,8 +474,8 @@ pub async fn wechat_service_account_callback(
         .into_response());
     }
 
-    let claims = wechat::decode_bind_state_token(&state.config, &query.state)
-        .map_err(AppError::Internal)?;
+    let claims =
+        wechat::decode_bind_state_token(&state.config, &query.state).map_err(AppError::Internal)?;
 
     if claims.purpose == "wechat_service_public_bind" {
         let bind_token = claims
@@ -453,7 +483,8 @@ pub async fn wechat_service_account_callback(
             .clone()
             .filter(|item| !item.trim().is_empty())
             .ok_or_else(|| AppError::Conflict("微信绑定态缺少bind_token".to_string()))?;
-        wechat::save_public_bind_state(&state, &bind_token, openid, oauth.unionid.as_deref()).await?;
+        wechat::save_public_bind_state(&state, &bind_token, openid, oauth.unionid.as_deref())
+            .await?;
         if let Some(return_url) = wechat::load_public_bind_return_url(&state, &bind_token).await {
             let separator = if return_url.contains('?') { '&' } else { '?' };
             let redirect_url = format!(
@@ -541,7 +572,13 @@ pub async fn get_permissions(
             .await
             .context("failed to query roles for permissions")
             .map_err(AppError::Internal)?;
-    let role_ids: Vec<i64> = roles.into_iter().filter_map(|item| item.id).collect();
+    let role_ids: Vec<i64> = roles
+        .into_iter()
+        .filter(|item| {
+            role_matches_current_scope(item.role_code.as_deref(), auth_user.current_role.as_str())
+        })
+        .filter_map(|item| item.id)
+        .collect();
     let role_permissions: Vec<RolePermissionEntity> = db::select_by_map_compat(
         state.rb.as_ref(),
         "role_permission",
@@ -555,7 +592,9 @@ pub async fn get_permissions(
         .filter_map(|item| item.permission_id)
         .collect();
     if permission_ids.is_empty() {
-        return Ok(Json(ApiResponse::success(Vec::new())));
+        return Ok(Json(ApiResponse::success(
+            default_permissions_for_current_role(auth_user.current_role.as_str()),
+        )));
     }
     let permissions: Vec<PermissionEntity> = db::select_by_map_compat(
         state.rb.as_ref(),
@@ -566,12 +605,17 @@ pub async fn get_permissions(
     .context("failed to query permissions")
     .map_err(AppError::Internal)?;
 
-    Ok(Json(ApiResponse::success(
-        permissions
-            .into_iter()
-            .filter_map(|item| item.permission_code)
-            .collect(),
-    )))
+    let permission_codes = permissions
+        .into_iter()
+        .filter_map(|item| item.permission_code)
+        .collect::<Vec<_>>();
+    if permission_codes.is_empty() {
+        return Ok(Json(ApiResponse::success(
+            default_permissions_for_current_role(auth_user.current_role.as_str()),
+        )));
+    }
+
+    Ok(Json(ApiResponse::success(permission_codes)))
 }
 
 pub async fn update_message_settings(
@@ -662,7 +706,9 @@ fn ensure_user_enabled(user: &UserEntity) -> Result<(), AppError> {
         return Err(AppError::NotFound("用户不存在或已删除".to_string()));
     }
     if user.status.as_deref() == Some("disabled") {
-        return Err(AppError::Forbidden("账号已被禁用，请联系管理员".to_string()));
+        return Err(AppError::Forbidden(
+            "账号已被禁用，请联系管理员".to_string(),
+        ));
     }
     Ok(())
 }
@@ -691,6 +737,74 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn role_matches_current_scope(role_code: Option<&str>, current_role: &str) -> bool {
+    let Some(role_code) = role_code else {
+        return false;
+    };
+    if current_role == "dealer" || current_role == "technician" {
+        return role_code == "dealer" || role_code == "technician";
+    }
+    if current_role == "super_admin" || current_role == "hq_reviewer" {
+        return role_code == "super_admin" || role_code == "hq_reviewer";
+    }
+    role_code == current_role
+}
+
+fn default_permissions_for_current_role(current_role: &str) -> Vec<String> {
+    match current_role {
+        "technician" => vec![
+            "workspace",
+            "tasks",
+            "tasks:list",
+            "tasks:records",
+            "tasks:evaluation",
+            "measure",
+            "install",
+            "ironing",
+            "cleaning",
+            "users",
+            "customers",
+            "customers:list",
+            "users:customers",
+            "settings",
+            "settings:project-settings",
+            "master-data",
+            "master-data:stores",
+            "master-data:sources",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect(),
+        "dealer" => vec![
+            "workspace",
+            "tasks",
+            "tasks:list",
+            "tasks:list:create",
+            "tasks:records",
+            "tasks:evaluation",
+            "measure",
+            "install",
+            "ironing",
+            "cleaning",
+            "users",
+            "customers",
+            "customers:list",
+            "users:customers",
+            "users:staff",
+            "users:dealers",
+            "master-data",
+            "master-data:stores",
+            "master-data:sources",
+            "settings",
+            "settings:project-settings",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[derive(Debug)]
 struct UploadField {
     file_name: String,
@@ -702,8 +816,7 @@ async fn read_single_multipart(mut multipart: Multipart) -> Result<UploadField, 
     let field = multipart
         .next_field()
         .await
-        .context("failed to read avatar multipart field")
-        .map_err(AppError::Internal)?
+        .map_err(AppError::from_multipart_error)?
         .ok_or_else(|| AppError::BadRequest("请上传文件".to_string()))?;
 
     let file_name = field
@@ -714,8 +827,7 @@ async fn read_single_multipart(mut multipart: Multipart) -> Result<UploadField, 
     let bytes = field
         .bytes()
         .await
-        .context("failed to read avatar upload bytes")
-        .map_err(AppError::Internal)?
+        .map_err(AppError::from_multipart_error)?
         .to_vec();
 
     Ok(UploadField {
@@ -751,6 +863,7 @@ async fn find_user(state: &AppState, user_id: i64) -> Result<UserEntity, AppErro
 async fn build_profile_response(
     state: &AppState,
     user: UserEntity,
+    auth_user: &auth::CurrentAuthUser,
 ) -> Result<ProfileResponse, AppError> {
     let user_id = user.id.unwrap_or_default();
     let user_roles: Vec<UserRoleEntity> = db::select_by_map_compat(
@@ -824,10 +937,10 @@ async fn build_profile_response(
     };
     let primary_store_id = store_ids.first().copied();
     let primary_store_name = store_names.first().cloned();
-    let is_technician_only = role_codes.contains(&"technician".to_string())
-        && !role_codes.contains(&"dealer".to_string())
-        && !role_codes.contains(&"hq_reviewer".to_string())
-        && !role_codes.contains(&"super_admin".to_string());
+    let current_role = auth_user.current_role.clone();
+    let display_name =
+        identity::role_display_name(state, user_id, &current_role, user.name.as_deref()).await?;
+    let is_technician_only = current_role == "technician";
     let now = chrono::Utc::now();
     let (task_count, completed_count, technician_count, customer_count, month_completed_count) =
         if is_technician_only {
@@ -838,7 +951,10 @@ async fn build_profile_response(
             )
             .await
             .context("failed to query technician tasks for profile")
-            .map_err(AppError::Internal)?;
+            .map_err(AppError::Internal)?
+            .into_iter()
+            .filter(|task| task.deleted_at.is_none())
+            .collect::<Vec<_>>();
             let completed = tasks
                 .iter()
                 .filter(|item| is_profile_completed_status(item.task_status.as_deref(), true))
@@ -868,7 +984,10 @@ async fn build_profile_response(
             )
             .await
             .context("failed to query tasks for profile aggregate")
-            .map_err(AppError::Internal)?;
+            .map_err(AppError::Internal)?
+            .into_iter()
+            .filter(|task| task.deleted_at.is_none())
+            .collect::<Vec<_>>();
             let completed = tasks
                 .iter()
                 .filter(|item| is_profile_completed_status(item.task_status.as_deref(), false))
@@ -922,10 +1041,25 @@ async fn build_profile_response(
             format!("DL-{:08}", user_id)
         }
     });
+    let service_types = if current_role == "technician" {
+        db::select_by_map_compat::<crate::models::technician_skill::TechnicianSkillEntity>(
+            state.rb.as_ref(),
+            "technician_skill",
+            value! { "user_id": user_id },
+        )
+        .await
+        .context("failed to query technician skills for profile")
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .filter_map(|item| item.service_type)
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     Ok(ProfileResponse {
         id: user_id,
-        name: user.name.unwrap_or_default(),
+        name: display_name,
         nickname: user.nickname,
         mobile: user.mobile.unwrap_or_default(),
         email: user.email,
@@ -935,6 +1069,8 @@ async fn build_profile_response(
         status_text: profile_status_text(user.status.as_deref()).to_string(),
         job_no,
         role_names,
+        role_codes,
+        current_role,
         store_id: primary_store_id,
         store_ids,
         store_names,
@@ -944,6 +1080,7 @@ async fn build_profile_response(
         customer_count,
         month_completed_count,
         completion_rate,
+        service_types,
     })
 }
 
@@ -989,5 +1126,8 @@ fn profile_status_text(status: Option<&str>) -> &'static str {
 }
 
 fn is_profile_completed_status(status: Option<&str>, _technician_only: bool) -> bool {
-    matches!(status, Some("pending_hq_score") | Some("completed") | Some("closed"))
+    matches!(
+        status,
+        Some("pending_hq_score") | Some("completed") | Some("closed")
+    )
 }

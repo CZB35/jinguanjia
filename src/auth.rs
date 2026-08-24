@@ -5,7 +5,13 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use serde::{Deserialize, Serialize};
 use tokio::{runtime::Handle, task::block_in_place};
 
-use crate::{config::AuthConfig, db, error::AppError, models::user::UserEntity, state::AppState};
+use crate::{
+    config::AuthConfig,
+    db,
+    error::AppError,
+    models::{role::RoleEntity, user::UserEntity, user_role::UserRoleEntity},
+    state::AppState,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JwtClaims {
@@ -44,9 +50,31 @@ pub fn issue_token_pair(
     current_role: &str,
     session_version: i64,
 ) -> Result<TokenPair> {
+    issue_token_pair_with_expiry(
+        config,
+        user_id,
+        mobile,
+        roles,
+        current_role,
+        session_version,
+        Duration::minutes(config.access_token_expire_minutes),
+        Duration::days(config.refresh_token_expire_days),
+    )
+}
+
+pub fn issue_token_pair_with_expiry(
+    config: &AuthConfig,
+    user_id: i64,
+    mobile: &str,
+    roles: Vec<String>,
+    current_role: &str,
+    session_version: i64,
+    access_duration: Duration,
+    refresh_duration: Duration,
+) -> Result<TokenPair> {
     let now = Utc::now();
-    let access_exp = now + Duration::minutes(config.access_token_expire_minutes);
-    let refresh_exp = now + Duration::days(config.refresh_token_expire_days);
+    let access_exp = now + access_duration;
+    let refresh_exp = now + refresh_duration;
 
     let access_claims = JwtClaims {
         sub: user_id,
@@ -74,7 +102,7 @@ pub fn issue_token_pair(
         access_token: encode_token(config, &access_claims)?,
         refresh_token: encode_token(config, &refresh_claims)?,
         token_type: "Bearer".to_string(),
-        expires_in: config.access_token_expire_minutes * 60,
+        expires_in: access_duration.num_seconds(),
     })
 }
 
@@ -112,7 +140,14 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<CurrentAuth
         return Err(AppError::Unauthorized("登录已失效，请重新登录".to_string()));
     }
     if user.session_version.unwrap_or(1) != claims.session_version {
-        return Err(AppError::Unauthorized("账号权限已变更，请重新登录".to_string()));
+        return Err(AppError::Unauthorized(
+            "账号权限已变更，请重新登录".to_string(),
+        ));
+    }
+    if !current_role_enabled(state, claims.sub, claims.current_role.as_str())? {
+        return Err(AppError::Unauthorized(
+            "账号权限已变更，请重新登录".to_string(),
+        ));
     }
 
     Ok(CurrentAuthUser {
@@ -141,6 +176,33 @@ impl CurrentAuthUser {
     }
 }
 
+fn current_role_enabled(state: &AppState, user_id: i64, role_code: &str) -> Result<bool, AppError> {
+    let role = block_in_place(|| {
+        Handle::current().block_on(db::select_one_by_map_compat::<RoleEntity>(
+            state.rb.as_ref(),
+            "role",
+            rbs::value! { "role_code": role_code },
+        ))
+    })
+    .map_err(AppError::Internal)?;
+    let Some(role_id) = role.and_then(|item| item.id) else {
+        return Ok(false);
+    };
+
+    let relation = block_in_place(|| {
+        Handle::current().block_on(db::select_one_by_map_compat::<UserRoleEntity>(
+            state.rb.as_ref(),
+            "user_role",
+            rbs::value! { "user_id": user_id, "role_id": role_id },
+        ))
+    })
+    .map_err(AppError::Internal)?;
+
+    Ok(relation
+        .map(|item| !matches!(item.status.as_deref(), Some("disabled") | Some("inactive")))
+        .unwrap_or(false))
+}
+
 pub async fn bump_user_session_version(state: &AppState, user_id: i64) -> Result<(), AppError> {
     let user = db::select_one_by_map_compat::<UserEntity>(
         state.rb.as_ref(),
@@ -152,7 +214,7 @@ pub async fn bump_user_session_version(state: &AppState, user_id: i64) -> Result
     .map_err(AppError::Internal)?
     .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
     let next_version = user.session_version.unwrap_or(1) + 1;
-    UserEntity::update_by_map(
+    let update_result = UserEntity::update_by_map(
         state.rb.as_ref(),
         &UserEntity {
             session_version: Some(next_version),
@@ -160,9 +222,21 @@ pub async fn bump_user_session_version(state: &AppState, user_id: i64) -> Result
         },
         rbs::value! { "id": user_id, "column": ["session_version"] },
     )
-    .await
-    .context("failed to update user session version")
-    .map_err(AppError::Internal)?;
+    .await;
+    if let Err(error) = update_result {
+        let message = error.to_string();
+        if message.contains("session_version") && message.contains("Unknown column") {
+            tracing::warn!(
+                user_id,
+                error = %error,
+                "skip session version bump because session_version column is missing"
+            );
+        } else {
+            return Err(AppError::Internal(anyhow!(
+                "failed to update user session version: {message}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -192,13 +266,16 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| AppError::Unauthorized("登录已失效，请重新登录".to_string()))?;
 
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| AppError::Unauthorized("登录已失效，请重新登录".to_string()))?;
+    let trimmed = auth_header.trim();
+    let token = if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("Bearer ") {
+        &trimmed[7..]
+    } else {
+        return Err(AppError::Unauthorized("登录已失效，请重新登录".to_string()));
+    };
 
     if token.trim().is_empty() {
         return Err(AppError::Unauthorized("登录已失效，请重新登录".to_string()));
     }
 
-    Ok(token.to_string())
+    Ok(token.trim().to_string())
 }

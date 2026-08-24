@@ -91,11 +91,13 @@ pub async fn list_customer_sources(
         }
         true
     });
-    items.sort_by_key(|item| {
-        (
-            item.sort_no.unwrap_or_default(),
-            item.id.unwrap_or_default(),
-        )
+    items.sort_by(|left, right| {
+        right.created_at.cmp(&left.created_at).then_with(|| {
+            right
+                .id
+                .unwrap_or_default()
+                .cmp(&left.id.unwrap_or_default())
+        })
     });
 
     let total = items.len();

@@ -13,11 +13,7 @@ pub struct HealthPayload {
 }
 
 pub async fn health_check(State(state): State<AppState>) -> Json<ApiResponse<HealthPayload>> {
-    let db_driver = state
-        .rb
-        .driver_type()
-        .unwrap_or("mysql")
-        .to_string();
+    let db_driver = state.rb.driver_type().unwrap_or("mysql").to_string();
 
     Json(ApiResponse::success(HealthPayload {
         app_name: state.config.app.name,

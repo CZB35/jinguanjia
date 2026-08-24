@@ -1535,6 +1535,7 @@ dependencies = [
  "calamine",
  "chrono",
  "dotenvy",
+ "encoding_rs",
  "font8x8",
  "hmac",
  "image",

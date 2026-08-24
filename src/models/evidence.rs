@@ -13,6 +13,7 @@ pub struct EvidenceEntity {
     pub file_size: Option<i64>,
     pub mime_type: Option<String>,
     pub watermark_text: Option<String>,
+    pub location_address: Option<String>,
     pub longitude: Option<f64>,
     pub latitude: Option<f64>,
     pub shot_at: Option<NaiveDateTime>,

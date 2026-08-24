@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth, db,
     error::AppError,
+    identity,
     models::{
         customer_review::CustomerReviewEntity, customer_review_image::CustomerReviewImageEntity,
         customer_review_link::CustomerReviewLinkEntity, hq_score::HqScoreEntity, task::TaskEntity,
@@ -53,6 +54,7 @@ pub struct CustomerReviewFormResponse {
     pub technician_name: String,
     pub technician_avatar_url: Option<String>,
     pub technician_avg_score: f64,
+    pub technician_avg_score_text: String,
     pub service_items_text: String,
     pub service_time: Option<String>,
     pub tag_options: Vec<String>,
@@ -183,6 +185,17 @@ pub async fn review_form(
     } else {
         0.0
     };
+    let technician_name = if let Some(technician) = technician.as_ref() {
+        identity::role_display_name(
+            &state,
+            technician.id.unwrap_or_default(),
+            "technician",
+            technician.name.as_deref(),
+        )
+        .await?
+    } else {
+        String::new()
+    };
 
     Ok(Json(ApiResponse::success(CustomerReviewFormResponse {
         task_id: link.task_id.unwrap_or_default(),
@@ -192,12 +205,10 @@ pub async fn review_form(
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default(),
         status: link.status.unwrap_or_default(),
-        technician_name: technician
-            .as_ref()
-            .and_then(|item| item.name.clone())
-            .unwrap_or_default(),
+        technician_name,
         technician_avatar_url: technician.as_ref().and_then(|item| item.avatar_url.clone()),
         technician_avg_score,
+        technician_avg_score_text: format_score(technician_avg_score),
         service_items_text: service_items
             .into_iter()
             .filter_map(|item| item.service_type)
@@ -241,8 +252,7 @@ pub async fn upload_customer_review_image(
     let field = multipart
         .next_field()
         .await
-        .context("failed to read customer review image field")
-        .map_err(AppError::Internal)?
+        .map_err(AppError::from_multipart_error)?
         .ok_or_else(|| AppError::BadRequest("请上传图片".to_string()))?;
     let file_name = field
         .file_name()
@@ -252,8 +262,7 @@ pub async fn upload_customer_review_image(
     let bytes = field
         .bytes()
         .await
-        .context("failed to read customer review image bytes")
-        .map_err(AppError::Internal)?;
+        .map_err(AppError::from_multipart_error)?;
     let stored = storage::save_bytes(
         &state,
         "customer-reviews",
@@ -322,8 +331,7 @@ pub async fn delete_customer_review_image(
         .context("failed to delete customer review image")
         .map_err(AppError::Internal)?;
 
-    let path = storage::full_path(&state, image.file_url.as_deref().unwrap_or_default());
-    let _ = tokio::fs::remove_file(path).await;
+    let _ = storage::delete_file(&state, image.file_url.as_deref().unwrap_or_default()).await;
 
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "ok": true }),
@@ -489,11 +497,16 @@ pub async fn review_detail(
 }
 
 async fn find_task(state: &AppState, task_id: i64) -> Result<TaskEntity, AppError> {
-    db::select_one_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
-        .await
-        .context("failed to query task for customer review")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::NotFound("任务不存在或已删除".to_string()))
+    let task: TaskEntity =
+        db::select_one_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
+            .await
+            .context("failed to query task for customer review")
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound("任务不存在或已删除".to_string()))?;
+    if task.deleted_at.is_some() {
+        return Err(AppError::NotFound("任务不存在或已删除".to_string()));
+    }
+    Ok(task)
 }
 
 async fn find_link_by_token(
@@ -508,7 +521,7 @@ async fn find_link_by_token(
     .await
     .context("failed to query customer review link")
     .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::NotFound("评价链接不存在".to_string()))
+    .ok_or_else(|| AppError::NotFound("评价链接不存在".to_string()))
 }
 
 fn resolve_review_token(token: Option<&str>, code: Option<&str>) -> Result<String, AppError> {
@@ -550,7 +563,11 @@ async fn calculate_technician_average_score(
     .await
     .context("failed to query technician tasks for customer review score")
     .map_err(AppError::Internal)?;
-    let task_ids: Vec<i64> = tasks.into_iter().filter_map(|item| item.id).collect();
+    let task_ids: Vec<i64> = tasks
+        .into_iter()
+        .filter(|item| item.deleted_at.is_none())
+        .filter_map(|item| item.id)
+        .collect();
     if task_ids.is_empty() {
         return Ok(0.0);
     }
@@ -567,9 +584,19 @@ async fn calculate_technician_average_score(
         return Ok(0.0);
     }
 
-    Ok(scores
-        .iter()
-        .map(|item| item.total_score.unwrap_or_default() as f64)
-        .sum::<f64>()
-        / scores.len() as f64)
+    Ok(round_score(
+        scores
+            .iter()
+            .map(|item| item.total_score.unwrap_or_default() as f64)
+            .sum::<f64>()
+            / scores.len() as f64,
+    ))
+}
+
+fn round_score(score: f64) -> f64 {
+    (score * 100.0).round() / 100.0
+}
+
+fn format_score(score: f64) -> String {
+    format!("{:.2}", round_score(score))
 }

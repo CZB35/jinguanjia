@@ -1,17 +1,16 @@
 use anyhow::Context;
 use axum::{
     Json,
+    body::Body,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
-    body::Body,
 };
 use rbs::value;
 use serde::Serialize;
 
 use crate::{
-    auth,
-    db,
+    auth, db,
     error::AppError,
     models::{hq_score::HqScoreEntity, task::TaskEntity},
     response::ApiResponse,
@@ -53,7 +52,10 @@ pub async fn overview(
     ensure_hq_access(&state, &headers)?;
     let tasks = all_tasks(&state).await?;
     let total_tasks = tasks.len();
-    let completed_tasks = tasks.iter().filter(|item| item.task_status.as_deref() == Some("completed")).count();
+    let completed_tasks = tasks
+        .iter()
+        .filter(|item| item.task_status.as_deref() == Some("completed"))
+        .count();
     let pending_review_tasks = tasks
         .iter()
         .filter(|item| item.task_status.as_deref() == Some("pending_dealer_review"))
@@ -81,11 +83,13 @@ pub async fn performance(
 
     for task in tasks {
         if let Some(technician_id) = task.current_technician_id {
-            let entry = map.entry(technician_id).or_insert(TechnicianPerformanceItem {
-                technician_id,
-                total_tasks: 0,
-                completed_tasks: 0,
-            });
+            let entry = map
+                .entry(technician_id)
+                .or_insert(TechnicianPerformanceItem {
+                    technician_id,
+                    total_tasks: 0,
+                    completed_tasks: 0,
+                });
             entry.total_tasks += 1;
             if task.task_status.as_deref() == Some("completed") {
                 entry.completed_tasks += 1;
@@ -103,10 +107,11 @@ pub async fn quality_distribution(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<QualityDistributionReport>>, AppError> {
     ensure_hq_access(&state, &headers)?;
-    let scores: Vec<HqScoreEntity> = db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! {})
-        .await
-        .context("failed to query hq scores")
-        .map_err(AppError::Internal)?;
+    let scores: Vec<HqScoreEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "hq_score", value! {})
+            .await
+            .context("failed to query hq scores")
+            .map_err(AppError::Internal)?;
 
     let mut report = QualityDistributionReport {
         excellent: 0,
@@ -134,14 +139,14 @@ pub async fn export(
     ensure_hq_access(&state, &headers)?;
     let tasks = all_tasks(&state).await?;
 
-    let mut csv = String::from("task_id,task_no,service_type,task_status,technician_id\n");
+    let mut csv = String::from("\u{feff}任务ID,任务编号,服务类型,任务状态,师傅ID\n");
     for task in tasks {
         csv.push_str(&format!(
             "{},{},{},{},{}\n",
             task.id.unwrap_or_default(),
             task.task_no.unwrap_or_default(),
-            task.service_type.unwrap_or_default(),
-            task.task_status.unwrap_or_default(),
+            report_service_type_text(task.service_type.as_deref()),
+            report_task_status_text(task.task_status.as_deref()),
             task.current_technician_id.unwrap_or_default()
         ));
     }
@@ -154,9 +159,32 @@ pub async fn export(
     );
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=\"report-export.csv\""),
+        HeaderValue::from_static("attachment; filename=\"总部报表导出.csv\""),
     );
     Ok(response)
+}
+
+fn report_service_type_text(service_type: Option<&str>) -> &'static str {
+    match service_type.unwrap_or_default() {
+        "measure" => "量尺服务",
+        "install" => "安装服务",
+        "ironing" => "熨烫服务",
+        "cleaning" => "除尘除螨服务",
+        _ => "其他服务",
+    }
+}
+
+fn report_task_status_text(status: Option<&str>) -> &'static str {
+    match status.unwrap_or_default() {
+        "pending_assign" => "待分派",
+        "pending_execute" => "待执行",
+        "executing" => "进行中",
+        "pending_dealer_review" => "待评价",
+        "pending_hq_score" => "待评分",
+        "completed" => "已完成",
+        "closed" => "已关闭",
+        _ => "未知状态",
+    }
 }
 
 fn ensure_hq_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
@@ -165,8 +193,12 @@ fn ensure_hq_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppErro
 }
 
 async fn all_tasks(state: &AppState) -> Result<Vec<TaskEntity>, AppError> {
-    db::select_by_map_compat(state.rb.as_ref(), "task", value! {})
+    let tasks: Vec<TaskEntity> = db::select_by_map_compat(state.rb.as_ref(), "task", value! {})
         .await
         .context("failed to query tasks for report")
-        .map_err(AppError::Internal)
+        .map_err(AppError::Internal)?;
+    Ok(tasks
+        .into_iter()
+        .filter(|task| task.deleted_at.is_none())
+        .collect())
 }

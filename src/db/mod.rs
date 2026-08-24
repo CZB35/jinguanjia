@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::DateTime;
-use rbatis::RBatis;
+use rbatis::{RBatis, executor::Executor};
 use rbdc_mysql::driver::MysqlDriver;
 use rbs::{Value, from_value, value::map::ValueMap};
 use serde::de::DeserializeOwned;
@@ -26,12 +26,34 @@ where
     decode_table_rows(raw)
 }
 
-pub async fn select_one_by_map_compat<T>(rb: &RBatis, table: &str, condition: Value) -> Result<Option<T>>
+pub async fn select_one_by_map_compat<T>(
+    rb: &RBatis,
+    table: &str,
+    condition: Value,
+) -> Result<Option<T>>
 where
     T: DeserializeOwned,
 {
     let mut rows: Vec<T> = select_by_map_compat(rb, table, condition).await?;
     Ok(rows.drain(..).next())
+}
+
+pub async fn select_by_map_for_update_compat<T, E>(
+    executor: &E,
+    table: &str,
+    condition: Value,
+) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+    E: Executor + ?Sized,
+{
+    let (mut sql, args) = build_select_sql(table, condition)?;
+    sql.push_str(" for update");
+    let raw = executor
+        .query(sql.as_str(), args)
+        .await
+        .with_context(|| format!("failed to lock table rows: {table}"))?;
+    decode_table_rows(raw)
 }
 
 fn build_select_sql(table: &str, condition: Value) -> Result<(String, Vec<Value>)> {
@@ -41,13 +63,17 @@ fn build_select_sql(table: &str, condition: Value) -> Result<(String, Vec<Value>
 
     if let Value::Map(map) = condition {
         for (key, value) in map {
-            let Some(column) = key.as_str() else { continue; };
+            let Some(column) = key.as_str() else {
+                continue;
+            };
             if column == "column" || value == Value::Null {
                 continue;
             }
             match value {
                 Value::Array(arr) if !arr.is_empty() => {
-                    let placeholders = std::iter::repeat_n("?", arr.len()).collect::<Vec<_>>().join(", ");
+                    let placeholders = std::iter::repeat_n("?", arr.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     clauses.push(format!("`{}` in ({})", column, placeholders));
                     args.extend(arr);
                 }
@@ -83,7 +109,8 @@ where
             }
 
             if matches!(rows.first(), Some(Value::Map(_))) {
-                return from_value::<Vec<T>>(Value::Array(rows)).map_err(|e| anyhow!(e.to_string()));
+                return from_value::<Vec<T>>(Value::Array(rows))
+                    .map_err(|e| anyhow!(e.to_string()));
             }
 
             let headers = rows
@@ -93,10 +120,14 @@ where
 
             let mut mapped_rows = Vec::new();
             for row in rows.into_iter().skip(1) {
-                let cells = row.as_array().cloned().ok_or_else(|| anyhow!("invalid mysql table result row"))?;
+                let cells = row
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("invalid mysql table result row"))?;
                 let mut map = ValueMap::with_capacity(headers.len());
                 for (index, header) in headers.iter().enumerate() {
-                    let normalized = normalize_value(cells.get(index).cloned().unwrap_or(Value::Null));
+                    let normalized =
+                        normalize_value(cells.get(index).cloned().unwrap_or(Value::Null));
                     let final_value = if is_json_column(header) {
                         Value::String(to_json_value(normalized).to_string())
                     } else {
@@ -117,7 +148,14 @@ fn is_json_column(header: &Value) -> bool {
     match header {
         Value::String(name) => {
             name.ends_with("_json")
-                || matches!(name.as_str(), "config_value" | "before_value" | "after_value" | "request_payload" | "response_payload")
+                || matches!(
+                    name.as_str(),
+                    "config_value"
+                        | "before_value"
+                        | "after_value"
+                        | "request_payload"
+                        | "response_payload"
+                )
         }
         _ => false,
     }
@@ -143,7 +181,9 @@ fn normalize_value(value: Value) -> Value {
             }
             other => Value::Ext(tag, Box::new(other)),
         },
-        Value::Ext(tag, ext) if tag.eq_ignore_ascii_case("json") || tag.eq_ignore_ascii_case("Json") => {
+        Value::Ext(tag, ext)
+            if tag.eq_ignore_ascii_case("json") || tag.eq_ignore_ascii_case("Json") =>
+        {
             match *ext {
                 Value::String(text) => Value::String(text),
                 other => {
@@ -172,10 +212,13 @@ fn to_json_value(value: Value) -> JsonValue {
         Value::Map(map) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in map {
-                obj.insert(match k {
-                    Value::String(s) => s,
-                    other => format!("{other:?}"),
-                }, to_json_value(v));
+                obj.insert(
+                    match k {
+                        Value::String(s) => s,
+                        other => format!("{other:?}"),
+                    },
+                    to_json_value(v),
+                );
             }
             JsonValue::Object(obj)
         }

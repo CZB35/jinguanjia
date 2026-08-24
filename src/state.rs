@@ -3,7 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use rbatis::RBatis;
 use tokio::sync::RwLock;
 
-use crate::{config::AppConfig, wechat::{WechatPublicBindState, WechatRuntime}};
+use crate::{
+    config::AppConfig,
+    wechat::{WechatPublicBindState, WechatRuntime},
+};
 
 #[derive(Clone, Debug)]
 pub struct VerificationCodeState {

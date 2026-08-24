@@ -17,15 +17,76 @@ pub mod standards;
 pub mod stores;
 pub mod system;
 pub mod tasks;
+pub mod technician_location;
 pub mod technicians;
 pub mod users;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{delete, get, patch, post},
 };
 
 use crate::state::AppState;
+
+const MAX_50MB_MULTIPART_BODY_BYTES: usize = 51 * 1024 * 1024;
+
+pub(crate) fn deserialize_patch_field<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize<'de>>::deserialize(deserializer).map(Some)
+}
+
+pub(crate) fn parse_multi_query_values(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+
+    if value.starts_with('[')
+        && let Ok(values) = serde_json::from_str::<Vec<String>>(value)
+    {
+        return normalize_multi_query_values(values);
+    }
+
+    normalize_multi_query_values(
+        value
+            .split(|character: char| {
+                matches!(character, ',' | ';' | '|') || matches!(character as u32, 0xFF0C | 0x3001)
+            })
+            .map(ToString::to_string),
+    )
+}
+
+pub(crate) fn multi_query_value_matches(
+    value: Option<&str>,
+    mut predicate: impl FnMut(&str) -> bool,
+) -> bool {
+    let values = parse_multi_query_values(value);
+    values.is_empty()
+        || values.iter().any(|value| is_all_query_value(value))
+        || values.iter().any(|value| predicate(value))
+}
+
+fn normalize_multi_query_values(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || normalized.iter().any(|current| current == value) {
+            continue;
+        }
+        normalized.push(value.to_string());
+    }
+    normalized
+}
+
+pub(crate) fn is_all_query_value(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "all" | "*")
+        || matches!(value.trim(), "\u{5168}\u{90e8}" | "\u{4e0d}\u{9650}")
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -112,8 +173,20 @@ pub fn router() -> Router<AppState> {
             "/users/import-template",
             get(imports::download_user_import_template),
         )
+        .route("/dealers/import", post(imports::import_dealers))
+        .route("/technicians/import", post(imports::import_technicians))
+        .route(
+            "/technicians/import-template",
+            get(imports::download_technician_import_template),
+        )
+        .route("/customers/import", post(imports::import_customers))
+        .route("/stores/import", post(imports::import_stores))
         .route("/users/export", get(imports::export_users))
         .route("/users/batch-delete", post(imports::batch_delete_users))
+        .route(
+            "/customers/batch-delete",
+            post(customers::batch_delete_customers),
+        )
         .route(
             "/customers",
             get(customers::list_customers).post(customers::create_customer),
@@ -124,20 +197,24 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/customers/{id}",
-            get(customers::get_customer_detail).patch(customers::update_customer),
+            get(customers::get_customer_detail)
+                .patch(customers::update_customer)
+                .delete(customers::delete_customer),
         )
         .route(
             "/customers/{id}/service-history",
             get(customers::get_customer_service_history),
         )
-        .route("/dealers", get(users::list_dealers).post(users::create_dealer))
+        .route(
+            "/dealers",
+            get(users::list_dealers).post(users::create_dealer),
+        )
+        .route("/dealers/batch-delete", post(users::batch_delete_dealers))
         .route(
             "/dealers/{id}",
-            get(users::get_dealer_detail).patch(users::update_dealer),
-        )
-        .route(
-            "/dealers/{id}/reset-password",
-            post(users::reset_dealer_password),
+            get(users::get_dealer_detail)
+                .patch(users::update_dealer)
+                .delete(users::delete_dealer),
         )
         .route(
             "/dealers/{id}/reset-password",
@@ -146,6 +223,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/technicians",
             get(technicians::list_technicians).post(technicians::create_technician),
+        )
+        .route(
+            "/technicians/batch-delete",
+            post(technicians::batch_delete_technicians),
         )
         .route(
             "/technicians/available",
@@ -157,7 +238,9 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/technicians/{id}",
-            get(technicians::get_technician_detail).patch(technicians::update_technician),
+            get(technicians::get_technician_detail)
+                .patch(technicians::update_technician)
+                .delete(technicians::delete_technician),
         )
         .route(
             "/technicians/{id}/performance",
@@ -166,10 +249,6 @@ pub fn router() -> Router<AppState> {
         .route(
             "/technicians/{id}/status",
             patch(technicians::update_technician_status),
-        )
-        .route(
-            "/technicians/{id}/reset-password",
-            post(technicians::reset_technician_password),
         )
         .route(
             "/technicians/{id}/reset-password",
@@ -187,8 +266,15 @@ pub fn router() -> Router<AppState> {
             post(users::reset_user_password),
         )
         .route("/tasks", post(tasks::create_task).get(tasks::list_tasks))
+        .route("/tasks/batch-delete", post(tasks::batch_delete_tasks))
         .route("/tasks/export", get(tasks::export_tasks))
-        .route("/tasks/{id}", get(tasks::get_task_detail))
+        .route("/tasks/export/all", get(tasks::export_tasks))
+        .route("/tasks/export/selected", post(tasks::export_selected_tasks))
+        .route(
+            "/tasks/{id}",
+            get(tasks::get_task_detail).delete(tasks::delete_task),
+        )
+        .route("/tasks/{id}/detail", get(tasks::get_task_detail))
         .route(
             "/tasks/{id}/attachments",
             post(files::upload_task_attachment).get(files::list_task_attachments),
@@ -200,7 +286,8 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/tasks/{id}/evidences/videos",
-            post(files::upload_evidence_video),
+            post(files::upload_evidence_video)
+                .layer(DefaultBodyLimit::max(MAX_50MB_MULTIPART_BODY_BYTES)),
         )
         .route(
             "/attachments/batch-download",
@@ -216,11 +303,31 @@ pub fn router() -> Router<AppState> {
         .route("/tasks/{id}/hq-score", post(reviews::hq_score))
         .route("/hq/review/tasks", get(hq_review::list_review_tasks))
         .route(
+            "/hq/review/tasks/pending-and-completed",
+            get(hq_review::list_review_pending_and_completed_tasks),
+        )
+        .route(
+            "/hq/review/tasks/pending-execute-and-executing",
+            get(hq_review::list_review_pending_execute_and_executing_tasks),
+        )
+        .route(
             "/hq/review/tasks/export",
             get(hq_review::export_review_tasks),
         )
         .route(
+            "/hq/review/tasks/export/all",
+            get(hq_review::export_review_tasks),
+        )
+        .route(
+            "/hq/review/tasks/export/selected",
+            post(hq_review::export_selected_review_tasks),
+        )
+        .route(
             "/hq/review/tasks/{id}",
+            get(hq_review::get_review_task_detail),
+        )
+        .route(
+            "/hq/review/tasks/{id}/detail",
             get(hq_review::get_review_task_detail),
         )
         .route(
@@ -238,6 +345,10 @@ pub fn router() -> Router<AppState> {
             get(reports::quality_distribution),
         )
         .route("/hq/reports/export", get(reports::export))
+        .route(
+            "/hq/scores/import-template",
+            get(imports::download_score_import_template),
+        )
         .route("/hq/scores/import", post(imports::import_scores))
         .route(
             "/system/configs",
@@ -246,6 +357,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/system/project-settings",
             get(system::get_project_settings).patch(system::save_project_settings),
+        )
+        .route(
+            "/system/project-settings/upload",
+            post(system::upload_project_setting_image)
+                .layer(DefaultBodyLimit::max(MAX_50MB_MULTIPART_BODY_BYTES)),
         )
         .route(
             "/system/agreements/user",
@@ -302,4 +418,34 @@ pub fn router() -> Router<AppState> {
             get(files::download_attachment),
         )
         .route("/evidences/{id}", delete(files::delete_evidence))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_query_values_accept_scalar_delimited_and_json_array() {
+        assert_eq!(
+            parse_multi_query_values(Some("pending_execute")),
+            vec!["pending_execute"]
+        );
+        assert_eq!(
+            parse_multi_query_values(Some("pending_execute,executing|completed")),
+            vec!["pending_execute", "executing", "completed"]
+        );
+        assert_eq!(
+            parse_multi_query_values(Some(r#"["pending","scored","pending"]"#)),
+            vec!["pending", "scored"]
+        );
+    }
+
+    #[test]
+    fn multi_query_all_value_disables_the_filter() {
+        assert!(multi_query_value_matches(Some("all"), |_| false));
+        assert!(multi_query_value_matches(None, |_| false));
+        assert!(multi_query_value_matches(Some("pending,scored"), |value| {
+            value == "scored"
+        }));
+    }
 }

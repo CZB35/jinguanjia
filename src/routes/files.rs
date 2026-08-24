@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Write, path::Path};
+use std::{collections::HashMap, io::Write, path::Path, str::FromStr};
 
 use ab_glyph::{FontArc, PxScale};
 use anyhow::{Context, anyhow};
@@ -10,15 +10,17 @@ use axum::{
     response::Response,
 };
 use chrono::Local;
+use font8x8::{BASIC_FONTS, UnicodeFonts};
 use image::{ImageFormat, Rgba};
 use imageproc::{
-    drawing::{draw_filled_rect_mut, draw_text_mut},
+    drawing::{draw_filled_rect_mut, draw_text_mut, text_size},
     rect::Rect,
 };
-use font8x8::{BASIC_FONTS, UnicodeFonts};
 use rbs::value;
 use serde::Serialize;
 use tokio::fs;
+use tokio::process::Command;
+use uuid::Uuid;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
@@ -26,15 +28,30 @@ use crate::{
     error::AppError,
     models::{
         attachment::AttachmentEntity, customer::CustomerEntity,
-        customer_address::CustomerAddressEntity, evidence::EvidenceEntity,
-        store::StoreEntity, task::TaskEntity,
-        task_execution::TaskExecutionEntity, task_service_item::TaskServiceItemEntity,
-        user_store::UserStoreEntity,
+        customer_address::CustomerAddressEntity, evidence::EvidenceEntity, store::StoreEntity,
+        task::TaskEntity, task_execution::TaskExecutionEntity,
+        task_service_item::TaskServiceItemEntity, user_store::UserStoreEntity,
     },
     response::ApiResponse,
     state::AppState,
     storage,
 };
+
+const MAX_EVIDENCE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const WATERMARK_BOX_WIDTH_RATIO: f32 = 0.33;
+const MAX_EVIDENCE_VIDEO_BYTES: usize = 50 * 1024 * 1024;
+const MAX_EVIDENCE_IMAGES_PER_EXECUTION: usize = 10;
+const LOCATION_ADDRESS_FIELD_KEYS: &[&str] = &[
+    "location_address",
+    "locationAddress",
+    "location_text",
+    "locationText",
+    "current_address",
+    "currentAddress",
+    "formatted_address",
+    "formattedAddress",
+    "address",
+];
 
 #[derive(Debug, Serialize)]
 pub struct FileItem {
@@ -82,25 +99,69 @@ pub struct EvidenceUploadQuery {
     pub execution_id: Option<i64>,
     pub service_item_id: Option<i64>,
     pub service_type: Option<String>,
+    #[serde(
+        alias = "locationAddress",
+        alias = "location_text",
+        alias = "locationText",
+        alias = "current_address",
+        alias = "currentAddress",
+        alias = "formatted_address",
+        alias = "formattedAddress",
+        alias = "address"
+    )]
+    pub location_address: Option<String>,
 }
 
 pub async fn upload_task_attachment(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<i64>,
+    Query(query): Query<EvidenceUploadQuery>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<UploadResponse>>, AppError> {
     let auth_user = auth::authenticate(&state, &headers)?;
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
-    let _ = find_task(&state, task_id).await?;
+    let task = find_task(&state, task_id).await?;
 
     let upload = read_single_multipart(multipart).await?;
+    let file_bytes = if upload
+        .content_type
+        .as_deref()
+        .map(|item| item.starts_with("image/"))
+        .unwrap_or(false)
+        || Path::new(&upload.file_name)
+            .extension()
+            .and_then(|item| item.to_str())
+            .map(|item| {
+                ["jpg", "jpeg", "png", "webp"].contains(&item.to_ascii_lowercase().as_str())
+            })
+            .unwrap_or(false)
+    {
+        let location_address = query
+            .location_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| parse_optional_text_field(&upload.fields, LOCATION_ADDRESS_FIELD_KEYS))
+            .unwrap_or_default();
+        let location_context = EvidenceLocationContext {
+            location_address,
+            customer_address: load_task_customer_address(&state, &task).await?,
+        };
+        let watermark_text =
+            build_evidence_watermark_data(&state, &task, &location_context).await?;
+        apply_visible_watermark(&upload.bytes, &watermark_text)
+            .unwrap_or_else(|_| upload.bytes.clone())
+    } else {
+        upload.bytes.clone()
+    };
     let stored = storage::save_bytes(
         &state,
         "attachments",
         &upload.file_name,
         upload.content_type.as_deref(),
-        &upload.bytes,
+        &file_bytes,
     )
     .await
     .map_err(AppError::Internal)?;
@@ -201,7 +262,11 @@ pub async fn list_task_attachments(
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).max(1);
     let start = page.saturating_sub(1).saturating_mul(page_size);
-    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
+    let items = items
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(FileListResponse {
         items,
         total,
@@ -264,7 +329,11 @@ pub async fn list_task_evidences(
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).max(1);
     let start = page.saturating_sub(1).saturating_mul(page_size);
-    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
+    let items = items
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(FileListResponse {
         items,
         total,
@@ -287,8 +356,7 @@ pub async fn delete_attachment(
         .context("failed to delete attachment")
         .map_err(AppError::Internal)?;
 
-    let path = storage::full_path(&state, attachment.file_url.as_deref().unwrap_or_default());
-    let _ = fs::remove_file(path).await;
+    let _ = storage::delete_file(&state, attachment.file_url.as_deref().unwrap_or_default()).await;
 
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "ok": true }),
@@ -309,8 +377,7 @@ pub async fn delete_evidence(
         .context("failed to delete evidence")
         .map_err(AppError::Internal)?;
 
-    let path = storage::full_path(&state, evidence.file_url.as_deref().unwrap_or_default());
-    let _ = fs::remove_file(path).await;
+    let _ = storage::delete_file(&state, evidence.file_url.as_deref().unwrap_or_default()).await;
 
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "ok": true }),
@@ -326,10 +393,9 @@ pub async fn download_attachment(
     let attachment = find_attachment(&state, attachment_id).await?;
     ensure_task_access(&state, &auth_user, attachment.task_id.unwrap_or_default()).await?;
 
-    let path = storage::full_path(&state, attachment.file_url.as_deref().unwrap_or_default());
-    let bytes = fs::read(&path)
+    let bytes = storage::read_bytes(&state, attachment.file_url.as_deref().unwrap_or_default())
         .await
-        .with_context(|| format!("failed to read attachment file: {}", path.display()))
+        .context("failed to read attachment file")
         .map_err(AppError::Internal)?;
 
     let mime_type = attachment
@@ -372,7 +438,9 @@ pub async fn batch_download_attachments(
 
     let attachments = resolve_batch_download_attachments(&state, &auth_user, &payload).await?;
     if attachments.is_empty() {
-        return Err(AppError::BadRequest("所选任务暂无附件".to_string()));
+        return Err(AppError::BadRequest(
+            "所选任务暂无附件或现场图片".to_string(),
+        ));
     }
 
     let mut buffer = std::io::Cursor::new(Vec::new());
@@ -382,23 +450,17 @@ pub async fn batch_download_attachments(
         let mut used_file_names = HashMap::<String, usize>::new();
 
         for attachment in attachments {
-            let path =
-                storage::full_path(&state, attachment.file_url.as_deref().unwrap_or_default());
-            let bytes = fs::read(&path)
+            let bytes = storage::read_bytes(&state, &attachment.file_url)
                 .await
-                .with_context(|| {
-                    format!("failed to read attachment file for zip: {}", path.display())
-                })
+                .context("failed to read attachment file for zip")
                 .map_err(AppError::Internal)?;
-            let base_file_name = attachment
-                .file_name
-                .clone()
-                .unwrap_or_else(|| format!("attachment-{}.bin", attachment.id.unwrap_or_default()));
-            let file_name = unique_zip_entry_name(
-                &mut used_file_names,
-                &base_file_name,
-                attachment.task_id,
-            );
+            let base_file_name = if attachment.file_name.trim().is_empty() {
+                format!("{}-{}.bin", attachment.source, attachment.id)
+            } else {
+                attachment.file_name.clone()
+            };
+            let file_name =
+                unique_zip_entry_name(&mut used_file_names, &base_file_name, attachment.task_id);
             zip.start_file(file_name, options)
                 .map_err(|_| AppError::Internal(anyhow!("failed to start zip entry")))?;
             zip.write_all(&bytes)
@@ -439,13 +501,23 @@ async fn resolve_batch_download_attachments(
     state: &AppState,
     auth_user: &auth::CurrentAuthUser,
     payload: &BatchDownloadRequest,
-) -> Result<Vec<AttachmentEntity>, AppError> {
-    let mut attachment_map = std::collections::BTreeMap::new();
+) -> Result<Vec<BatchDownloadFile>, AppError> {
+    let mut attachment_map = std::collections::BTreeMap::<(String, i64), BatchDownloadFile>::new();
 
     for &attachment_id in &payload.attachment_ids {
         let attachment = find_attachment(state, attachment_id).await?;
         ensure_task_access(state, auth_user, attachment.task_id.unwrap_or_default()).await?;
-        attachment_map.insert(attachment.id.unwrap_or_default(), attachment);
+        let id = attachment.id.unwrap_or_default();
+        attachment_map.insert(
+            ("attachment".to_string(), id),
+            BatchDownloadFile {
+                id,
+                source: "attachment",
+                task_id: attachment.task_id,
+                file_name: attachment.file_name.unwrap_or_default(),
+                file_url: attachment.file_url.unwrap_or_default(),
+            },
+        );
     }
 
     if !payload.task_ids.is_empty() {
@@ -463,12 +535,45 @@ async fn resolve_batch_download_attachments(
         .map_err(AppError::Internal)?;
 
         for attachment in attachments {
-            attachment_map.insert(attachment.id.unwrap_or_default(), attachment);
+            let id = attachment.id.unwrap_or_default();
+            attachment_map.insert(
+                ("attachment".to_string(), id),
+                BatchDownloadFile {
+                    id,
+                    source: "attachment",
+                    task_id: attachment.task_id,
+                    file_name: attachment.file_name.unwrap_or_default(),
+                    file_url: attachment.file_url.unwrap_or_default(),
+                },
+            );
+        }
+
+        let evidences: Vec<EvidenceEntity> = db::select_by_map_compat(
+            state.rb.as_ref(),
+            "evidence",
+            value! { "task_id": payload.task_ids.clone() },
+        )
+        .await
+        .context("failed to query batch download evidences by task ids")
+        .map_err(AppError::Internal)?;
+
+        for evidence in evidences {
+            let id = evidence.id.unwrap_or_default();
+            attachment_map.insert(
+                ("evidence".to_string(), id),
+                BatchDownloadFile {
+                    id,
+                    source: "evidence",
+                    task_id: evidence.task_id,
+                    file_name: evidence.file_name.unwrap_or_default(),
+                    file_url: evidence.file_url.unwrap_or_default(),
+                },
+            );
         }
     }
 
     let mut items = attachment_map.into_values().collect::<Vec<_>>();
-    items.sort_by_key(|item| (item.task_id.unwrap_or_default(), item.id.unwrap_or_default()));
+    items.sort_by_key(|item| (item.task_id.unwrap_or_default(), item.source, item.id));
     Ok(items)
 }
 
@@ -531,15 +636,21 @@ async fn upload_evidence(
     if task.task_status.as_deref() != Some("executing") {
         return Err(AppError::Conflict("请先开始执行任务".to_string()));
     }
+    let upload = if evidence_type == "video" {
+        read_single_multipart_with_limit_message(multipart, "现场视频大小不能超过50MB").await?
+    } else {
+        read_single_multipart(multipart).await?
+    };
+    let query = merge_evidence_upload_query(query, &upload.fields)?;
     let execution = resolve_evidence_execution(&state, &task, auth_user.user_id, &query).await?;
     let execution_id = execution
         .id
         .ok_or_else(|| AppError::Internal(anyhow!("execution.id missing")))?;
 
-    let upload = read_single_multipart(multipart).await?;
     validate_upload(
         &upload.file_name,
         upload.content_type.as_deref(),
+        upload.bytes.len(),
         evidence_type,
     )?;
 
@@ -552,19 +663,27 @@ async fn upload_evidence(
         .await
         .context("failed to query existing image evidence")
         .map_err(AppError::Internal)?;
-        if existing.len() >= 5 {
+        if existing.len() >= MAX_EVIDENCE_IMAGES_PER_EXECUTION {
             return Err(AppError::Conflict("上传图片数量已达上限".to_string()));
         }
     }
-
     let sub_dir = if evidence_type == "image" {
         "evidences/images"
     } else {
         "evidences/videos"
     };
-    let watermark_text = build_evidence_watermark_data(&state, &task).await?;
-    let file_bytes = if evidence_type == "image" {
-        match apply_visible_watermark(&upload.bytes, &watermark_text) {
+    let location_context = load_evidence_location_context(&state, &task, &query).await?;
+    let technician_location_address = normalize_optional_location_address(
+        location_context.location_address.as_str(),
+        location_context.customer_address.as_str(),
+    );
+    let watermark = if evidence_type == "image" {
+        Some(build_evidence_watermark_data(&state, &task, &location_context).await?)
+    } else {
+        None
+    };
+    let file_bytes = if let Some(watermark) = watermark.as_ref() {
+        match apply_visible_watermark(&upload.bytes, watermark) {
             Ok(bytes) => bytes,
             Err(_) => upload.bytes.clone(),
         }
@@ -593,7 +712,8 @@ async fn upload_evidence(
             file_url: Some(stored.relative_path.clone()),
             file_size: Some(stored.file_size),
             mime_type: Some(stored.mime_type.clone()),
-            watermark_text: Some(watermark_text.fallback_text),
+            watermark_text: watermark.map(|item| item.fallback_text),
+            location_address: technician_location_address,
             longitude: None,
             latitude: None,
             shot_at: Some(Local::now().naive_local()),
@@ -625,43 +745,118 @@ async fn upload_evidence(
     })))
 }
 
+fn merge_evidence_upload_query(
+    mut query: EvidenceUploadQuery,
+    fields: &HashMap<String, String>,
+) -> Result<EvidenceUploadQuery, AppError> {
+    if query.execution_id.is_none() {
+        query.execution_id = parse_optional_i64_field(fields, &["execution_id", "executionId"])?;
+    }
+    if query.service_item_id.is_none() {
+        query.service_item_id =
+            parse_optional_i64_field(fields, &["service_item_id", "serviceItemId"])?;
+    }
+    if query.service_type.is_none() {
+        query.service_type = parse_optional_text_field(fields, &["service_type", "serviceType"]);
+    }
+    if query.location_address.is_none() {
+        query.location_address = parse_optional_text_field(fields, LOCATION_ADDRESS_FIELD_KEYS);
+    }
+    Ok(query)
+}
+
+fn parse_optional_i64_field(
+    fields: &HashMap<String, String>,
+    keys: &[&str],
+) -> Result<Option<i64>, AppError> {
+    let Some(raw) = keys.iter().find_map(|key| fields.get(*key)) else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    i64::from_str(raw)
+        .map(Some)
+        .map_err(|_| AppError::BadRequest(format!("{}鏍煎紡閿欒", keys[0])))
+}
+
+fn parse_optional_text_field(fields: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| fields.get(*key))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug)]
 struct UploadField {
     file_name: String,
     content_type: Option<String>,
     bytes: Vec<u8>,
+    fields: HashMap<String, String>,
 }
 
-async fn read_single_multipart(mut multipart: Multipart) -> Result<UploadField, AppError> {
-    let field = multipart
+struct BatchDownloadFile {
+    id: i64,
+    source: &'static str,
+    task_id: Option<i64>,
+    file_name: String,
+    file_url: String,
+}
+
+async fn read_single_multipart(multipart: Multipart) -> Result<UploadField, AppError> {
+    read_single_multipart_with_limit_message(multipart, "上传文件大小不能超过10MB").await
+}
+
+async fn read_single_multipart_with_limit_message(
+    mut multipart: Multipart,
+    limit_message: &'static str,
+) -> Result<UploadField, AppError> {
+    let mut fields = HashMap::new();
+    let mut file_name = None;
+    let mut content_type = None;
+    let mut bytes = None;
+
+    while let Some(field) = multipart
         .next_field()
         .await
-        .context("failed to read multipart field")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::BadRequest("请上传文件".to_string()))?;
-
-    let file_name = field
-        .file_name()
-        .map(ToString::to_string)
-        .ok_or_else(|| AppError::BadRequest("上传文件名不能为空".to_string()))?;
-    let content_type = field.content_type().map(ToString::to_string);
-    let bytes = field
-        .bytes()
-        .await
-        .context("failed to read upload bytes")
-        .map_err(AppError::Internal)?
-        .to_vec();
+        .map_err(|err| AppError::from_multipart_error_with_limit_message(err, limit_message))?
+    {
+        let name = field.name().map(ToString::to_string).unwrap_or_default();
+        if let Some(current_file_name) = field.file_name().map(ToString::to_string) {
+            content_type = field.content_type().map(ToString::to_string);
+            file_name = Some(current_file_name);
+            bytes = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|err| {
+                        AppError::from_multipart_error_with_limit_message(err, limit_message)
+                    })?
+                    .to_vec(),
+            );
+        } else {
+            let text = field.text().await.map_err(|err| {
+                AppError::from_multipart_error_with_limit_message(err, limit_message)
+            })?;
+            if !name.is_empty() {
+                fields.insert(name, text);
+            }
+        }
+    }
 
     Ok(UploadField {
-        file_name,
+        file_name: file_name.ok_or_else(|| AppError::BadRequest("请上传文件".to_string()))?,
         content_type,
-        bytes,
+        bytes: bytes.ok_or_else(|| AppError::BadRequest("请上传文件".to_string()))?,
+        fields,
     })
 }
 
 fn validate_upload(
     file_name: &str,
     content_type: Option<&str>,
+    file_size: usize,
     evidence_type: &str,
 ) -> Result<(), AppError> {
     let ext = Path::new(file_name)
@@ -678,6 +873,9 @@ fn validate_upload(
             if !ok {
                 return Err(AppError::BadRequest("当前文件格式不支持上传".to_string()));
             }
+            if file_size > MAX_EVIDENCE_IMAGE_BYTES {
+                return Err(AppError::BadRequest("现场图片大小不能超过10MB".to_string()));
+            }
         }
         "video" => {
             let ok =
@@ -685,21 +883,251 @@ fn validate_upload(
             if !ok {
                 return Err(AppError::BadRequest("当前文件格式不支持上传".to_string()));
             }
+            if file_size > MAX_EVIDENCE_VIDEO_BYTES {
+                return Err(AppError::BadRequest("现场视频大小不能超过50MB".to_string()));
+            }
         }
         _ => {}
     }
     Ok(())
 }
 
+async fn apply_video_watermark(
+    bytes: &[u8],
+    file_name: &str,
+    watermark: &EvidenceWatermarkData,
+) -> Result<Vec<u8>, AppError> {
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or("mp4");
+    let temp_dir = std::env::temp_dir().join(format!("kgj-video-watermark-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir)
+        .context("failed to create temp dir for video watermark")
+        .map_err(AppError::Internal)?;
+
+    let input_path = temp_dir.join(format!("input.{extension}"));
+    let output_path = temp_dir.join(format!("output.{extension}"));
+    let font_path = temp_dir.join("simhei.ttf");
+    let text_path = temp_dir.join("watermark.txt");
+
+    let watermark_text = watermark.info_lines.join("\n");
+    fs::write(&input_path, bytes)
+        .await
+        .context("failed to write temp input video")
+        .map_err(AppError::Internal)?;
+    fs::write(&font_path, include_bytes!("../assets/fonts/simhei.ttf"))
+        .await
+        .context("failed to write temp watermark font")
+        .map_err(AppError::Internal)?;
+    fs::write(&text_path, watermark_text.as_bytes())
+        .await
+        .context("failed to write temp watermark text")
+        .map_err(AppError::Internal)?;
+
+    let drawtext_filter = format!(
+        "drawtext=fontfile='{}':textfile='{}':reload=0:fontcolor=black:fontsize=24:line_spacing=8:box=1:boxcolor=0xB8B8B8@0.95:boxborderw=12:x=20:y=h-th-20",
+        escape_ffmpeg_filter_path(&font_path),
+        escape_ffmpeg_filter_path(&text_path),
+    );
+
+    let ffmpeg_bin = resolve_ffmpeg_binary_path();
+    let output = Command::new(&ffmpeg_bin)
+        .arg("-y")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-vf")
+        .arg(drawtext_filter)
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-crf")
+        .arg("23")
+        .arg("-c:a")
+        .arg("copy")
+        .arg(&output_path)
+        .output()
+        .await
+        .map_err(|_| AppError::Internal(anyhow!(
+            "服务端未找到可用的ffmpeg，优先检查FFMPEG_PATH，其次确认程序同目录是否存在ffmpeg.exe"
+        )))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&input_path).await;
+        let _ = fs::remove_file(&output_path).await;
+        let _ = fs::remove_file(&font_path).await;
+        let _ = fs::remove_file(&text_path).await;
+        let _ = fs::remove_dir(&temp_dir).await;
+        return Err(AppError::Internal(anyhow!(
+            "瑙嗛姘村嵃澶勭悊澶辫触: {}",
+            stderr.trim()
+        )));
+    }
+
+    let watermarked_bytes = fs::read(&output_path)
+        .await
+        .context("failed to read watermarked video output")
+        .map_err(AppError::Internal)?;
+
+    let _ = fs::remove_file(&input_path).await;
+    let _ = fs::remove_file(&output_path).await;
+    let _ = fs::remove_file(&font_path).await;
+    let _ = fs::remove_file(&text_path).await;
+    let _ = fs::remove_dir(&temp_dir).await;
+
+    Ok(watermarked_bytes)
+}
+
+fn escape_ffmpeg_filter_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .replace(':', "\\:")
+        .replace('\'', "\\'")
+}
+
+fn resolve_ffmpeg_binary_path() -> String {
+    if let Ok(path) = std::env::var("FFMPEG_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        let bundled = exe_dir.join("ffmpeg.exe");
+        if bundled.exists() {
+            return bundled.to_string_lossy().to_string();
+        }
+    }
+
+    "ffmpeg".to_string()
+}
+
+fn normalize_optional_location_address(
+    location_address: &str,
+    customer_address: &str,
+) -> Option<String> {
+    let location_address = location_address.trim();
+    if location_address.is_empty() || location_address == customer_address.trim() {
+        None
+    } else {
+        Some(location_address.to_string())
+    }
+}
+
+pub async fn refresh_execution_evidence_watermarks(
+    state: &AppState,
+    task: &TaskEntity,
+    execution_id: i64,
+    location_address: &str,
+) -> Result<(), AppError> {
+    let location_address = location_address.trim();
+    if location_address.is_empty() {
+        return Ok(());
+    }
+
+    let evidences: Vec<EvidenceEntity> = db::select_by_map_compat(
+        state.rb.as_ref(),
+        "evidence",
+        value! { "task_id": task.id.unwrap_or_default(), "execution_id": execution_id },
+    )
+    .await
+    .context("failed to query evidence for watermark refresh")
+    .map_err(AppError::Internal)?;
+
+    if evidences.is_empty() {
+        return Ok(());
+    }
+
+    let location_context = EvidenceLocationContext {
+        location_address: location_address.to_string(),
+        customer_address: load_task_customer_address(state, task).await?,
+    };
+    let watermark = build_evidence_watermark_data(state, task, &location_context).await?;
+
+    for evidence in evidences {
+        let evidence_id = evidence.id.unwrap_or_default();
+        let evidence_type = evidence.evidence_type.as_deref().unwrap_or_default();
+        if evidence_type == "video" {
+            EvidenceEntity::update_by_map(
+                state.rb.as_ref(),
+                &EvidenceEntity {
+                    location_address: Some(location_address.to_string()),
+                    ..Default::default()
+                },
+                value! { "id": evidence_id, "column": ["location_address"] },
+            )
+            .await
+            .context("failed to update video evidence location")
+            .map_err(AppError::Internal)?;
+            continue;
+        }
+        if evidence_type != "image" {
+            continue;
+        }
+        if evidence
+            .watermark_text
+            .as_deref()
+            .map(|text| text.contains(location_address))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let Some(relative_path) = evidence.file_url.as_deref() else {
+            continue;
+        };
+        let original_bytes = storage::read_bytes(state, relative_path)
+            .await
+            .context("failed to read evidence for watermark refresh")
+            .map_err(AppError::Internal)?;
+        let refreshed_bytes =
+            apply_visible_watermark(&original_bytes, &watermark).map_err(AppError::Internal)?;
+
+        storage::replace_bytes(
+            state,
+            relative_path,
+            evidence.mime_type.as_deref(),
+            &refreshed_bytes,
+        )
+        .await
+        .context("failed to write refreshed evidence watermark")
+        .map_err(AppError::Internal)?;
+        EvidenceEntity::update_by_map(
+            state.rb.as_ref(),
+            &EvidenceEntity {
+                watermark_text: Some(watermark.fallback_text.clone()),
+                location_address: Some(location_address.to_string()),
+                ..Default::default()
+            },
+            value! { "id": evidence_id, "column": ["watermark_text", "location_address"] },
+        )
+        .await
+        .context("failed to update refreshed evidence watermark text")
+        .map_err(AppError::Internal)?;
+    }
+
+    Ok(())
+}
+
 struct EvidenceWatermarkData {
     info_lines: Vec<String>,
-    time_text: String,
     fallback_text: String,
+}
+
+struct EvidenceLocationContext {
+    location_address: String,
+    customer_address: String,
 }
 
 async fn build_evidence_watermark_data(
     state: &AppState,
     task: &TaskEntity,
+    location_context: &EvidenceLocationContext,
 ) -> Result<EvidenceWatermarkData, AppError> {
     let store_name = if let Some(store_id) = task.store_id {
         db::select_one_by_map_compat::<StoreEntity>(
@@ -715,20 +1143,12 @@ async fn build_evidence_watermark_data(
     } else {
         String::new()
     };
-    let service_address = if let Some(address_id) = task.customer_address_id {
-        db::select_one_by_map_compat::<CustomerAddressEntity>(
-            state.rb.as_ref(),
-            "customer_address",
-            value! { "id": address_id },
-        )
-        .await
-        .context("failed to query customer address for evidence watermark")
-        .map_err(AppError::Internal)?
-        .and_then(|item| item.address)
-        .unwrap_or_default()
+    let service_address = if location_context.location_address.trim().is_empty() {
+        location_context.customer_address.clone()
     } else {
-        String::new()
+        location_context.location_address.clone()
     };
+    let customer_address = location_context.customer_address.clone();
     let (customer_name, customer_mobile) = if let Some(customer_id) = task.customer_id {
         let customer = db::select_one_by_map_compat::<CustomerEntity>(
             state.rb.as_ref(),
@@ -739,7 +1159,10 @@ async fn build_evidence_watermark_data(
         .context("failed to query customer for evidence watermark")
         .map_err(AppError::Internal)?;
         (
-            customer.as_ref().and_then(|item| item.name.clone()).unwrap_or_default(),
+            customer
+                .as_ref()
+                .and_then(|item| item.name.clone())
+                .unwrap_or_default(),
             customer.and_then(|item| item.mobile).unwrap_or_default(),
         )
     } else {
@@ -753,33 +1176,99 @@ async fn build_evidence_watermark_data(
         "cleaning" => "除尘除螨",
         _ => "服务",
     };
-    let masked_mobile = mask_mobile(&customer_mobile);
+    let display_mobile = if customer_mobile.trim().is_empty() {
+        "-".to_string()
+    } else {
+        customer_mobile.trim().to_string()
+    };
     let time_text = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let display_name = if customer_name.trim().is_empty() {
+        "-"
+    } else {
+        customer_name.trim()
+    };
     let info_lines = vec![
-        if store_name.trim().is_empty() { "-".to_string() } else { store_name.trim().to_string() },
-        if service_address.trim().is_empty() { "-".to_string() } else { service_address.trim().to_string() },
-        format!(
-            "客户: {}({})",
-            if customer_name.trim().is_empty() { "-" } else { customer_name.trim() },
-            masked_mobile
-        ),
+        if store_name.trim().is_empty() {
+            "-".to_string()
+        } else {
+            store_name.trim().to_string()
+        },
+        if service_address.trim().is_empty() {
+            "-".to_string()
+        } else {
+            service_address.trim().to_string()
+        },
+        format!("手机号: {}", display_mobile),
+        format!("姓名: {}", display_name),
         format!("服务环节: {}", service_type_text),
+        format!("时间: {}", time_text),
     ];
     let fallback_text = format!(
-        "门店:{} 地址:{} 客户:{}({}) 服务:{} 时间:{}",
-        if store_name.trim().is_empty() { "-" } else { store_name.trim() },
-        if service_address.trim().is_empty() { "-" } else { service_address.trim() },
-        if customer_name.trim().is_empty() { "-" } else { customer_name.trim() },
-        masked_mobile,
+        "门店:{} 地址:{} 客户地址:{} 客户:{}({}) 服务:{} 时间:{}",
+        if store_name.trim().is_empty() {
+            "-"
+        } else {
+            store_name.trim()
+        },
+        if service_address.trim().is_empty() {
+            "-"
+        } else {
+            service_address.trim()
+        },
+        if customer_address.trim().is_empty() {
+            "-"
+        } else {
+            customer_address.trim()
+        },
+        display_name,
+        display_mobile,
         service_type_text,
         time_text
     );
 
     Ok(EvidenceWatermarkData {
         info_lines,
-        time_text,
         fallback_text,
     })
+}
+
+async fn load_evidence_location_context(
+    state: &AppState,
+    task: &TaskEntity,
+    query: &EvidenceUploadQuery,
+) -> Result<EvidenceLocationContext, AppError> {
+    let customer_address = load_task_customer_address(state, task).await?;
+    Ok(EvidenceLocationContext {
+        location_address: query
+            .location_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        customer_address,
+    })
+}
+
+async fn load_task_customer_address(
+    state: &AppState,
+    task: &TaskEntity,
+) -> Result<String, AppError> {
+    let Some(address_id) = task.customer_address_id else {
+        return Ok(String::new());
+    };
+    Ok(db::select_one_by_map_compat::<CustomerAddressEntity>(
+        state.rb.as_ref(),
+        "customer_address",
+        value! { "id": address_id },
+    )
+    .await
+    .context("failed to query customer address for evidence watermark")
+    .map_err(AppError::Internal)?
+    .and_then(|item| item.address)
+    .map(|item| item.trim().to_string())
+    .filter(|item| !item.is_empty())
+    .unwrap_or_default())
 }
 
 fn apply_visible_watermark(
@@ -799,29 +1288,27 @@ fn apply_visible_watermark(
         let char_h = 8 * scale;
         let padding = 12 * scale;
         let line_height = char_h + 4 * scale;
-        let max_chars = ((width.saturating_sub(padding * 2)) / char_w).max(1) as usize;
+        let box_width = watermark_box_width(width, padding);
+        let max_chars = ((box_width.saturating_sub(padding)) / char_w).max(1) as usize;
         let lines = wrap_text(&watermark.fallback_text, max_chars);
-        let overlay_height = (lines.len() as u32 * line_height) + padding;
-        let overlay_y = height.saturating_sub(overlay_height + padding / 2);
-
-        for y in overlay_y..height {
-            for x in 0..width {
-                let pixel = image.get_pixel_mut(x, y);
-                let alpha = 80u16;
-                let bg = [0u8, 0u8, 0u8, 255u8];
-                let blended = [
-                    (((pixel[0] as u16 * (255 - alpha)) + (bg[0] as u16 * alpha)) / 255) as u8,
-                    (((pixel[1] as u16 * (255 - alpha)) + (bg[1] as u16 * alpha)) / 255) as u8,
-                    (((pixel[2] as u16 * (255 - alpha)) + (bg[2] as u16 * alpha)) / 255) as u8,
-                    255,
-                ];
-                *pixel = Rgba(blended);
-            }
-        }
-
+        let overlay_height = (lines.len() as u32 * line_height) + padding * 2;
+        let overlay_x = padding;
+        let overlay_y = height.saturating_sub(overlay_height + padding);
+        draw_filled_rect_mut(
+            &mut image,
+            Rect::at(overlay_x as i32, overlay_y as i32).of_size(box_width, overlay_height),
+            Rgba([184, 184, 184, 242]),
+        );
         for (index, line) in lines.iter().enumerate() {
             let y = overlay_y + padding / 2 + index as u32 * line_height;
-            draw_text_bitmap(&mut image, padding, y, line, scale, Rgba([255, 255, 255, 255]));
+            draw_text_bitmap(
+                &mut image,
+                overlay_x + padding / 2,
+                y,
+                line,
+                scale,
+                Rgba([0, 0, 0, 255]),
+            );
         }
     }
 
@@ -836,58 +1323,69 @@ fn draw_chinese_watermark(
     watermark: &EvidenceWatermarkData,
 ) {
     let width = image.width();
+    let height = image.height();
     let scale_value = ((width as f32) / 48.0).clamp(18.0, 28.0);
-    let text_scale = PxScale::from(scale_value);
-    let time_scale = PxScale::from((scale_value - 2.0).max(16.0));
     let padding = 18i32;
     let line_gap = 8i32;
     let line_height = scale_value as i32 + line_gap;
-    let box_width = ((width as f32) * 0.62) as u32;
+    let box_width = watermark_box_width(width, padding as u32);
+    let text_scale_value = fit_watermark_text_scale(
+        &watermark.info_lines,
+        font,
+        scale_value,
+        box_width.saturating_sub((padding * 2) as u32 + 24) as f32,
+    );
+    let text_scale = PxScale::from(text_scale_value);
     let box_height = (padding * 2 + watermark.info_lines.len() as i32 * line_height) as u32;
+    let box_x = padding;
+    let box_y = height.saturating_sub(box_height + padding as u32) as i32;
 
     draw_filled_rect_mut(
         image,
-        Rect::at(padding, padding).of_size(box_width.max(260), box_height.max(120)),
-        Rgba([0, 0, 0, 160]),
+        Rect::at(box_x, box_y).of_size(box_width, box_height.max(120)),
+        Rgba([184, 184, 184, 242]),
     );
 
     for (index, line) in watermark.info_lines.iter().enumerate() {
         draw_text_mut(
             image,
-            Rgba([255, 255, 255, 255]),
-            padding + 12,
-            padding + 10 + index as i32 * line_height,
+            Rgba([0, 0, 0, 255]),
+            box_x + 12,
+            box_y + 10 + index as i32 * line_height,
             text_scale,
             font,
             line,
         );
     }
+}
 
-    draw_text_mut(
-        image,
-        Rgba([255, 255, 255, 235]),
-        width.saturating_sub((watermark.time_text.chars().count() as u32 * (scale_value as u32 / 2 + 9)) + 20) as i32,
-        padding + 6,
-        time_scale,
-        font,
-        &watermark.time_text,
-    );
+fn watermark_box_width(width: u32, padding: u32) -> u32 {
+    (((width as f32) * WATERMARK_BOX_WIDTH_RATIO) as u32)
+        .max(160)
+        .min(width.saturating_sub(padding.saturating_mul(2)))
+}
+
+fn fit_watermark_text_scale(
+    lines: &[String],
+    font: &FontArc,
+    initial_scale: f32,
+    available_width: f32,
+) -> f32 {
+    let initial = PxScale::from(initial_scale);
+    let widest = lines
+        .iter()
+        .map(|line| text_size(initial, font, line).0 as f32)
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or_default();
+    if widest <= available_width || widest <= 0.0 {
+        return initial_scale;
+    }
+    (initial_scale * available_width / widest).max(12.0)
 }
 
 fn load_watermark_font() -> Option<FontArc> {
     let bytes = include_bytes!("../assets/fonts/simhei.ttf");
     FontArc::try_from_slice(bytes).ok()
-}
-
-fn mask_mobile(mobile: &str) -> String {
-    let mobile = mobile.trim();
-    if mobile.len() >= 7 {
-        format!("{}****{}", &mobile[..3], &mobile[mobile.len().saturating_sub(4)..])
-    } else if mobile.is_empty() {
-        "-".to_string()
-    } else {
-        mobile.to_string()
-    }
 }
 
 fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
@@ -1069,11 +1567,16 @@ async fn ensure_task_access(
 }
 
 async fn find_task(state: &AppState, task_id: i64) -> Result<TaskEntity, AppError> {
-    db::select_one_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
-        .await
-        .context("failed to query task")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::NotFound("任务不存在或已删除".to_string()))
+    let task: TaskEntity =
+        db::select_one_by_map_compat(state.rb.as_ref(), "task", value! { "id": task_id })
+            .await
+            .context("failed to query task")
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound("任务不存在或已删除".to_string()))?;
+    if task.deleted_at.is_some() {
+        return Err(AppError::NotFound("任务不存在或已删除".to_string()));
+    }
+    Ok(task)
 }
 
 async fn find_attachment(
@@ -1101,4 +1604,131 @@ async fn find_evidence(state: &AppState, evidence_id: i64) -> Result<EvidenceEnt
 
 fn sanitize_filename(file_name: &str) -> String {
     file_name.replace(['\r', '\n', '"'], "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{AppConfig, AppMeta, AuthConfig, DatabaseConfig, ServerConfig, StorageConfig},
+        models::task::TaskEntity,
+    };
+    use rbatis::RBatis;
+
+    fn test_state() -> AppState {
+        AppState::new(
+            AppConfig {
+                app: AppMeta {
+                    name: "kgj-backend-test".to_string(),
+                    version: "test".to_string(),
+                },
+                server: ServerConfig {
+                    host: "127.0.0.1".to_string(),
+                    port: 0,
+                },
+                database: DatabaseConfig { url: String::new() },
+                auth: AuthConfig {
+                    jwt_secret: "test".to_string(),
+                    access_token_expire_minutes: 1,
+                    refresh_token_expire_days: 1,
+                },
+                storage: StorageConfig {
+                    backend: "local".to_string(),
+                    upload_dir: "uploads".to_string(),
+                    oss_endpoint: String::new(),
+                    oss_bucket: String::new(),
+                    oss_access_key_id: String::new(),
+                    oss_access_key_secret: String::new(),
+                },
+            },
+            RBatis::new(),
+        )
+    }
+
+    fn test_task() -> TaskEntity {
+        TaskEntity {
+            service_type: Some("cleaning".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn photo_watermark_uses_current_location_and_falls_back_for_blank() {
+        let state = test_state();
+        let task = test_task();
+        let current_address = "临颍县荣耀授权专卖店(漯河临颍金地时代广场店)";
+        let customer_address = "客户地址测试";
+
+        let current = build_evidence_watermark_data(
+            &state,
+            &task,
+            &EvidenceLocationContext {
+                location_address: current_address.to_string(),
+                customer_address: customer_address.to_string(),
+            },
+        )
+        .await
+        .expect("current location watermark should build");
+        assert_eq!(current.info_lines[1], current_address);
+        assert_eq!(
+            current
+                .info_lines
+                .last()
+                .map(|line| line.starts_with("时间: ")),
+            Some(true)
+        );
+        assert!(current.fallback_text.contains(current_address));
+
+        let blank = build_evidence_watermark_data(
+            &state,
+            &task,
+            &EvidenceLocationContext {
+                location_address: "   ".to_string(),
+                customer_address: customer_address.to_string(),
+            },
+        )
+        .await
+        .expect("blank location watermark should build");
+        assert_eq!(blank.info_lines[1], customer_address);
+
+        let image = image::RgbaImage::from_pixel(640, 480, Rgba([240, 240, 240, 255]));
+        let mut source = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut source, ImageFormat::Png)
+            .expect("test image should encode");
+        let output = apply_visible_watermark(&source.into_inner(), &current)
+            .expect("photo watermark should render");
+        let output_image = image::load_from_memory(&output)
+            .expect("watermarked image should decode")
+            .to_rgba8();
+        assert_eq!(output_image.get_pixel(30, 30), &Rgba([240, 240, 240, 255]));
+        assert_ne!(
+            output_image.get_pixel(30, output_image.height().saturating_sub(40)),
+            &Rgba([240, 240, 240, 255])
+        );
+    }
+
+    #[test]
+    fn photo_watermark_box_uses_one_third_of_the_image_width() {
+        assert_eq!(watermark_box_width(1449, 18), 478);
+        assert_eq!(watermark_box_width(640, 18), 211);
+
+        let mut image = image::RgbaImage::from_pixel(1449, 760, Rgba([240, 240, 240, 255]));
+        let font = load_watermark_font().expect("watermark font should load");
+        let watermark = EvidenceWatermarkData {
+            info_lines: vec![
+                "location".to_string(),
+                "address".to_string(),
+                "mobile".to_string(),
+                "name".to_string(),
+                "service".to_string(),
+                "time".to_string(),
+            ],
+            fallback_text: String::new(),
+        };
+        draw_chinese_watermark(&mut image, &font, &watermark);
+
+        assert_ne!(image.get_pixel(490, 735), &Rgba([240, 240, 240, 255]));
+        assert_eq!(image.get_pixel(520, 735), &Rgba([240, 240, 240, 255]));
+    }
 }

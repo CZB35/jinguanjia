@@ -1,19 +1,27 @@
 use std::net::SocketAddr;
 
 use anyhow::Result;
-use axum::{Router, http::header, middleware::map_response, response::Response};
+use axum::{
+    Router, extract::DefaultBodyLimit, http::header, middleware::map_response, response::Response,
+    routing::get,
+};
 use tokio::net::TcpListener;
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{config::AppConfig, db, routes, state::AppState, storage, wechat};
+
+const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub async fn bootstrap() -> Result<()> {
     init_tracing();
 
     let config = AppConfig::from_env()?;
-    let upload_root = storage::resolve_upload_root(&config.storage.upload_dir);
-    std::fs::create_dir_all(&upload_root)?;
+    config.storage.validate()?;
+    if !config.storage.is_oss() {
+        let upload_root = storage::resolve_upload_root(&config.storage.upload_dir);
+        std::fs::create_dir_all(&upload_root)?;
+    }
     let rb = db::init_rbatis(&config.database.url).await?;
     let addr = config.server.socket_addr()?;
     let state = AppState::new(config.clone(), rb);
@@ -41,12 +49,12 @@ fn init_tracing() {
 }
 
 fn build_router(state: AppState) -> Router {
-    let upload_service = ServeDir::new(storage::resolve_upload_root(&state.config.storage.upload_dir));
     Router::new()
         .nest("/api", routes::router())
-        .nest_service("/uploads", upload_service)
+        .route("/uploads/{*path}", get(storage::serve_upload))
         .with_state(state)
         .layer(map_response(force_utf8_json))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
 }

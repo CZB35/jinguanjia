@@ -1,6 +1,6 @@
 use std::{env, net::SocketAddr};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -37,7 +37,12 @@ pub struct AuthConfig {
 
 #[derive(Clone, Debug)]
 pub struct StorageConfig {
+    pub backend: String,
     pub upload_dir: String,
+    pub oss_endpoint: String,
+    pub oss_bucket: String,
+    pub oss_access_key_id: String,
+    pub oss_access_key_secret: String,
 }
 
 impl AppConfig {
@@ -71,9 +76,38 @@ impl AppConfig {
                     .context("JWT_REFRESH_EXPIRE_DAYS must be a valid i64")?,
             },
             storage: StorageConfig {
+                backend: env_var_or("STORAGE_BACKEND", "local"),
                 upload_dir: env_var_or("UPLOAD_DIR", "uploads"),
+                oss_endpoint: env_var_or("OSS_ENDPOINT", ""),
+                oss_bucket: env_var_or("OSS_BUCKET", ""),
+                oss_access_key_id: env_var_or("OSS_ACCESS_KEY_ID", ""),
+                oss_access_key_secret: env_var_or("OSS_ACCESS_KEY_SECRET", ""),
             },
         })
+    }
+}
+
+impl StorageConfig {
+    pub fn is_oss(&self) -> bool {
+        self.backend.trim().eq_ignore_ascii_case("oss")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.is_oss() {
+            if self.oss_endpoint.trim().is_empty() {
+                bail!("OSS_ENDPOINT must be set when STORAGE_BACKEND=oss");
+            }
+            if self.oss_bucket.trim().is_empty() {
+                bail!("OSS_BUCKET must be set when STORAGE_BACKEND=oss");
+            }
+            if self.oss_access_key_id.trim().is_empty() {
+                bail!("OSS_ACCESS_KEY_ID must be set when STORAGE_BACKEND=oss");
+            }
+            if self.oss_access_key_secret.trim().is_empty() {
+                bail!("OSS_ACCESS_KEY_SECRET must be set when STORAGE_BACKEND=oss");
+            }
+        }
+        Ok(())
     }
 }
 

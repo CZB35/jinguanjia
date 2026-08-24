@@ -1,5 +1,9 @@
 use anyhow::Context;
-use axum::{Json, extract::{Query, State}, http::HeaderMap};
+use axum::{
+    Json,
+    extract::{Multipart, Query, State},
+    http::HeaderMap,
+};
 use rbs::value;
 use serde::{Deserialize, Serialize};
 
@@ -8,11 +12,16 @@ use crate::{
     error::AppError,
     models::{
         audit_log::AuditLogEntity, system_config::SystemConfigEntity,
-        system_version::SystemVersionEntity,
+        system_version::SystemVersionEntity, user::UserEntity,
     },
     response::ApiResponse,
+    rich_text,
     state::AppState,
+    storage,
 };
+
+const MAX_PROJECT_SETTING_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_PROJECT_SETTING_VIDEO_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateConfigsRequest {
@@ -52,6 +61,7 @@ pub struct AuditLogItem {
     pub biz_id: i64,
     pub action: String,
     pub operator_id: i64,
+    pub operator_name: String,
     pub operator_role: String,
     pub remark: Option<String>,
     pub created_at: Option<String>,
@@ -67,6 +77,8 @@ pub struct AuditLogListResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct AuditLogQuery {
+    pub operator_id: Option<i64>,
+    pub operator_name: Option<String>,
     pub page: Option<usize>,
     pub page_size: Option<usize>,
 }
@@ -115,6 +127,21 @@ pub struct ProjectSettingItem {
 #[derive(Debug, Serialize)]
 pub struct ProjectSettingsResponse {
     pub items: Vec<ProjectSettingItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectSettingUploadResponse {
+    pub file_name: String,
+    pub file_url: String,
+    pub file_size: i64,
+    pub mime_type: String,
+}
+
+#[derive(Debug)]
+struct UploadField {
+    file_name: String,
+    content_type: Option<String>,
+    bytes: Vec<u8>,
 }
 
 pub async fn get_configs(
@@ -255,7 +282,34 @@ pub async fn get_operation_logs(
             .context("failed to query operation logs")
             .map_err(AppError::Internal)?;
 
-    let items = logs
+    let mut logs = logs;
+    if let Some(operator_id) = query.operator_id {
+        logs.retain(|item| item.operator_id == Some(operator_id));
+    }
+
+    let operator_ids = logs
+        .iter()
+        .filter_map(|item| item.operator_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let operator_map = if operator_ids.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        db::select_by_map_compat::<UserEntity>(
+            state.rb.as_ref(),
+            "user",
+            value! { "id": operator_ids },
+        )
+        .await
+        .context("failed to query audit log operators")
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .filter_map(|item| item.id.map(|id| (id, item.name.unwrap_or_default())))
+        .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    let mut items = logs
         .into_iter()
         .map(|item| AuditLogItem {
             id: item.id.unwrap_or_default(),
@@ -263,6 +317,10 @@ pub async fn get_operation_logs(
             biz_id: item.biz_id.unwrap_or_default(),
             action: item.action.unwrap_or_default(),
             operator_id: item.operator_id.unwrap_or_default(),
+            operator_name: operator_map
+                .get(&item.operator_id.unwrap_or_default())
+                .cloned()
+                .unwrap_or_default(),
             operator_role: item.operator_role.unwrap_or_default(),
             remark: item.remark,
             created_at: item
@@ -270,11 +328,24 @@ pub async fn get_operation_logs(
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
         })
         .collect::<Vec<_>>();
+    if let Some(operator_name) = query.operator_name.as_deref() {
+        items.retain(|item| item.operator_name.contains(operator_name));
+    }
+    items.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).max(1);
     let start = page.saturating_sub(1).saturating_mul(page_size);
-    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
+    let items = items
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect::<Vec<_>>();
 
     Ok(Json(ApiResponse::success(AuditLogListResponse {
         items,
@@ -303,6 +374,16 @@ pub async fn get_operation_log_detail(
         biz_id: log.biz_id.unwrap_or_default(),
         action: log.action.unwrap_or_default(),
         operator_id: log.operator_id.unwrap_or_default(),
+        operator_name: db::select_one_by_map_compat::<UserEntity>(
+            state.rb.as_ref(),
+            "user",
+            value! { "id": log.operator_id.unwrap_or_default() },
+        )
+        .await
+        .context("failed to query operator detail for audit log")
+        .map_err(AppError::Internal)?
+        .and_then(|item| item.name)
+        .unwrap_or_default(),
         operator_role: log.operator_role.unwrap_or_default(),
         remark: log.remark,
         created_at: log
@@ -383,16 +464,30 @@ pub async fn save_project_settings(
         let title = normalize_optional_text(item.title.as_deref())
             .unwrap_or_else(|| default_project_setting_title(&service_type).to_string());
         let config_key = format!("project_setting:{service_type}");
+        let requirement_content =
+            normalize_optional_text(item.requirement_content.as_deref()).unwrap_or_default();
+        let requirement_content =
+            rich_text::persist_inline_images(&state, &requirement_content, "project-settings")
+                .await
+                .context("failed to persist project setting inline images")
+                .map_err(AppError::Internal)?;
+        let warm_tip_content =
+            normalize_optional_text(item.warm_tip_content.as_deref()).unwrap_or_default();
+        let warm_tip_content =
+            rich_text::persist_inline_images(&state, &warm_tip_content, "project-settings")
+                .await
+                .context("failed to persist project setting inline images")
+                .map_err(AppError::Internal)?;
         let config_value = serde_json::json!({
             "service_type": service_type,
             "title": title,
             "banner_image_url": normalize_optional_text(item.banner_image_url.as_deref()),
-            "requirement_content": normalize_optional_text(item.requirement_content.as_deref()).unwrap_or_default(),
-            "warm_tip_content": normalize_optional_text(item.warm_tip_content.as_deref()).unwrap_or_default(),
+            "requirement_content": requirement_content,
+            "warm_tip_content": warm_tip_content,
             "status": normalize_config_status(item.status.as_deref())?,
         });
-        let normalized_value = normalize_json_config_value(&config_value.to_string())
-            .map_err(AppError::Internal)?;
+        let normalized_value =
+            normalize_json_config_value(&config_value.to_string()).map_err(AppError::Internal)?;
 
         let existing = db::select_one_by_map_compat::<SystemConfigEntity>(
             state.rb.as_ref(),
@@ -440,20 +535,49 @@ pub async fn save_project_settings(
     )))
 }
 
+pub async fn upload_project_setting_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Json<ApiResponse<ProjectSettingUploadResponse>>, AppError> {
+    ensure_admin_access(&state, &headers)?;
+    let upload = read_single_upload(multipart).await?;
+    validate_project_setting_upload(
+        &upload.file_name,
+        upload.content_type.as_deref(),
+        upload.bytes.len(),
+    )?;
+
+    let stored = storage::save_bytes(
+        &state,
+        "project-settings",
+        &upload.file_name,
+        upload.content_type.as_deref(),
+        &upload.bytes,
+    )
+    .await
+    .context("failed to save project setting file")
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(ApiResponse::success(ProjectSettingUploadResponse {
+        file_name: stored.original_name,
+        file_url: storage::public_url(&stored.relative_path),
+        file_size: stored.file_size,
+        mime_type: stored.mime_type,
+    })))
+}
+
 fn ensure_admin_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let auth_user = auth::authenticate(state, headers)?;
     auth_user.require_any_role(&["super_admin", "hq_reviewer"])
 }
 
 async fn load_project_settings(state: &AppState) -> Result<Vec<ProjectSettingItem>, AppError> {
-    let configs: Vec<SystemConfigEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "system_config",
-        value! {},
-    )
-    .await
-    .context("failed to query project settings")
-    .map_err(AppError::Internal)?;
+    let configs: Vec<SystemConfigEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "system_config", value! {})
+            .await
+            .context("failed to query project settings")
+            .map_err(AppError::Internal)?;
 
     let mut items = configs
         .into_iter()
@@ -560,6 +684,84 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
+}
+
+async fn read_single_upload(mut multipart: Multipart) -> Result<UploadField, AppError> {
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        AppError::from_multipart_error_with_limit_message(error, "项目设置上传文件大小不能超过50MB")
+    })? {
+        let Some(file_name) = field.file_name().map(ToString::to_string) else {
+            continue;
+        };
+        if file_name.trim().is_empty() {
+            continue;
+        }
+        let content_type = field.content_type().map(ToString::to_string);
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|error| {
+                AppError::from_multipart_error_with_limit_message(
+                    error,
+                    "项目设置上传文件大小不能超过50MB",
+                )
+            })?
+            .to_vec();
+        return Ok(UploadField {
+            file_name,
+            content_type,
+            bytes,
+        });
+    }
+
+    Err(AppError::BadRequest("请上传图片或视频文件".to_string()))
+}
+
+fn validate_project_setting_upload(
+    file_name: &str,
+    content_type: Option<&str>,
+    file_size: usize,
+) -> Result<(), AppError> {
+    if file_size == 0 {
+        return Err(AppError::BadRequest("上传文件不能为空".to_string()));
+    }
+    let ext = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content_type = content_type.unwrap_or("").to_ascii_lowercase();
+    let is_image = ["jpg", "jpeg", "png", "webp"].contains(&ext.as_str())
+        || matches!(
+            content_type.as_str(),
+            "image/jpeg" | "image/png" | "image/webp"
+        );
+    let is_video = ["mp4", "mov", "avi"].contains(&ext.as_str())
+        || matches!(
+            content_type.as_str(),
+            "video/mp4" | "video/quicktime" | "video/x-msvideo"
+        );
+
+    if is_image {
+        if file_size > MAX_PROJECT_SETTING_IMAGE_BYTES {
+            return Err(AppError::PayloadTooLarge(
+                "图片大小不能超过10MB".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if is_video {
+        if file_size > MAX_PROJECT_SETTING_VIDEO_BYTES {
+            return Err(AppError::PayloadTooLarge(
+                "视频大小不能超过50MB".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(
+        "仅支持jpg、jpeg、png、webp图片或mp4、mov、avi视频".to_string(),
+    ))
 }
 
 async fn get_agreement(

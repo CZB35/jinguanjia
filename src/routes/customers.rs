@@ -4,24 +4,29 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
 };
+use chrono::Utc;
 use rbs::value;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    auth, db,
+    audit, auth, db,
     error::AppError,
+    identity,
     models::{
         customer::CustomerEntity, customer_address::CustomerAddressEntity,
         customer_source::CustomerSourceEntity, task::TaskEntity,
         task_service_item::TaskServiceItemEntity, user::UserEntity,
     },
     response::ApiResponse,
+    routes::imports::{deserialize_vec_i64_from_mixed, normalize_delete_ids},
     state::AppState,
 };
 
 #[derive(Debug, Deserialize)]
 pub struct CustomerListQuery {
+    #[serde(alias = "customer_mobile", alias = "customerMobile", alias = "phone")]
     pub mobile: Option<String>,
+    #[serde(alias = "customerName")]
     pub name: Option<String>,
     pub page: Option<usize>,
     pub page_size: Option<usize>,
@@ -62,6 +67,17 @@ pub struct UpdateCustomerRequest {
     pub district: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_address_payload")]
     pub address: Option<AddressPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchDeleteCustomersRequest {
+    #[serde(
+        default,
+        alias = "ids",
+        alias = "customerIds",
+        deserialize_with = "deserialize_vec_i64_from_mixed"
+    )]
+    pub customer_ids: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -118,6 +134,8 @@ pub struct CustomerItem {
     pub latest_service_status: Option<String>,
     pub store_names: Vec<String>,
     pub service_history: Vec<CustomerServiceHistoryItem>,
+    #[serde(skip_serializing)]
+    pub created_at_sort: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,14 +214,16 @@ pub async fn list_customers(
         let scoped_tasks = if store_ids.is_empty() {
             Vec::new()
         } else {
-            db::select_by_map_compat::<TaskEntity>(
-                state.rb.as_ref(),
-                "task",
-                value! { "store_id": store_ids.clone() },
+            active_tasks(
+                db::select_by_map_compat::<TaskEntity>(
+                    state.rb.as_ref(),
+                    "task",
+                    value! { "store_id": store_ids.clone() },
+                )
+                .await
+                .context("failed to query dealer scoped customer tasks")
+                .map_err(AppError::Internal)?,
             )
-            .await
-            .context("failed to query dealer scoped customer tasks")
-            .map_err(AppError::Internal)?
         };
         let visible_customer_ids = scoped_tasks
             .into_iter()
@@ -222,6 +242,9 @@ pub async fn list_customers(
     }
 
     customers.retain(|customer| {
+        if customer.deleted_at.is_some() {
+            return false;
+        }
         if let Some(mobile) = &query.mobile
             && !customer
                 .mobile
@@ -250,14 +273,16 @@ pub async fn list_customers(
         .await
         .context("failed to query customer addresses")
         .map_err(AppError::Internal)?;
-        let tasks: Vec<TaskEntity> = db::select_by_map_compat(
-            state.rb.as_ref(),
-            "task",
-            value! { "customer_id": customer_id },
-        )
-        .await
-        .context("failed to query customer tasks for list")
-        .map_err(AppError::Internal)?;
+        let tasks = active_tasks(
+            db::select_by_map_compat(
+                state.rb.as_ref(),
+                "task",
+                value! { "customer_id": customer_id },
+            )
+            .await
+            .context("failed to query customer tasks for list")
+            .map_err(AppError::Internal)?,
+        );
         let latest_service_date = tasks
             .iter()
             .filter_map(|item| item.appointment_time)
@@ -306,24 +331,47 @@ pub async fn list_customers(
             default_address: default_address_entity
                 .as_ref()
                 .and_then(|item| item.address.clone()),
-            province: default_address_entity.as_ref().and_then(|item| item.province.clone()),
-            city: default_address_entity.as_ref().and_then(|item| item.city.clone()),
-            district: default_address_entity.as_ref().and_then(|item| item.district.clone()),
-            address: default_address_entity.as_ref().and_then(|item| item.address.clone()),
+            province: default_address_entity
+                .as_ref()
+                .and_then(|item| item.province.clone()),
+            city: default_address_entity
+                .as_ref()
+                .and_then(|item| item.city.clone()),
+            district: default_address_entity
+                .as_ref()
+                .and_then(|item| item.district.clone()),
+            address: default_address_entity
+                .as_ref()
+                .and_then(|item| item.address.clone()),
             order_count: tasks.len(),
             service_count: tasks.len(),
             latest_service_date,
             latest_service_status: latest_task.and_then(|item| item.task_status.clone()),
             store_names,
             service_history: Vec::new(),
+            created_at_sort: customer
+                .created_at
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default(),
         });
     }
+
+    items.sort_by(|left, right| {
+        right
+            .created_at_sort
+            .cmp(&left.created_at_sort)
+            .then_with(|| right.id.cmp(&left.id))
+    });
 
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).max(1);
     let start = page.saturating_sub(1).saturating_mul(page_size);
-    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
+    let items = items
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(CustomerListResponse {
         items,
         total,
@@ -384,6 +432,7 @@ pub async fn create_customer(
             created_by: Some(auth_user.user_id),
             created_at: None,
             updated_at: None,
+            deleted_at: None,
         },
     )
     .await
@@ -438,14 +487,11 @@ pub async fn update_customer(
             if value.is_empty() {
                 return Err(AppError::BadRequest("请输入客户手机号".to_string()));
             }
-            let exists: Vec<CustomerEntity> = db::select_by_map_compat(
-                state.rb.as_ref(),
-                "customer",
-                value! { "mobile": value },
-            )
-            .await
-            .context("failed to query existing customer mobile during update")
-            .map_err(AppError::Internal)?;
+            let exists: Vec<CustomerEntity> =
+                db::select_by_map_compat(state.rb.as_ref(), "customer", value! { "mobile": value })
+                    .await
+                    .context("failed to query existing customer mobile during update")
+                    .map_err(AppError::Internal)?;
             if exists.into_iter().any(|item| item.id != Some(customer_id)) {
                 return Err(AppError::Conflict("该手机号客户已存在".to_string()));
             }
@@ -459,7 +505,10 @@ pub async fn update_customer(
     } else {
         existing_customer.primary_store_id
     };
-    let source = if payload.source.is_some() || payload.source_id.is_some() || payload.customer_source_id.is_some() {
+    let source = if payload.source.is_some()
+        || payload.source_id.is_some()
+        || payload.customer_source_id.is_some()
+    {
         resolve_customer_source_value(
             &state,
             payload.source.clone(),
@@ -470,9 +519,24 @@ pub async fn update_customer(
         existing_customer.source.clone()
     };
     let has_address_update = payload.address.is_some()
-        || payload.province.as_deref().map(str::trim).filter(|item| !item.is_empty()).is_some()
-        || payload.city.as_deref().map(str::trim).filter(|item| !item.is_empty()).is_some()
-        || payload.district.as_deref().map(str::trim).filter(|item| !item.is_empty()).is_some();
+        || payload
+            .province
+            .as_deref()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .is_some()
+        || payload
+            .city
+            .as_deref()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .is_some()
+        || payload
+            .district
+            .as_deref()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .is_some();
 
     CustomerEntity::update_by_map(
         state.rb.as_ref(),
@@ -511,7 +575,11 @@ pub async fn update_customer(
         .context("failed to query customer addresses during update")
         .map_err(AppError::Internal)?;
 
-        if let Some(default_address) = existing_addresses.iter().find(|item| item.is_default == Some(1)).or_else(|| existing_addresses.first()) {
+        if let Some(default_address) = existing_addresses
+            .iter()
+            .find(|item| item.is_default == Some(1))
+            .or_else(|| existing_addresses.first())
+        {
             CustomerAddressEntity::update_by_map(
                 state.rb.as_ref(),
                 &CustomerAddressEntity {
@@ -550,6 +618,64 @@ pub async fn update_customer(
     get_customer_detail_inner(&state, customer_id).await
 }
 
+pub async fn delete_customer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(customer_id): Path<i64>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let auth_user = auth::authenticate(&state, &headers)?;
+    auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+
+    let customer = find_customer(&state, customer_id).await?;
+    ensure_customer_access(&state, &auth_user, &customer).await?;
+    soft_delete_customer(
+        &state,
+        &auth_user,
+        &customer,
+        "delete_customer",
+        "后台删除客户",
+    )
+    .await?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "ok": true }),
+    )))
+}
+
+pub async fn batch_delete_customers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<BatchDeleteCustomersRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let auth_user = auth::authenticate(&state, &headers)?;
+    auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
+    let customer_ids = normalize_delete_ids(payload.customer_ids, "customer_ids")?;
+
+    let mut customers = Vec::with_capacity(customer_ids.len());
+    for customer_id in customer_ids {
+        let customer = find_customer(&state, customer_id).await?;
+        ensure_customer_access(&state, &auth_user, &customer).await?;
+        customers.push(customer);
+    }
+
+    let deleted_count = customers.len();
+    for customer in &customers {
+        soft_delete_customer(
+            &state,
+            &auth_user,
+            customer,
+            "batch_delete_customer",
+            "后台批量删除客户",
+        )
+        .await?;
+    }
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "ok": true,
+        "deleted_count": deleted_count
+    }))))
+}
+
 pub async fn get_customer_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -570,14 +696,16 @@ pub async fn get_customer_service_history(
     auth_user.require_any_role(&["dealer", "hq_reviewer", "super_admin"])?;
 
     let _ = find_customer(&state, customer_id).await?;
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "task",
-        value! { "customer_id": customer_id },
-    )
-    .await
-    .context("failed to query customer service history")
-    .map_err(AppError::Internal)?;
+    let tasks = active_tasks(
+        db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task",
+            value! { "customer_id": customer_id },
+        )
+        .await
+        .context("failed to query customer service history")
+        .map_err(AppError::Internal)?,
+    );
     let items = build_customer_service_history_items(&state, tasks).await?;
     Ok(Json(ApiResponse::success(items)))
 }
@@ -600,10 +728,12 @@ pub async fn search_customer_by_mobile(
             .context("failed to search customer by mobile")
             .map_err(AppError::Internal)?;
     customers.retain(|item| {
-        item.mobile
-            .as_deref()
-            .unwrap_or_default()
-            .contains(query.mobile.trim())
+        item.deleted_at.is_none()
+            && item
+                .mobile
+                .as_deref()
+                .unwrap_or_default()
+                .contains(query.mobile.trim())
     });
 
     if auth_user.has_role("dealer")
@@ -614,14 +744,16 @@ pub async fn search_customer_by_mobile(
         if store_ids.is_empty() {
             customers.clear();
         } else {
-            let scoped_tasks = db::select_by_map_compat::<TaskEntity>(
-                state.rb.as_ref(),
-                "task",
-                value! { "store_id": store_ids.clone() },
-            )
-            .await
-            .context("failed to query dealer scoped tasks for customer mobile search")
-            .map_err(AppError::Internal)?;
+            let scoped_tasks = active_tasks(
+                db::select_by_map_compat::<TaskEntity>(
+                    state.rb.as_ref(),
+                    "task",
+                    value! { "store_id": store_ids.clone() },
+                )
+                .await
+                .context("failed to query dealer scoped tasks for customer mobile search")
+                .map_err(AppError::Internal)?,
+            );
             let visible_customer_ids = scoped_tasks
                 .into_iter()
                 .filter_map(|item| item.customer_id)
@@ -650,14 +782,16 @@ pub async fn search_customer_by_mobile(
         .await
         .context("failed to query customer addresses for search")
         .map_err(AppError::Internal)?;
-        let tasks: Vec<TaskEntity> = db::select_by_map_compat(
-            state.rb.as_ref(),
-            "task",
-            value! { "customer_id": customer_id },
-        )
-        .await
-        .context("failed to query customer tasks for search")
-        .map_err(AppError::Internal)?;
+        let tasks = active_tasks(
+            db::select_by_map_compat(
+                state.rb.as_ref(),
+                "task",
+                value! { "customer_id": customer_id },
+            )
+            .await
+            .context("failed to query customer tasks for search")
+            .map_err(AppError::Internal)?,
+        );
         let store_ids = tasks
             .iter()
             .filter_map(|task| task.store_id)
@@ -698,10 +832,18 @@ pub async fn search_customer_by_mobile(
             default_address: default_address_entity
                 .as_ref()
                 .and_then(|addr| addr.address.clone()),
-            province: default_address_entity.as_ref().and_then(|addr| addr.province.clone()),
-            city: default_address_entity.as_ref().and_then(|addr| addr.city.clone()),
-            district: default_address_entity.as_ref().and_then(|addr| addr.district.clone()),
-            address: default_address_entity.as_ref().and_then(|addr| addr.address.clone()),
+            province: default_address_entity
+                .as_ref()
+                .and_then(|addr| addr.province.clone()),
+            city: default_address_entity
+                .as_ref()
+                .and_then(|addr| addr.city.clone()),
+            district: default_address_entity
+                .as_ref()
+                .and_then(|addr| addr.district.clone()),
+            address: default_address_entity
+                .as_ref()
+                .and_then(|addr| addr.address.clone()),
             order_count: tasks.len(),
             service_count: tasks.len(),
             latest_service_date: tasks
@@ -715,6 +857,10 @@ pub async fn search_customer_by_mobile(
                 .and_then(|task| task.task_status.clone()),
             store_names,
             service_history: build_customer_service_history_items(&state, tasks.clone()).await?,
+            created_at_sort: item
+                .created_at
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default(),
         });
     }
     Ok(Json(ApiResponse::success(result)))
@@ -733,14 +879,16 @@ async fn get_customer_detail_inner(
     .await
     .context("failed to query customer addresses")
     .map_err(AppError::Internal)?;
-    let tasks: Vec<TaskEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "task",
-        value! { "customer_id": customer_id },
-    )
-    .await
-    .context("failed to query customer tasks")
-    .map_err(AppError::Internal)?;
+    let tasks = active_tasks(
+        db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task",
+            value! { "customer_id": customer_id },
+        )
+        .await
+        .context("failed to query customer tasks")
+        .map_err(AppError::Internal)?,
+    );
     let latest_service_date = tasks
         .iter()
         .filter_map(|item| item.appointment_time)
@@ -798,9 +946,15 @@ async fn get_customer_detail_inner(
         primary_store_id,
         primary_store_name,
         store_ids,
-        province: default_address_entity.as_ref().and_then(|item| item.province.clone()),
-        city: default_address_entity.as_ref().and_then(|item| item.city.clone()),
-        district: default_address_entity.as_ref().and_then(|item| item.district.clone()),
+        province: default_address_entity
+            .as_ref()
+            .and_then(|item| item.province.clone()),
+        city: default_address_entity
+            .as_ref()
+            .and_then(|item| item.city.clone()),
+        district: default_address_entity
+            .as_ref()
+            .and_then(|item| item.district.clone()),
         address: default_address.clone(),
         addresses: addresses
             .into_iter()
@@ -837,11 +991,15 @@ async fn build_customer_service_history_items(
         .context("failed to query customer service history task service items")
         .map_err(AppError::Internal)?;
         let technician_name = if let Some(technician_id) = item.current_technician_id {
-            load_user_name(state, technician_id).await.unwrap_or_default()
+            load_user_name(state, technician_id)
+                .await
+                .unwrap_or_default()
         } else {
             String::new()
         };
-        let store_name = load_store_name(state, item.store_id).await?.unwrap_or_default();
+        let store_name = load_store_name(state, item.store_id)
+            .await?
+            .unwrap_or_default();
         items.push(CustomerServiceHistoryItem {
             task_id,
             task_no: item.task_no.unwrap_or_default(),
@@ -870,12 +1028,113 @@ async fn build_customer_service_history_items(
     Ok(items)
 }
 
-async fn find_customer(state: &AppState, customer_id: i64) -> Result<CustomerEntity, AppError> {
-    db::select_one_by_map_compat(state.rb.as_ref(), "customer", value! { "id": customer_id })
+fn active_tasks(tasks: Vec<TaskEntity>) -> Vec<TaskEntity> {
+    tasks
+        .into_iter()
+        .filter(|task| task.deleted_at.is_none())
+        .collect()
+}
+
+async fn ensure_customer_access(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    customer: &CustomerEntity,
+) -> Result<(), AppError> {
+    if auth_user.has_role("hq_reviewer") || auth_user.has_role("super_admin") {
+        return Ok(());
+    }
+    if !auth_user.has_role("dealer") {
+        return Err(AppError::Forbidden("您没有权限执行该操作".to_string()));
+    }
+
+    let store_ids = load_user_store_ids(state, auth_user.user_id).await?;
+    if customer
+        .primary_store_id
+        .map(|store_id| store_ids.contains(&store_id))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let customer_id = customer.id.unwrap_or_default();
+    let tasks = active_tasks(
+        db::select_by_map_compat(
+            state.rb.as_ref(),
+            "task",
+            value! { "customer_id": customer_id },
+        )
         .await
-        .context("failed to query customer by id")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::NotFound("客户不存在".to_string()))
+        .context("failed to query customer tasks for delete access")
+        .map_err(AppError::Internal)?,
+    );
+    if tasks
+        .iter()
+        .filter_map(|task| task.store_id)
+        .any(|store_id| store_ids.contains(&store_id))
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        "您只能删除所属门店范围内的客户".to_string(),
+    ))
+}
+
+async fn soft_delete_customer(
+    state: &AppState,
+    auth_user: &auth::CurrentAuthUser,
+    customer: &CustomerEntity,
+    action: &str,
+    remark: &str,
+) -> Result<(), AppError> {
+    let customer_id = customer
+        .id
+        .ok_or_else(|| AppError::Internal(anyhow!("customer.id missing")))?;
+    CustomerEntity::update_by_map(
+        state.rb.as_ref(),
+        &CustomerEntity {
+            deleted_at: Some(Utc::now().naive_utc()),
+            ..Default::default()
+        },
+        value! { "id": customer_id, "column": ["deleted_at"] },
+    )
+    .await
+    .context("failed to soft delete customer")
+    .map_err(AppError::Internal)?;
+
+    let after_customer = db::select_one_by_map_compat::<CustomerEntity>(
+        state.rb.as_ref(),
+        "customer",
+        value! { "id": customer_id },
+    )
+    .await
+    .context("failed to query customer after delete")
+    .map_err(AppError::Internal)?;
+    audit::write_audit_log(
+        state,
+        "customer",
+        customer_id,
+        action,
+        auth_user.user_id,
+        auth_user.primary_role(),
+        Some(customer),
+        after_customer.as_ref(),
+        Some(remark.to_string()),
+    )
+    .await
+}
+
+async fn find_customer(state: &AppState, customer_id: i64) -> Result<CustomerEntity, AppError> {
+    let customer: CustomerEntity =
+        db::select_one_by_map_compat(state.rb.as_ref(), "customer", value! { "id": customer_id })
+            .await
+            .context("failed to query customer by id")
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound("客户不存在或已删除".to_string()))?;
+    if customer.deleted_at.is_some() {
+        return Err(AppError::NotFound("客户不存在或已删除".to_string()));
+    }
+    Ok(customer)
 }
 
 async fn load_user_name(state: &AppState, user_id: i64) -> Result<String, AppError> {
@@ -887,7 +1146,10 @@ async fn load_user_name(state: &AppState, user_id: i64) -> Result<String, AppErr
     .await
     .context("failed to query user name for customer history")
     .map_err(AppError::Internal)?;
-    Ok(user.and_then(|item| item.name).unwrap_or_default())
+    let Some(user) = user else {
+        return Ok(String::new());
+    };
+    identity::role_display_name(state, user_id, "technician", user.name.as_deref()).await
 }
 
 async fn resolve_customer_source_value(
@@ -925,14 +1187,11 @@ async fn resolve_customer_source_ids(
     let Some(source) = source.map(str::trim).filter(|item| !item.is_empty()) else {
         return Ok(None);
     };
-    let items: Vec<CustomerSourceEntity> = db::select_by_map_compat(
-        state.rb.as_ref(),
-        "customer_source",
-        value! {},
-    )
-    .await
-    .context("failed to query customer source ids")
-    .map_err(AppError::Internal)?;
+    let items: Vec<CustomerSourceEntity> =
+        db::select_by_map_compat(state.rb.as_ref(), "customer_source", value! {})
+            .await
+            .context("failed to query customer source ids")
+            .map_err(AppError::Internal)?;
     Ok(items.into_iter().find_map(|item| {
         let matches = item.code.as_deref() == Some(source) || item.name.as_deref() == Some(source);
         if matches { item.id } else { None }
@@ -1028,4 +1287,16 @@ async fn load_store_name(
     .context("failed to query store name for customer")
     .map_err(AppError::Internal)?;
     Ok(store.and_then(|item| item.store_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn customer_batch_delete_request_accepts_legacy_string_ids() {
+        let payload: BatchDeleteCustomersRequest =
+            serde_json::from_value(serde_json::json!({ "ids": ["12", 13] })).unwrap();
+        assert_eq!(payload.customer_ids, vec![12, 13]);
+    }
 }

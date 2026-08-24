@@ -22,7 +22,8 @@ use crate::{
 #[derive(Clone, Default)]
 pub struct WechatRuntime {
     pub access_token: Arc<RwLock<Option<WechatAccessTokenState>>>,
-    pub public_bind_return_urls: Arc<RwLock<std::collections::HashMap<String, WechatPublicBindReturnState>>>,
+    pub public_bind_return_urls:
+        Arc<RwLock<std::collections::HashMap<String, WechatPublicBindReturnState>>>,
     pub oauth_states: Arc<RwLock<std::collections::HashMap<String, WechatOauthState>>>,
 }
 
@@ -136,7 +137,10 @@ struct WechatTemplateMiniprogram {
     miniprogram_state: Option<String>,
 }
 
-pub async fn build_service_account_bind_url(state: &AppState, user_id: i64) -> Result<String, AppError> {
+pub async fn build_service_account_bind_url(
+    state: &AppState,
+    user_id: i64,
+) -> Result<String, AppError> {
     let config = load_service_account_config(state).await?;
     if config.appid.trim().is_empty() || config.bind_redirect_uri.trim().is_empty() {
         return Err(AppError::Conflict("微信服务号配置不完整".to_string()));
@@ -185,10 +189,7 @@ pub fn decode_bind_state_token(config: &AppConfig, token: &str) -> Result<Wechat
     Ok(data.claims)
 }
 
-pub async fn load_oauth_state(
-    state: &AppState,
-    state_token: &str,
-) -> Option<WechatOauthState> {
+pub async fn load_oauth_state(state: &AppState, state_token: &str) -> Option<WechatOauthState> {
     let store = state.wechat_runtime.oauth_states.read().await;
     store.get(state_token).and_then(|item| {
         if Utc::now().timestamp() - item.created_at > 1800 {
@@ -299,16 +300,23 @@ pub async fn bind_service_account_user(
 }
 
 pub async fn get_bind_status(state: &AppState, user_id: i64) -> Result<WechatBindStatus, AppError> {
-    let user: UserEntity = db::select_one_by_map_compat(state.rb.as_ref(), "user", value! { "id": user_id })
-        .await
-        .context("failed to query user for wechat bind status")
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
+    let user: UserEntity =
+        db::select_one_by_map_compat(state.rb.as_ref(), "user", value! { "id": user_id })
+            .await
+            .context("failed to query user for wechat bind status")
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
     Ok(WechatBindStatus {
-        wechat_bound: user.wechat_openid.as_deref().map(|item| !item.trim().is_empty()).unwrap_or(false),
+        wechat_bound: user
+            .wechat_openid
+            .as_deref()
+            .map(|item| !item.trim().is_empty())
+            .unwrap_or(false),
         wechat_openid: user.wechat_openid,
         wechat_subscribe: user.wechat_subscribe.unwrap_or(0) == 1,
-        wechat_bind_at: user.wechat_bind_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+        wechat_bind_at: user
+            .wechat_bind_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
     })
 }
 
@@ -340,7 +348,9 @@ pub async fn load_public_bind_state(
         .cloned()
         .ok_or_else(|| AppError::BadRequest("微信授权状态已失效，请重新发起绑定".to_string()))?;
     if Utc::now().timestamp() - bind.authorized_at > 600 {
-        return Err(AppError::BadRequest("微信授权状态已过期，请重新发起绑定".to_string()));
+        return Err(AppError::BadRequest(
+            "微信授权状态已过期，请重新发起绑定".to_string(),
+        ));
     }
     Ok(bind)
 }
@@ -376,6 +386,24 @@ pub async fn enqueue_wechat_notice(
     state: &AppState,
     notice: &NoticeEntity,
 ) -> Result<(), AppError> {
+    enqueue_wechat_notice_with_payload(
+        state,
+        notice,
+        serde_json::json!({
+            "title": notice.title.clone().unwrap_or_default(),
+            "content": notice.content.clone().unwrap_or_default(),
+            "biz_type": notice.biz_type.clone().unwrap_or_default(),
+            "biz_id": notice.biz_id.unwrap_or_default(),
+        }),
+    )
+    .await
+}
+
+pub async fn enqueue_wechat_notice_with_payload(
+    state: &AppState,
+    notice: &NoticeEntity,
+    payload: serde_json::Value,
+) -> Result<(), AppError> {
     let Some(receiver_id) = notice.receiver_id else {
         return Ok(());
     };
@@ -383,7 +411,9 @@ pub async fn enqueue_wechat_notice(
         return Ok(());
     };
 
-    let setting = db::select_one_by_map_compat::<crate::models::user_message_setting::UserMessageSettingEntity>(
+    let setting = db::select_one_by_map_compat::<
+        crate::models::user_message_setting::UserMessageSettingEntity,
+    >(
         state.rb.as_ref(),
         "user_message_setting",
         value! { "user_id": receiver_id },
@@ -410,18 +440,16 @@ pub async fn enqueue_wechat_notice(
     let Some(user) = user else {
         return Ok(());
     };
-    let Some(openid) = user.wechat_openid.clone().filter(|item| !item.trim().is_empty()) else {
+    let Some(openid) = user
+        .wechat_openid
+        .clone()
+        .filter(|item| !item.trim().is_empty())
+    else {
         return Ok(());
     };
 
     let template_code = notice.biz_type.clone().unwrap_or_default();
-    let payload_json = serde_json::json!({
-        "title": notice.title.clone().unwrap_or_default(),
-        "content": notice.content.clone().unwrap_or_default(),
-        "biz_type": notice.biz_type.clone().unwrap_or_default(),
-        "biz_id": notice.biz_id.unwrap_or_default(),
-    })
-    .to_string();
+    let payload_json = payload.to_string();
 
     let existing = db::select_one_by_map_compat::<NoticeDeliveryEntity>(
         state.rb.as_ref(),
@@ -494,11 +522,21 @@ async fn process_pending_deliveries(state: &AppState) -> Result<()> {
         let Some(delivery_id) = delivery.id else {
             continue;
         };
-        let next_retry_at = delivery.next_retry_at.unwrap_or_else(|| Local::now().naive_local());
+        let next_retry_at = delivery
+            .next_retry_at
+            .unwrap_or_else(|| Local::now().naive_local());
         if next_retry_at > Local::now().naive_local() {
             continue;
         }
-        update_delivery_status(state.rb.as_ref(), delivery_id, "processing", delivery.attempt_count.unwrap_or(0), None, None).await?;
+        update_delivery_status(
+            state.rb.as_ref(),
+            delivery_id,
+            "processing",
+            delivery.attempt_count.unwrap_or(0),
+            None,
+            None,
+        )
+        .await?;
 
         let send_result = send_wechat_delivery(state, &delivery).await;
         match send_result {
@@ -526,7 +564,10 @@ async fn process_pending_deliveries(state: &AppState) -> Result<()> {
                     "pending"
                 };
                 let retry_at = if final_status == "pending" {
-                    Some(Local::now().naive_local() + Duration::seconds(settings.retry_interval_seconds.max(30)))
+                    Some(
+                        Local::now().naive_local()
+                            + Duration::seconds(settings.retry_interval_seconds.max(30)),
+                    )
                 } else {
                     None
                 };
@@ -545,15 +586,19 @@ async fn process_pending_deliveries(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-async fn send_wechat_delivery(state: &AppState, delivery: &NoticeDeliveryEntity) -> Result<Option<String>> {
+async fn send_wechat_delivery(
+    state: &AppState,
+    delivery: &NoticeDeliveryEntity,
+) -> Result<Option<String>> {
     let template_code = delivery.template_code.as_deref().unwrap_or_default();
     let template = load_template_config(state, template_code).await?;
     if template.template_id.trim().is_empty() {
         return Err(anyhow!("wechat template not configured: {template_code}"));
     }
     let access_token = get_service_account_access_token(state).await?;
-    let payload: serde_json::Value = serde_json::from_str(delivery.payload_json.as_deref().unwrap_or("{}"))
-        .context("failed to parse notice delivery payload json")?;
+    let payload: serde_json::Value =
+        serde_json::from_str(delivery.payload_json.as_deref().unwrap_or("{}"))
+            .context("failed to parse notice delivery payload json")?;
     let data = build_template_message_data(state, template_code, &payload).await?;
 
     let request = WechatTemplateSendPayload {
@@ -566,7 +611,11 @@ async fn send_wechat_delivery(state: &AppState, delivery: &NoticeDeliveryEntity)
         miniprogram: template
             .miniprogram_appid
             .clone()
-            .zip(template.page_path.clone())
+            .zip(resolve_template_miniprogram_page_path(
+                template_code,
+                &template,
+                &payload,
+            ))
             .map(|(appid, pagepath)| WechatTemplateMiniprogram {
                 appid,
                 pagepath,
@@ -590,7 +639,9 @@ async fn send_wechat_delivery(state: &AppState, delivery: &NoticeDeliveryEntity)
     if response.errcode.unwrap_or_default() != 0 {
         return Err(anyhow!(
             "wechat send failed: {}",
-            response.errmsg.unwrap_or_else(|| "unknown error".to_string())
+            response
+                .errmsg
+                .unwrap_or_else(|| "unknown error".to_string())
         ));
     }
     Ok(response.msgid.map(|item| item.to_string()))
@@ -603,6 +654,7 @@ async fn build_template_message_data(
 ) -> Result<serde_json::Value> {
     match template_code {
         "hq_score_done" => build_hq_score_done_template_data(state, payload).await,
+        "task_submit" => build_task_submit_template_data(state, payload).await,
         _ => Ok(serde_json::json!({
             "first": { "value": payload.get("title").and_then(|v| v.as_str()).unwrap_or_default() },
             "keyword1": { "value": payload.get("content").and_then(|v| v.as_str()).unwrap_or_default() },
@@ -651,6 +703,53 @@ async fn build_hq_score_done_template_data(
     }))
 }
 
+async fn build_task_submit_template_data(
+    state: &AppState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let biz_id = payload
+        .get("biz_id")
+        .and_then(|item| item.as_i64())
+        .ok_or_else(|| anyhow!("wechat task_submit payload missing biz_id"))?;
+    let task = db::select_one_by_map_compat::<TaskEntity>(
+        state.rb.as_ref(),
+        "task",
+        value! { "id": biz_id },
+    )
+    .await
+    .context("failed to query task for wechat task submit template")?
+    .ok_or_else(|| anyhow!("task not found for wechat task submit template: {biz_id}"))?;
+    let technician_name = if let Some(technician_id) = task.current_technician_id {
+        db::select_one_by_map_compat::<UserEntity>(
+            state.rb.as_ref(),
+            "user",
+            value! { "id": technician_id },
+        )
+        .await
+        .context("failed to query technician for wechat task submit template")?
+        .and_then(|item| item.name)
+        .unwrap_or_else(|| "服务人员".to_string())
+    } else {
+        "服务人员".to_string()
+    };
+    let project_name = resolve_wechat_project_name(state, &task).await?;
+    let completed_at = payload
+        .get("completed_at")
+        .and_then(|item| item.as_str())
+        .map(ToString::to_string)
+        .or_else(|| {
+            task.updated_at
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        })
+        .unwrap_or_else(|| Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+
+    Ok(serde_json::json!({
+        "thing2": { "value": truncate_wechat_text(&technician_name, 20) },
+        "thing4": { "value": truncate_wechat_text(&project_name, 20) },
+        "time12": { "value": truncate_wechat_text(&completed_at, 32) },
+    }))
+}
+
 async fn resolve_wechat_project_name(state: &AppState, task: &TaskEntity) -> Result<String> {
     if let Some(store_id) = task.store_id {
         if let Some(store) = db::select_one_by_map_compat::<StoreEntity>(
@@ -660,7 +759,10 @@ async fn resolve_wechat_project_name(state: &AppState, task: &TaskEntity) -> Res
         )
         .await
         .context("failed to query store for wechat project name")?
-            && let Some(name) = store.store_name.map(|item| item.trim().to_string()).filter(|item| !item.is_empty())
+            && let Some(name) = store
+                .store_name
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
         {
             return Ok(name);
         }
@@ -674,13 +776,19 @@ async fn resolve_wechat_project_name(state: &AppState, task: &TaskEntity) -> Res
         )
         .await
         .context("failed to query customer for wechat project name")?
-            && let Some(name) = customer.name.map(|item| item.trim().to_string()).filter(|item| !item.is_empty())
+            && let Some(name) = customer
+                .name
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
         {
             return Ok(name);
         }
     }
 
-    Ok(task.task_no.clone().unwrap_or_else(|| "项目服务".to_string()))
+    Ok(task
+        .task_no
+        .clone()
+        .unwrap_or_else(|| "项目服务".to_string()))
 }
 
 fn truncate_wechat_text(input: &str, max_chars: usize) -> String {
@@ -689,6 +797,30 @@ fn truncate_wechat_text(input: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     text.chars().take(max_chars).collect()
+}
+
+fn resolve_template_miniprogram_page_path(
+    template_code: &str,
+    template: &WechatTemplateConfig,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let base_path = template
+        .page_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())?;
+    let biz_id = payload.get("biz_id").and_then(|item| item.as_i64());
+    match template_code {
+        "hq_score_done" | "task_submit" => {
+            biz_id.map(|biz_id| append_query_param(base_path, "id", &biz_id.to_string()))
+        }
+        _ => Some(base_path.to_string()),
+    }
+}
+
+fn append_query_param(base_path: &str, key: &str, value: &str) -> String {
+    let separator = if base_path.contains('?') { '&' } else { '?' };
+    format!("{}{}{}={}", base_path, separator, key, value)
 }
 
 async fn get_service_account_access_token(state: &AppState) -> Result<String> {
@@ -721,7 +853,9 @@ async fn get_service_account_access_token(state: &AppState) -> Result<String> {
     if response.errcode.unwrap_or_default() != 0 {
         return Err(anyhow!(
             "wechat access token failed: {}",
-            response.errmsg.unwrap_or_else(|| "unknown error".to_string())
+            response
+                .errmsg
+                .unwrap_or_else(|| "unknown error".to_string())
         ));
     }
     let access_token = response
@@ -736,10 +870,13 @@ async fn get_service_account_access_token(state: &AppState) -> Result<String> {
     Ok(access_token)
 }
 
-async fn load_service_account_config(state: &AppState) -> Result<WechatServiceAccountConfig, AppError> {
+async fn load_service_account_config(
+    state: &AppState,
+) -> Result<WechatServiceAccountConfig, AppError> {
     let appid = load_config_string(state, "wechat.service_account.appid").await?;
     let secret = load_config_string(state, "wechat.service_account.secret").await?;
-    let bind_redirect_uri = load_config_string(state, "wechat.service_account.bind_redirect_uri").await?;
+    let bind_redirect_uri =
+        load_config_string(state, "wechat.service_account.bind_redirect_uri").await?;
     Ok(WechatServiceAccountConfig {
         appid,
         secret,
@@ -750,7 +887,8 @@ async fn load_service_account_config(state: &AppState) -> Result<WechatServiceAc
 async fn load_notification_settings(state: &AppState) -> Result<WechatNotificationSettings> {
     let enabled = load_config_bool(state, "wechat.notify.enabled", true).await?;
     let retry_limit = load_config_i32(state, "wechat.notify.retry_limit", 3).await?;
-    let retry_interval_seconds = load_config_i64(state, "wechat.notify.retry_interval_seconds", 60).await?;
+    let retry_interval_seconds =
+        load_config_i64(state, "wechat.notify.retry_interval_seconds", 60).await?;
     Ok(WechatNotificationSettings {
         enabled,
         retry_limit,
@@ -758,11 +896,28 @@ async fn load_notification_settings(state: &AppState) -> Result<WechatNotificati
     })
 }
 
-async fn load_template_config(state: &AppState, template_code: &str) -> Result<WechatTemplateConfig> {
-    let template_id = load_config_string(state, &format!("wechat.template.{template_code}.template_id")).await?;
-    let page_path = load_config_optional_string(state, &format!("wechat.template.{template_code}.page_path")).await?;
-    let miniprogram_appid = load_config_optional_string(state, &format!("wechat.template.{template_code}.miniprogram_appid")).await?;
-    let miniprogram_state = load_config_optional_string(state, &format!("wechat.template.{template_code}.miniprogram_state")).await?;
+async fn load_template_config(
+    state: &AppState,
+    template_code: &str,
+) -> Result<WechatTemplateConfig> {
+    let template_id = load_config_string(
+        state,
+        &format!("wechat.template.{template_code}.template_id"),
+    )
+    .await?;
+    let page_path =
+        load_config_optional_string(state, &format!("wechat.template.{template_code}.page_path"))
+            .await?;
+    let miniprogram_appid = load_config_optional_string(
+        state,
+        &format!("wechat.template.{template_code}.miniprogram_appid"),
+    )
+    .await?;
+    let miniprogram_state = load_config_optional_string(
+        state,
+        &format!("wechat.template.{template_code}.miniprogram_state"),
+    )
+    .await?;
     Ok(WechatTemplateConfig {
         template_id,
         page_path,
@@ -772,10 +927,15 @@ async fn load_template_config(state: &AppState, template_code: &str) -> Result<W
 }
 
 async fn load_config_string(state: &AppState, key: &str) -> Result<String, AppError> {
-    Ok(load_config_optional_string(state, key).await?.unwrap_or_default())
+    Ok(load_config_optional_string(state, key)
+        .await?
+        .unwrap_or_default())
 }
 
-async fn load_config_optional_string(state: &AppState, key: &str) -> Result<Option<String>, AppError> {
+async fn load_config_optional_string(
+    state: &AppState,
+    key: &str,
+) -> Result<Option<String>, AppError> {
     let item = db::select_one_by_map_compat::<SystemConfigEntity>(
         state.rb.as_ref(),
         "system_config",

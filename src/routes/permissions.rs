@@ -97,12 +97,17 @@ pub async fn get_roles(
     Query(query): Query<RoleListQuery>,
 ) -> Result<Json<ApiResponse<RoleListResponse>>, AppError> {
     ensure_admin_access(&state, &headers)?;
-    let items = load_role_items(&state, None).await?;
+    let mut items = load_role_items(&state, None).await?;
+    items.sort_by(|left, right| right.id.cmp(&left.id));
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).max(1);
     let start = page.saturating_sub(1).saturating_mul(page_size);
-    let items = items.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
+    let items = items
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect::<Vec<_>>();
     Ok(Json(ApiResponse::success(RoleListResponse {
         items,
         total,
@@ -442,7 +447,12 @@ async fn load_role_items(
             }
         })
         .collect::<Vec<_>>();
-    items.sort_by(|a, b| a.role_code.cmp(&b.role_code).then(a.id.cmp(&b.id)));
+    items.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
     Ok(items)
 }
 
@@ -618,9 +628,14 @@ fn build_permission_tree(permissions: Vec<PermissionEntity>) -> Vec<PermissionTr
 }
 
 fn regroup_permission_roots(roots: &mut Vec<PermissionTreeItem>) {
-    let settings_index = roots.iter().position(|item| item.permission_code == "settings");
-    let master_data_index = roots.iter().position(|item| item.permission_code == "master-data");
-    let (Some(settings_index), Some(master_data_index)) = (settings_index, master_data_index) else {
+    let settings_index = roots
+        .iter()
+        .position(|item| item.permission_code == "settings");
+    let master_data_index = roots
+        .iter()
+        .position(|item| item.permission_code == "master-data");
+    let (Some(settings_index), Some(master_data_index)) = (settings_index, master_data_index)
+    else {
         return;
     };
 

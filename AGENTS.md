@@ -1,28 +1,25 @@
-## Quick Facts
-- This repo is a single-binary Rust backend: the root `Cargo.toml` is the only manifest, and `src/main.rs` only calls `app::bootstrap()`.
-- The HTTP surface is defined in `src/routes/mod.rs`. `src/app.rs` mounts that router under `/api` and separately serves `UPLOAD_DIR` as `/uploads/*`.
-- `docs/*.md` are useful product docs, but if they disagree with code, trust `src/routes/mod.rs` and the handler implementations.
+## Repo Shape
+- This is a single-binary Rust backend. The root `Cargo.toml` is the only manifest, and `src/main.rs` only calls `app::bootstrap()`.
+- `src/routes/mod.rs` is the executable source of truth for the HTTP surface. `src/app.rs` mounts it under `/api`; uploads are served separately from `/uploads/*`.
+- `docs/*.md` are helpful product docs, but they can lag code. Trust `src/routes/mod.rs` and the handler files first.
 
 ## Run And Verify
-- Local config comes from `.env`, which is loaded automatically by `dotenvy`; start from `.env.example`.
-- `.env` is gitignored and overrides the hardcoded defaults in `src/config.rs`; inspect it before assuming which database or JWT secret the app is using.
-- The only env values you usually need to change are `DATABASE_URL` and `JWT_SECRET`. Defaults bind to `0.0.0.0:3001`.
-- The documented startup command is `cargo run --release`.
+- Runtime config is loaded from `.env` via `dotenvy`; start from `.env.example`. `.env` is gitignored and overrides defaults in `src/config.rs`.
+- The main env values that usually matter locally are `DATABASE_URL` and `JWT_SECRET`. Defaults bind to `0.0.0.0:3001`.
+- Start the service with `cargo run --release`.
 - Fast manual check: `GET /api/health`.
-- Verified repo-level check: `cargo test`. It currently succeeds but runs `0` tests, so use it as a compile smoke test. A cold Windows build is slow.
-- There is no checked-in CI workflow, task runner, `rustfmt.toml`, or `clippy.toml`; do not assume extra repo-specific commands exist.
+- Repo-level verification is `cargo test`, but it currently runs `0` tests, so treat it as a compile smoke test. A cold Windows build is slow.
+- There is no checked-in CI workflow, task runner, `rustfmt.toml`, or `clippy.toml`.
 
-## Database And Seed Data
-- There is no migration runner in the repo. Apply `migrations/0001_*.sql` through `0008_*.sql` manually in filename order.
-- `migrations/0002_seed_data.sql` inserts the default admin/demo data described in `README.md`; use that when you need a loginable local database quickly.
+## Database And State
+- There is no migration runner. Apply `migrations/*.sql` manually in filename order; the repo currently goes through `0019_wechat_notice_delivery.sql`.
+- `migrations/0002_seed_data.sql` inserts the default admin account and baseline demo data.
+- `src/state.rs` keeps login verification codes in memory only. They are not persisted across restarts.
+- `uploads/` is gitignored. `storage::resolve_upload_root()` resolves relative upload paths back to the project root when running from `target/debug` or `target/release`, so `cargo run` still writes to the repo-level upload directory.
 
-## Code Structure
-- `src/app.rs` wires tracing, env config, the RBatis connection, permissive CORS, request tracing, and the JSON UTF-8 content-type patch.
-- `src/state.rs` is the shared state: config, `Arc<RBatis>`, and an in-memory verification-code store. Login codes are not persisted.
+## Code Conventions
 - `src/models/*.rs` are thin `*Entity` structs with `rbatis::crud!`; most business logic lives directly in `src/routes/*.rs`.
-- `src/db/mod.rs` contains compatibility helpers such as `select_by_map_compat` that normalize RBatis/MySQL result shapes, including JSON and `DateTime` fields. Prefer those helpers over ad hoc raw decoding.
-
-## Handler Conventions
-- Protected routes do not use a global auth middleware. Handlers explicitly take `HeaderMap` and call `auth::authenticate(&state, &headers)`.
-- Role gates are manual via `CurrentAuthUser::require_any_role`; add the auth call and role check yourself when introducing a protected endpoint.
-- Success responses should use `response::ApiResponse<T>`. Errors should return `AppError` so the standard `{ code, message, data, request_id }` envelope stays consistent.
+- Prefer `src/db/mod.rs` helpers such as `select_by_map_compat` / `select_one_by_map_compat` over ad hoc RBatis decoding; they normalize MySQL result shapes plus JSON and `DateTime` fields.
+- Protected routes do not use a global auth middleware. Handlers explicitly accept `HeaderMap` and call `auth::authenticate(&state, &headers)`.
+- Role checks are also manual via `CurrentAuthUser::require_any_role(...)`.
+- Success responses should use `response::ApiResponse<T>`. Return `AppError` for failures so the standard `{ code, message, data, request_id }` envelope stays intact.
